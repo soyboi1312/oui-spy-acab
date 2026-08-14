@@ -21,6 +21,11 @@
 
 void desertSetEnabled(bool enabled);
 bool desertIsEnabled(void);
+// Reload the persisted toggle on boot; if none saved yet, use defaultEnabled. Call from setup()
+// beside the other detectors' restores. Without it a deployed board silently stops recording
+// after any reset, which is the single failure this mode cannot survive: the owner returns
+// unable to distinguish "nothing came by" from "it switched itself off".
+void desertRestoreEnabled(bool defaultEnabled);
 
 // Catch-all: returns true for ANY device when Desert mode is on (emits
 // ACAB_NEARBY_DEVICE). MUST be tried LAST, after every specific classifier.

@@ -132,10 +132,10 @@ int main() {
     gHostDesert = false;
     chk("Desert back off: ignored again", run(airtagOffline(), &d), false);
 
-    // trackerRestoreEnabled() is what both firmware images call in setup(). The host Preferences
-    // stub always returns the caller's default (no NVS on a laptop), so this pins the
-    // never-been-set path: whatever main.cpp passes is what the board boots with. The persisted
-    // path needs a board, not this harness.
+    // trackerRestoreEnabled() is what both firmware images call in setup(). The Preferences stub
+    // persists within a binary now, but this one never writes the tracker key, so the store is
+    // empty and this pins the never-been-set path: whatever main.cpp passes is what the board
+    // boots with. The persisted round-trip is covered by test_axon/test_desert.
     trackerRestoreEnabled(false);
     chkInt("restore(false) with no stored value -> off", trackerIsEnabled() ? 1 : 0, 0);
     trackerRestoreEnabled(true);

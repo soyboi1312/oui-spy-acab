@@ -14,6 +14,7 @@
 // Also locks the exact detail strings ("randomized MAC" / "hardware OUI") and the field stamping,
 // because the apps consume both verbatim on the detection row.
 #include "desert_detect.h"
+#include <Preferences.h>   // the stub now really stores; see the persistence block at the end
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -318,6 +319,46 @@ int main() {
       chk("re-disabled: BLE stops matching immediately", runBle(macOui, a, &d), false); }
     { std::vector<uint8_t> f = wifiHdr(0x80, macOui); addSsid(f, "CoffeeShop");
       chk("re-disabled: WiFi stops matching immediately", runWifi(f, &d), false); }
+
+    // ------------------------------------------------ persistence across a reboot
+    // Desert was the ONLY detector toggle without NVS until 2026-08-08, so every reset silently
+    // turned it off. On a handheld that voided one drive test. On a board deployed unattended for
+    // a week it is fatal AND undetectable: the owner returns to an empty log with no way to tell
+    // "nothing came by" from "the mode switched itself off on day two".
+    //
+    // This only became testable when the host Preferences stub stopped discarding writes. Before
+    // that, a toggle that never reached NVS and one that round-tripped correctly produced
+    // byte-identical passing runs, so the suite was blind to exactly the property that matters.
+    // Both halves are checked separately, because either one alone is a silent failure:
+    //   (a) the setter actually reaches NVS, and
+    //   (b) the restore path reads it back and BEATS the compiled-in default.
+    {
+        // (a) writes land
+        desertSetEnabled(true);
+        { Preferences p; p.begin("acab-desert", true);
+          chkTrue("desertSetEnabled(true) reaches NVS", p.getBool("on", false) == true); p.end(); }
+        desertSetEnabled(false);
+        { Preferences p; p.begin("acab-desert", true);
+          chkTrue("desertSetEnabled(false) reaches NVS", p.getBool("on", true) == false); p.end(); }
+
+        // (b) the reboot path. Seed NVS directly, then restore: this is what setup() does after a
+        // power cycle, and the persisted value has to win over whatever default is passed.
+        { Preferences p; p.begin("acab-desert", false); p.putBool("on", true); p.end(); }
+        desertRestoreEnabled(false);
+        chkTrue("reboot: persisted ON beats a false default", desertIsEnabled() == true);
+
+        { Preferences p; p.begin("acab-desert", false); p.putBool("on", false); p.end(); }
+        desertRestoreEnabled(true);
+        chkTrue("reboot: persisted OFF beats a true default", desertIsEnabled() == false);
+
+        // First ever boot / factory reset: nothing stored, so the default must govern both ways.
+        Preferences::wipeAll();
+        desertRestoreEnabled(false);
+        chkTrue("empty NVS falls back to the default (off)", desertIsEnabled() == false);
+        desertRestoreEnabled(true);
+        chkTrue("empty NVS honours a true default", desertIsEnabled() == true);
+        desertSetEnabled(false);
+    }
 
     printf("\n  %s (%d failure%s)\n\n", failures ? "REGRESSION DETECTED" : "all good",
            failures, failures == 1 ? "" : "s");

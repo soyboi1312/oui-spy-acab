@@ -202,7 +202,30 @@ def check_faq_copies():
     except Exception as e:
         print(f"   !! faq-content.json does not parse: {e}")
         return 1
-    return 0
+    # Related-help coverage: both apps key the detail screen's Related Help panel off the
+    # DeviceType faq key into relatedHelp. A key with no entry HIDES the panel silently at
+    # runtime (both apps skip rendering on an empty lookup), so a category can lose its help
+    # with nothing failing anywhere - the build is the only place it can be caught. This list
+    # mirrors the faqKey values the two DeviceType enums can produce; extend it in the same
+    # commit that adds a category.
+    faq_keys = ["FLOCK_CAMERA", "FLOCK_RAVEN", "BODY_CAM", "DRONE",
+                "TRACKER", "WATCHED", "GLASSES", "NETWORK_CAMERA"]
+    related = d.get("relatedHelp", {})
+    known_q = {q.get("id") for sec in d.get("sections", []) for q in sec.get("questions", [])}
+    bad = 0
+    for key in faq_keys:
+        rows = related.get(key, [])
+        if not rows:
+            print(f"   !! relatedHelp has no entries for {key}: both apps silently hide the panel")
+            bad += 1
+            continue
+        for qid in rows:
+            if qid not in known_q:
+                print(f"   !! relatedHelp[{key}] points at unknown question id '{qid}'")
+                bad += 1
+    if not bad:
+        print(f"   ok: relatedHelp covers all {len(faq_keys)} categories, every id resolves")
+    return bad
 
 
 def main():

@@ -20,6 +20,14 @@
 void alertsInit();
 void alertsBootJingle();
 
+// The mirror image of the boot jingle: a short DESCENDING "powering down" motif that ENDS LOW,
+// where boot rises and ends high ("...alive?"). Play it on a real running->off transition so the
+// user can HEAR off from on - the faint 25ms heartbeat LED never made that legible, and the red
+// light is the charger's, not ours. Blocking (~0.7s), safe to call right before deep sleep, and
+// honors the buzzer/LED master flags (a "lights out" board stays silent+dark; its off signal is
+// the app dropping the BLE link instead).
+void alertsPowerDown();
+
 // Play the "app linked" chirp once when the BLE connection comes up, and arm the
 // first-contact "reveal" sting for this session. Call on the rising edge of a link.
 void alertsConnected();

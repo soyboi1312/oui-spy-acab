@@ -21,6 +21,8 @@
 #include <esp_partition.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/md.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <string.h>
 #include <stddef.h>
 #include "acab_ble_service.h"   // acabBleClientConnected()
@@ -39,6 +41,19 @@ static const size_t   ENC_LEN    = SLOT - ENC_OFF;           // 52 encrypted byt
 // ever connecting to drain it, erase it (a board out of its owner's hands self-cleans).
 // This is a no-RTC proxy for the "N hours" decision; an epoch-time refinement is a TODO.
 static const uint32_t WIPE_AFTER_BOOTS = 6;
+// ...and the threshold used while "record everything" is on (see detLogSetBufferAll in det_log.h).
+// 6 reboots is the right proxy for "seized" when the board rides in a pocket and reconnects to a
+// phone daily. It is the WRONG proxy once the owner has explicitly said they are leaving it
+// unattended for days: a discharging battery brownout-looping six times would erase the entire
+// deployment, which is precisely the data the mode exists to collect, and the owner would never
+// know it happened. Still finite, so a genuinely abandoned board self-cleans eventually.
+//
+// DO NOT read this as "wide enough to survive a week of resets". A boot counter cannot bound a
+// brownout loop: gBoot increments unconditionally below, so a cell sitting at the brownout knee
+// at ~2 s per cycle burns 64 counts in about two minutes. 64 is a real and monotonic improvement
+// over 6 - there is no input where the wider threshold loses records the narrower one keeps - and
+// that is the whole claim. A time or epoch gate would be the honest fix and is future work.
+static const uint32_t WIPE_AFTER_BOOTS_DEPLOY = 64;
 
 // ---- state ----
 static const esp_partition_t* gPart = nullptr;
@@ -54,13 +69,29 @@ static bool     gDraining = false;
 // the NimBLE host task never eats the multi-second full-partition erase. The pending flag is
 // ALSO persisted to NVS ("wipe") so a power loss mid-sweep resumes at boot instead of letting
 // the boot scan resurrect not-yet-erased old-generation records (their seq/CRC still validate).
-static volatile bool     gWipePending = false;
-static volatile uint32_t gWipeNext    = 0;         // next partition offset to erase
-static volatile uint32_t gWipeGen     = 0;         // bumped per detLogClear so a re-latch restarts the sweep
-static portMUX_TYPE      gWipeMux     = portMUX_INITIALIZER_UNLOCKED;
+static bool              gWipePending = false;
+static uint32_t          gWipeNext    = 0;         // next partition offset to erase
+static bool              gWipeStalled = false;    // one failed tick waits for an explicit clear or reboot
 static const uint32_t    WIPE_BLOCK   = 64 * 1024; // one flash block erase (~100-250ms) per tick
 
+// One mutex owns every raw-flash operation and every cursor transition that describes that
+// flash. A spinlock cannot cover erase/write because flash operations may block with the cache
+// disabled. The mutex makes both clear/append orderings safe:
+//   - append first: its complete record is then condemned by the clear sweep;
+//   - clear first: append observes gWipePending after it gets the lock and writes nothing.
+// Drain reads use the same lock, so a wipe cannot erase a slot while it is being replayed.
+static StaticSemaphore_t gIoMutexStorage;
+static SemaphoreHandle_t gIoMutex = nullptr;
+
 static bool     gEnabled  = false;
+// volatile: read LOCK-FREE by detLogBufferAll() on the radio hot paths; writes stay under gIoMutex.
+static volatile bool gBufferAll = false;   // "record everything" deploy mode; see det_log.h
+// Ring-saturation marker. gSaturated is PERSISTED ("bufsat"): it has to outlive the reboots a
+// week-long deployment guarantees, or the owner reconnects to a full-looking log with no way to
+// know its tail was censored. gSatDrops is this boot only, for the [diag] line.
+static bool              gSaturated = false;
+static volatile uint32_t gSatDrops  = 0;
+static uint32_t gFaults = DET_LOG_FAULT_NONE;
 static uint8_t  gKey[32];
 static bool     gHaveKey  = false;
 
@@ -147,14 +178,35 @@ static const BootAnchor* anchorFor(uint32_t boot) {
     return nullptr;
 }
 
-// Serializes the seq-claim + ring-head update in detLogAppend. As of the PERF-2 hardening
-// pass the append is driven from the single scanner sink task (the flash write moved off the
-// radio hot path), so this is effectively uncontended now; it is kept as a cheap guard in
-// case a second caller is ever added. Short critical section only - the encrypt + flash write
-// happen outside it (flash ops must never run under a spinlock).
-static portMUX_TYPE gAppendMux = portMUX_INITIALIZER_UNLOCKED;
-
 // ---- low-level helpers ----
+static bool ioLock() {
+    return gIoMutex && xSemaphoreTake(gIoMutex, portMAX_DELAY) == pdTRUE;
+}
+
+static void ioUnlock() {
+    if (gIoMutex) xSemaphoreGive(gIoMutex);
+}
+
+static uint32_t countLocked() {
+    return (gHead > gOldest) ? (gHead - gOldest) : 0;
+}
+
+static void latchFaultLocked(uint32_t fault) {
+    const uint32_t next = gFaults | fault;
+    if (next == gFaults) return;
+    gFaults = next;
+    Preferences p; p.begin(NVS_NS, false); p.putUInt("fault", gFaults); p.end();
+}
+
+static bool appendBlockedLocked() {
+    // Even a read fault can make a boot scan underestimate gHead and select a slot that
+    // is already programmed. Once storage state is uncertain, only a full erase safely
+    // establishes a new writable generation.
+    return gFaults != DET_LOG_FAULT_NONE;
+}
+
+static void clearLocked();
+
 static uint16_t crc16(const uint8_t* p, size_t n) {       // CRC-16/CCITT-FALSE
     uint16_t c = 0xFFFF;
     for (size_t i = 0; i < n; i++) {
@@ -221,13 +273,37 @@ static bool slotValid(const StoredDet* s, uint32_t idx) {
     return crc16((const uint8_t*)s + ENC_OFF, ENC_LEN) == s->crc;
 }
 
-// Payload first, then the 12B header (seq/bootCount/crc/pad). A torn write leaves
-// the header erased (seq=0xFFFFFFFF), so the slot reads as empty rather than half-valid.
-static void writeSlot(uint32_t idx, const StoredDet* s) {
-    if (idx % PER_SECTOR == 0)                              // entering a sector: erase it first
-        esp_partition_erase_range(gPart, (size_t)idx * SLOT, SECTOR);
-    esp_partition_write(gPart, (size_t)idx * SLOT + ENC_OFF, (const uint8_t*)s + ENC_OFF, ENC_LEN);
-    esp_partition_write(gPart, (size_t)idx * SLOT,           s,                           ENC_OFF);
+// Entering a sector physically evicts every old slot in it. Move the logical floor at the
+// same moment the erase succeeds, even if the following record write fails. Otherwise status
+// counts records that no longer exist until the remaining 63 slots are rewritten.
+static bool prepareSlotLocked(uint32_t seq, uint32_t idx) {
+    if (idx % PER_SECTOR != 0) return true;
+    if (esp_partition_erase_range(gPart, (size_t)idx * SLOT, SECTOR) != ESP_OK) {
+        latchFaultLocked(DET_LOG_FAULT_ERASE);
+        return false;
+    }
+    if (seq > gSlots) {
+        const uint32_t afterErasedSector = seq - gSlots + (uint32_t)PER_SECTOR;
+        if (afterErasedSector > gOldest) gOldest = afterErasedSector;
+    }
+    return true;
+}
+
+// Payload first, then the 12B header (seq/bootCount/crc/pad). A torn write normally leaves
+// the header erased (seq=0xFFFFFFFF), so the slot reads as empty rather than half-valid. Either
+// failed call blocks further appends until a successful clear because a non-sector slot cannot
+// be safely retried without first erasing other valid records in its sector.
+static bool writeSlotLocked(uint32_t idx, const StoredDet* s) {
+    if (esp_partition_write(gPart, (size_t)idx * SLOT + ENC_OFF,
+                            (const uint8_t*)s + ENC_OFF, ENC_LEN) != ESP_OK) {
+        latchFaultLocked(DET_LOG_FAULT_WRITE);
+        return false;
+    }
+    if (esp_partition_write(gPart, (size_t)idx * SLOT, s, ENC_OFF) != ESP_OK) {
+        latchFaultLocked(DET_LOG_FAULT_WRITE);
+        return false;
+    }
+    return true;
 }
 
 // Decrypt-in-place must already have happened; map the stored fields back to a live
@@ -247,9 +323,18 @@ static void unpackToDetection(const StoredDet* s, AcabDetection* d) {
 
 // ---- public API ----
 void detLogBegin() {
+    if (!gIoMutex) gIoMutex = xSemaphoreCreateMutexStatic(&gIoMutexStorage);
+    if (!gIoMutex) {
+        gFaults |= DET_LOG_FAULT_LOCK;
+        gSlots = 0;
+        return;
+    }
     gPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, PART_LABEL);
     if (!gPart) { gSlots = 0; return; }              // no data partition -> buffering unavailable
-    gSlots = gPart->size / SLOT;
+    // Only expose complete erase sectors as slots. This keeps every sector erase inside the
+    // partition and makes the ring length an exact multiple of the physical eviction unit.
+    gSlots = (uint32_t)(gPart->size / SECTOR) * (uint32_t)PER_SECTOR;
+    if (gSlots == 0) return;
 
     // A wipe latched by detLogClear() but cut short by a power loss must be honoured BEFORE
     // trusting the boot scan: not-yet-erased old-generation slots still carry a valid seq/CRC,
@@ -258,27 +343,57 @@ void detLogBegin() {
     // contents are condemned either way, and detLogAppend holds off until the sweep completes.
     {
         Preferences p; p.begin(NVS_NS, true);
+        gFaults = p.getUInt("fault", DET_LOG_FAULT_NONE);
         if (p.getBool("wipe", false)) { gWipeNext = 0; gWipePending = true; }
         p.end();
     }
 
-    // Boot scan: find the highest valid seq. Live window is the last gSlots seqs.
+    // Boot scan: find the exact contiguous live window. Using maxSeq-gSlots as the floor is
+    // wrong for a sector-erased ring: the first write after wrap erases 64 old records at once,
+    // so the valid floor jumps by 64 while maxSeq advances by only one. minSeq reconstructs that
+    // physical fact after reboot. A damaged internal hole falls back to the newest contiguous
+    // suffix so count and drain never advertise records that are not actually readable.
     uint32_t maxSeq = 0;
+    uint32_t minSeq = 0xFFFFFFFFu;
+    uint32_t validCount = 0;
     if (!gWipePending) {
         StoredDet s;
         for (uint32_t i = 0; i < gSlots; i++) {
-            if (!readSlot(i, &s)) continue;
-            if (!slotValid(&s, i)) continue;
+            if (!readSlot(i, &s)) { latchFaultLocked(DET_LOG_FAULT_READ); continue; }
+            if (!slotValid(&s, i)) {
+                if (s.seq != 0 && s.seq != 0xFFFFFFFFu) latchFaultLocked(DET_LOG_FAULT_CORRUPT);
+                continue;
+            }
             if (s.seq > maxSeq) maxSeq = s.seq;
+            if (s.seq < minSeq) minSeq = s.seq;
+            validCount++;
+        }
+        if (maxSeq && (minSeq == 0xFFFFFFFFu || validCount != maxSeq - minSeq + 1)) {
+            latchFaultLocked(DET_LOG_FAULT_CORRUPT);
+            uint32_t suffixOldest = maxSeq;
+            for (uint32_t n = 0; n < gSlots && maxSeq > n; n++) {
+                const uint32_t seq = maxSeq - n;
+                if (!readSlot(slotOf(seq), &s)) {
+                    latchFaultLocked(DET_LOG_FAULT_READ);
+                    break;
+                }
+                if (!slotValid(&s, slotOf(seq)) || s.seq != seq) break;
+                suffixOldest = seq;
+            }
+            minSeq = suffixOldest;
         }
     }
     gHead   = maxSeq + 1;
-    gOldest = (maxSeq > gSlots) ? (maxSeq - gSlots + 1) : 1;
+    gOldest = maxSeq ? minSeq : 1;
     gDrain  = (gOldest > 0) ? gOldest - 1 : 0;
+    gDraining = false;
 
     // Persisted opt-in flag + monotonic boot counter, and the last-connect boot for auto-wipe.
     Preferences p; p.begin(NVS_NS, false);
     gEnabled = p.getBool("on", false);
+    gBufferAll = p.getBool("bufall", false);
+    gSaturated = p.getBool("bufsat", false);   // survives the reboots a deployment guarantees
+    gFaults |= p.getUInt("fault", DET_LOG_FAULT_NONE);
     // Reload a persisted at-rest key so deploy-and-leave buffering survives a reboot
     // instead of going keyless until the app reconnects (see the SECURITY note in det_log.h).
     if (gEnabled && p.getBytesLength("key") == 32) { p.getBytes("key", gKey, 32); gHaveKey = true; }
@@ -296,20 +411,94 @@ void detLogBegin() {
     // EARLIER boot still replay with an exact time, which is the whole point of persisting them.
     anchorsLoad();
 
-    // Auto-wipe: undrained across too many reboots -> erase.
-    if (maxSeq > 0 && (gBoot - lastConn) >= WIPE_AFTER_BOOTS) detLogClear();
+    // Auto-wipe: undrained across too many reboots -> erase. The threshold widens while
+    // "record everything" is on, because the owner has declared the board is deliberately
+    // unattended and boot count stops meaning "seized" (see WIPE_AFTER_BOOTS_DEPLOY).
+    //
+    // gEnabled is in the test ON PURPOSE. The three switches (buffer / bufall / desert) persist
+    // INDEPENDENTLY, so "buffering off, bufall still true" is reachable, and in that state a
+    // board that is not recording anything would otherwise keep the weakened self-clean posture
+    // indefinitely. Weakened seizure protection must never outlive the feature that asked for it.
+    // detLogSetEnabled below also clears bufall, so this is belt-and-braces against an NVS write
+    // that failed to land; the read is free and the failure it covers is silent.
+    const uint32_t wipeAfter = (gEnabled && gBufferAll) ? WIPE_AFTER_BOOTS_DEPLOY : WIPE_AFTER_BOOTS;
+    if (maxSeq > 0 && (gBoot - lastConn) >= wipeAfter) detLogClear();
+}
+
+// See the long note in det_log.h. Persisted so a deployed board keeps recording across the
+// brownout resets that a week in the field guarantees; without persistence this switch would
+// silently revert on the first reset and the deployment would quietly collect nothing.
+void detLogSetBufferAll(bool on) {
+    if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return; }
+    if (on == gBufferAll) { ioUnlock(); return; }
+    gBufferAll = on;
+    Preferences p; p.begin(NVS_NS, false);
+    p.putBool("bufall", on);
+    p.end();
+    ioUnlock();
+}
+bool detLogBufferAll() {
+    // Deliberately LOCK-FREE. Callers include the radio hot paths (handleDetection runs inside
+    // the promiscuous RX callback and the BLE ingest path), and gIoMutex is held across multi-ms
+    // flash erases (a 4 KB sector every 64 appends, 64 KB blocks during a wipe), so taking it
+    // here stalled frame RX for the duration of every erase. An aligned bool read is atomic on
+    // this core, the value only changes on an app config write, and the old lock-timeout
+    // fallback already returned the unlocked read - one-advert staleness is harmless.
+    return gBufferAll;
+}
+
+// True once the ring has refused at least one uncategorized record because it was full, i.e. the
+// tail of this log is censored. PERSISTED, so it survives the deployment's reboots. Cleared only
+// by detLogClear, because a wipe starts a genuinely fresh log.
+bool detLogSaturated() {
+    if (!ioLock()) return gSaturated;
+    const bool value = gSaturated;
+    ioUnlock();
+    return value;
+}
+uint32_t detLogSatDrops() {
+    if (!ioLock()) return gSatDrops;
+    const uint32_t value = gSatDrops;
+    ioUnlock();
+    return value;
+}
+
+static void clearKeyLocked() {
+    memset(gKey, 0, 32);
+    gHaveKey = false;
+    // gKeyFp deliberately SURVIVES this, in RAM and in NVS. Dropping the key does not drop the
+    // records it encrypted, so the fingerprint is the only thing left that can recognise a
+    // different phone's key arriving for them (see gKeyFp).
+    Preferences p; p.begin(NVS_NS, false); p.remove("key"); p.end();
 }
 
 void detLogSetEnabled(bool on) {
-    if (on == gEnabled) return;
+    if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return; }
+    if (on == gEnabled) { ioUnlock(); return; }
     gEnabled = on;
     Preferences p; p.begin(NVS_NS, false);
     p.putBool("on", on);
     if (on && gHaveKey) p.putBytes("key", gKey, 32);   // persist a key that arrived before enable
+    // Turning the MASTER switch off ends the deployment, so the deploy-only sub-mode goes with it
+    // rather than lingering as orphaned state that still selects the weakened wipe threshold and
+    // still admits nearby devices the moment buffering is re-enabled for ordinary use.
+    //
+    // The counter-argument, recorded so it is not re-litigated from scratch: this snaps the wipe
+    // threshold back to 6, so brownouts could erase a ring the owner had not drained yet. It does
+    // not bite in practice, because the natural end-of-deployment action is CONNECTING, which
+    // refreshes "lastconn" and resets the timer; and a board merely collected and driven home is
+    // untouched here, since nobody flipped this switch. Reaching this path takes a deliberate act.
+    if (!on) { gBufferAll = false; p.putBool("bufall", false); }
     p.end();
-    if (!on) detLogClearKey();                         // stop capturing; forget the key (RAM + NVS)
+    if (!on) clearKeyLocked();                         // stop capturing; forget the key (RAM + NVS)
+    ioUnlock();
 }
-bool detLogEnabled() { return gEnabled; }
+bool detLogEnabled() {
+    if (!ioLock()) return gEnabled;
+    const bool value = gEnabled;
+    ioUnlock();
+    return value;
+}
 
 void detLogSetKey(const uint8_t key[32]) {
     // Records are encrypted under whatever key was active when each was written, and the
@@ -327,7 +516,8 @@ void detLogSetKey(const uint8_t key[32]) {
     // the user's own replay.
     uint8_t fp[8];
     bool haveFp = keyFingerprint(key, fp);
-    if (haveFp && gHaveKeyFp && memcmp(gKeyFp, fp, sizeof(fp)) != 0 && detLogCount() > 0) detLogClear();
+    if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return; }
+    if (haveFp && gHaveKeyFp && memcmp(gKeyFp, fp, sizeof(fp)) != 0 && countLocked() > 0) clearLocked();
     memcpy(gKey, key, 32);
     gHaveKey = true;
     Preferences p; p.begin(NVS_NS, false);
@@ -339,37 +529,83 @@ void detLogSetKey(const uint8_t key[32]) {
     // enable is re-persisted by detLogSetEnabled(true).
     if (gEnabled) p.putBytes("key", gKey, 32);
     p.end();
+    ioUnlock();
 }
 void detLogClearKey() {
-    memset(gKey, 0, 32);
-    gHaveKey = false;
-    // gKeyFp deliberately SURVIVES this, in RAM and in NVS. Dropping the key does not drop the
-    // records it encrypted, so the fingerprint is the only thing left that can recognise a
-    // different phone's key arriving for them (see gKeyFp).
-    Preferences p; p.begin(NVS_NS, false); p.remove("key"); p.end();
+    if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return; }
+    clearKeyLocked();
+    ioUnlock();
 }
-bool detLogHaveKey() { return gHaveKey; }
+bool detLogHaveKey() {
+    if (!ioLock()) return gHaveKey;
+    const bool value = gHaveKey;
+    ioUnlock();
+    return value;
+}
 
 void detLogSetEpoch(uint32_t unixSec) {
+    if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return; }
     gEpochUnix = unixSec; gEpochAtMs = millis();
     // Persist it against THIS boot, so records captured in this boot stay datable even if the
     // board reboots before the app next connects.
     anchorPut(gBoot, gEpochUnix, gEpochAtMs);
+    ioUnlock();
 }
 
 void detLogAppend(const AcabDetection& d) {
-    if (!gEnabled || !gHaveKey || gSlots == 0) return;
-    if (acabBleClientConnected()) return;            // only buffer while the app is away
-    if (gWipePending) return;                        // deferred wipe still sweeping: a record written now could be erased moments later
+    if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return; }
+    // Recheck every admission condition while holding the same lock as clear, key changes,
+    // and the wipe tick. A caller that arrived just before one of those transitions cannot
+    // commit a stale-key record or write behind an erase that already promised an empty log.
+    if (!gEnabled || !gHaveKey || gSlots == 0 || acabBleClientConnected()) {
+        ioUnlock();
+        return;                                      // only buffer while the app is away
+    }
+    // ONCE THE RING IS FULL, UNCATEGORIZED ROWS STOP APPENDING. Signature hits still append and
+    // still evict oldest-first as always; only ACAB_NEARBY_DEVICE is capped.
+    //
+    // The ring is strictly FIFO and type-blind (see the gOldest advance below), unlike the dedup
+    // table, which deliberately evicts the oldest NEARBY_DEVICE first. acab_scanner.cpp says both
+    // halves are what make Desert safe: "the eviction priority in dedupFind() plus the type gate
+    // on buffering, NOT the size". detLogBufferAll relaxes the type gate, which leaves the ring
+    // with no type protection at all.
+    //
+    // The failure that closes: the owner collects a deployed board and drives home with it still
+    // powered and still armed. The app is disconnected - that is the mode's own premise - so the
+    // guard above never fires, and both bufall and desert now survive the reboot. The 2026-07-24
+    // drive logged 9,795 unique BLE + 10,296 unique WiFi devices in ~104 minutes against 24,576
+    // slots. That is ~82% of the ring on first sightings, and dedup thrash re-buffering the same
+    // devices (see the REBUFFER note in acab_scanner.cpp) carries it the rest of the way, so one
+    // drive home wraps it and silently overwrites the
+    // week the board was left there to record.
+    //
+    // TRADEOFF, deliberate: on a genuinely saturated deployment this drops the TAIL of nearby
+    // devices instead of the head. For "did anything come by while I was gone" that is the right
+    // end to lose, and it is strictly better than losing the whole deployment on the way home.
+    //
+    // AND IT MUST NOT BE SILENT. A dropped tail with no marker hands the owner a full-looking log
+    // whose last hours or days are censored, with nothing to distinguish "nothing came by after
+    // Tuesday" from "we stopped writing on Tuesday". That is the same class of unfalsifiable
+    // absence this project has already been bitten by twice. gSatDrops counts this boot; the
+    // persisted flag survives the reboots a week in the field guarantees, and is what the app
+    // must surface beside the log.
+    if (d.type == ACAB_NEARBY_DEVICE && countLocked() >= gSlots) {
+        gSatDrops++;
+        if (!gSaturated) {          // ONE NVS write per deployment, not one per dropped record
+            gSaturated = true;
+            Preferences p; p.begin(NVS_NS, false); p.putBool("bufsat", true); p.end();
+        }
+        ioUnlock();
+        return;
+    }
+    if (gWipePending || appendBlockedLocked()) {
+        ioUnlock();
+        return;
+    }
 
-    // Atomically claim this record's seq and advance the ring under a spinlock, so two
-    // radio tasks appending at once can't collide on a slot or lose a head update. The
-    // encrypt + flash write happen AFTER the lock (flash must not run under a spinlock).
-    uint32_t seq;
-    portENTER_CRITICAL(&gAppendMux);
-    seq = gHead++;
-    if (gHead - gOldest > gSlots) gOldest = gHead - gSlots;  // ring evicted the oldest
-    portEXIT_CRITICAL(&gAppendMux);
+    // gHead is only a candidate until every flash operation succeeds. Advancing it first makes
+    // a failed write look like a stored record in count/status and creates a hole in replay.
+    const uint32_t seq = gHead;
 
     StoredDet s; memset(&s, 0, sizeof(s));
     s.seq       = seq;
@@ -388,11 +624,17 @@ void detLogAppend(const AcabDetection& d) {
 
     cryptPayload(&s);                                // encrypt payload in place
     s.crc = crc16((const uint8_t*)&s + ENC_OFF, ENC_LEN);   // CRC over ciphertext
-    writeSlot(slotOf(seq), &s);
+    const uint32_t idx = slotOf(seq);
+    if (prepareSlotLocked(seq, idx) && writeSlotLocked(idx, &s)) {
+        gHead = seq + 1;
+        if (gHead - gOldest > gSlots) gOldest = gHead - gSlots;
+    }
+    ioUnlock();
 }
 
 void detLogStartDrain(uint32_t lastSeq) {
-    if (gSlots == 0) return;
+    if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return; }
+    if (gSlots == 0) { ioUnlock(); return; }
     // A cursor at/above gHead is exact proof of a generation reset (the board only ever issues
     // seqs < gHead): a board-side wipe the phone never saw (auto-wipe after undrained reboots,
     // or the key-change wipe) restarted seq at 1 while the app kept its old cursor. Without
@@ -406,78 +648,121 @@ void detLogStartDrain(uint32_t lastSeq) {
     gDrain    = (lastSeq > floor) ? lastSeq : floor;
     gDraining = (gDrain + 1 < gHead);
     Preferences p; p.begin(NVS_NS, false); p.putUInt("lastconn", gBoot); p.end();  // reset auto-wipe timer
+    ioUnlock();
 }
 
-bool detLogDraining() { return gDraining; }
+bool detLogDraining() {
+    if (!ioLock()) return false;
+    const bool value = gDraining;
+    ioUnlock();
+    return value;
+}
 
 // Abort an in-flight drain (link dropped mid-replay). The next reconnect must re-arm via
 // detLogStartDrain (the app's {sync}) rather than resume from a stale cursor with no
 // {"hist":"begin"} lead-in. Idempotent; leaves gDrain where it was (the {sync} rebases it).
-void detLogStopDrain() { gDraining = false; }
-
-bool detLogNextForDrain(DetLogReplay* out) {
-    if (!gDraining || gSlots == 0) { gDraining = false; return false; }
-    while (gDrain + 1 < gHead) {
-        uint32_t seq = ++gDrain;
-        if (seq < gOldest) continue;                 // evicted since the cursor was set
-        StoredDet s;
-        if (!readSlot(slotOf(seq), &s)) continue;
-        if (!slotValid(&s, slotOf(seq)) || s.seq != seq) continue;  // empty / overwritten
-
-        cryptPayload(&s);                            // decrypt in place
-        if (!plausibleRecord(&s)) continue;          // wrong-key noise: the CRC is over ciphertext, so it got this far
-        unpackToDetection(&s, &out->d);
-        out->seq = seq;
-        // Absolute time from THIS RECORD'S boot anchor, not just the current boot's. Anchors are
-        // persisted (see anchorPut), so a record survives any number of reboots between capture and
-        // collection and stays exactly datable, as long as the app connected at least once during
-        // the boot that captured it. That is the evidence case: a board left running, whose battery
-        // dies before you come back for it.
-        // Always hand up whenMs + bootCount regardless, so the app can BRACKET a record from a boot
-        // that was never anchored ("after the last anchored time of boot N, before the first of
-        // boot N+1") instead of showing a bare "time unknown".
-        out->whenMs    = s.whenMs;
-        out->bootCount = s.bootCount;
-        const BootAnchor* a = anchorFor(s.bootCount);
-        if (a) {
-            // SIGNED both ways. A capture can sit on EITHER side of its anchor:
-            //   BEFORE it, for the boot being drained right now, because the app pushes a fresh
-            //     epoch on connect and that refreshed anchor is newer than everything buffered.
-            //   AFTER it, for every PRIOR boot. The board only buffers while disconnected, and it
-            //     only anchors on a sync push, so a prior boot's records were necessarily captured
-            //     after that boot's last sync. This is not the rare case, it is ALL of them.
-            // The first version of this only handled the backward direction and clamped the other
-            // to zero, which silently dated every prior-boot record AT its anchor and still called
-            // it non-approx. A board that collected for eight hours after you walked away and then
-            // lost power replayed those eight hours all stamped with the moment you last synced,
-            // presented as measured. Strictly worse than the pre-anchor behaviour, which at least
-            // reported approx and let the app bracket it.
-            // Uptime is monotonic within a boot, so forward reconstruction is exactly as sound as
-            // backward; there is no reboot between the anchor and the capture, that is what the
-            // bootCount match guarantees.
-            // Unsigned subtract then cast is the wrap-correct signed difference, so a millis()
-            // rollover between anchor and capture still yields the right delta as long as the true
-            // span is under the 24.85-day signed range. Beyond ANCHOR_SPAN_MAX_MS we cannot tell a
-            // wrap from a genuinely huge gap, so we decline to date it rather than guess.
-            int32_t deltaMs = (int32_t)(s.whenMs - a->atMs);
-            if (deltaMs > -ANCHOR_SPAN_MAX_MS && deltaMs < ANCHOR_SPAN_MAX_MS) {
-                out->atUnix = (uint32_t)((int64_t)a->epochUnix + (int64_t)deltaMs / 1000);
-                out->approx = false;
-            } else {
-                out->atUnix = 0;
-                out->approx = true;                  // uptime span implausible -> let the app bracket
-            }
-        } else {
-            out->atUnix = 0;
-            out->approx = true;                      // unanchored boot -> app brackets it by seq/boot
-        }
-        return true;
-    }
+void detLogStopDrain() {
+    if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return; }
     gDraining = false;
-    return false;                                    // drain complete
+    ioUnlock();
 }
 
-void detLogClear() {
+bool detLogNextForDrain(DetLogReplay* out) {
+    if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return false; }
+    if (!out || !gDraining || gSlots == 0) {
+        gDraining = false;
+        ioUnlock();
+        return false;
+    }
+    if (gDrain + 1 < gOldest) gDrain = gOldest - 1;  // sector erase advanced the floor
+    if (gDrain + 1 >= gHead) {
+        gDraining = false;
+        ioUnlock();
+        return false;
+    }
+
+    const uint32_t seq = gDrain + 1;
+    StoredDet s;
+    if (!readSlot(slotOf(seq), &s)) {
+        latchFaultLocked(DET_LOG_FAULT_READ);
+        gDraining = false;
+        ioUnlock();
+        return false;
+    }
+    if (!slotValid(&s, slotOf(seq)) || s.seq != seq) {
+        latchFaultLocked(DET_LOG_FAULT_CORRUPT);
+        // Keep only the newer contiguous suffix. This record and everything older can no
+        // longer be represented by an exact count, while newer records remain independently
+        // valid. The current drain aborts so the client sees the short transfer and resyncs.
+        gOldest = seq + 1;
+        if (gOldest > gHead) gOldest = gHead;
+        gDrain = seq;
+        gDraining = false;
+        ioUnlock();
+        return false;
+    }
+
+    cryptPayload(&s);                                // decrypt in place
+    if (!plausibleRecord(&s)) {
+        latchFaultLocked(DET_LOG_FAULT_CORRUPT);
+        gOldest = seq + 1;
+        if (gOldest > gHead) gOldest = gHead;
+        gDrain = seq;
+        gDraining = false;
+        ioUnlock();
+        return false;
+    }
+    unpackToDetection(&s, &out->d);
+    out->seq = seq;
+    gDrain = seq;                                    // commit cursor only after a valid replay record
+    // Absolute time from THIS RECORD'S boot anchor, not just the current boot's. Anchors are
+    // persisted (see anchorPut), so a record survives any number of reboots between capture and
+    // collection and stays exactly datable, as long as the app connected at least once during
+    // the boot that captured it. That is the evidence case: a board left running, whose battery
+    // dies before you come back for it.
+    // Always hand up whenMs + bootCount regardless, so the app can BRACKET a record from a boot
+    // that was never anchored ("after the last anchored time of boot N, before the first of
+    // boot N+1") instead of showing a bare "time unknown".
+    out->whenMs    = s.whenMs;
+    out->bootCount = s.bootCount;
+    const BootAnchor* a = anchorFor(s.bootCount);
+    if (a) {
+        // SIGNED both ways. A capture can sit on EITHER side of its anchor:
+        //   BEFORE it, for the boot being drained right now, because the app pushes a fresh
+        //     epoch on connect and that refreshed anchor is newer than everything buffered.
+        //   AFTER it, for every PRIOR boot. The board only buffers while disconnected, and it
+        //     only anchors on a sync push, so a prior boot's records were necessarily captured
+        //     after that boot's last sync. This is not the rare case, it is ALL of them.
+        // The first version of this only handled the backward direction and clamped the other
+        // to zero, which silently dated every prior-boot record AT its anchor and still called
+        // it non-approx. A board that collected for eight hours after you walked away and then
+        // lost power replayed those eight hours all stamped with the moment you last synced,
+        // presented as measured. Strictly worse than the pre-anchor behaviour, which at least
+        // reported approx and let the app bracket it.
+        // Uptime is monotonic within a boot, so forward reconstruction is exactly as sound as
+        // backward; there is no reboot between the anchor and the capture, that is what the
+        // bootCount match guarantees.
+        // Unsigned subtract then cast is the wrap-correct signed difference, so a millis()
+        // rollover between anchor and capture still yields the right delta as long as the true
+        // span is under the 24.85-day signed range. Beyond ANCHOR_SPAN_MAX_MS we cannot tell a
+        // wrap from a genuinely huge gap, so we decline to date it rather than guess.
+        int32_t deltaMs = (int32_t)(s.whenMs - a->atMs);
+        if (deltaMs > -ANCHOR_SPAN_MAX_MS && deltaMs < ANCHOR_SPAN_MAX_MS) {
+            out->atUnix = (uint32_t)((int64_t)a->epochUnix + (int64_t)deltaMs / 1000);
+            out->approx = false;
+        } else {
+            out->atUnix = 0;
+            out->approx = true;                      // uptime span implausible -> let the app bracket
+        }
+    } else {
+        out->atUnix = 0;
+        out->approx = true;                          // unanchored boot -> app brackets it by seq/boot
+    }
+    ioUnlock();
+    return true;
+}
+
+static void clearLocked() {
     if (gSlots == 0) return;
     // LOGICAL clear now, PHYSICAL erase deferred. This runs on the NimBLE host task (the
     // {"clearlog"} config write and detLogSetKey's key-change wipe), where the old synchronous
@@ -485,7 +770,6 @@ void detLogClear() {
     // GATT and scanning for seconds. Resetting the cursors is microseconds and immediately
     // restores the guarantees that matter: detLogCount() reads 0, and a {"sync"} later in the
     // same handshake arms nothing over the condemned records.
-    gHead = 1; gOldest = 1; gDrain = 0; gDraining = false;
     // Advance the generation so post-clear records (which restart at seq=1) never reuse an
     // AES-CTR nonce (bootCount:seq) from the records being erased - reuse would XOR two
     // plaintexts under one keystream. Each record stores its own bootCount cleartext, so
@@ -497,12 +781,24 @@ void detLogClear() {
     Preferences p; p.begin(NVS_NS, false);
     p.putUInt("boot", gBoot);
     p.putBool("wipe", true);
+    p.putBool("bufsat", false);   // the censored-tail marker is per-log; this is a new log
     p.end();
-    portENTER_CRITICAL(&gWipeMux);
-    gWipeGen++;          // a sweep already in flight restarts at offset 0 under the new latch
+    // Publish the empty logical generation only after the persistent wipe latch has been
+    // attempted. The mutex keeps append and drain out across both transitions.
+    gHead = 1; gOldest = 1; gDrain = 0; gDraining = false;
+    // A wipe starts a genuinely fresh log, so the censored-tail marker clears with it. Left set,
+    // it would permanently mark every future log as truncated and the warning would stop meaning
+    // anything, which is worse than not having it.
+    gSaturated = false; gSatDrops = 0;
     gWipeNext = 0;
     gWipePending = true;
-    portEXIT_CRITICAL(&gWipeMux);
+    gWipeStalled = false;
+}
+
+void detLogClear() {
+    if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return; }
+    clearLocked();
+    ioUnlock();
 }
 
 // One chunk of a latched wipe: erase a single 64KB flash block per call. Runs on the loop
@@ -510,35 +806,102 @@ void detLogClear() {
 // the flash cache for ~100-250ms, and chunking with a loop-pass gap between blocks keeps
 // GATT, scanning, and the sink task live across the sweep instead of a device-wide stall.
 void detLogEraseTick() {
-    if (!gWipePending || gSlots == 0) return;
-    portENTER_CRITICAL(&gWipeMux);
-    uint32_t gen = gWipeGen;
-    uint32_t off = gWipeNext;
-    portEXIT_CRITICAL(&gWipeMux);
-    uint32_t n = (uint32_t)gPart->size - off;
+    if (!ioLock()) { gFaults |= DET_LOG_FAULT_LOCK; return; }
+    if (!gWipePending || gWipeStalled || gSlots == 0) { ioUnlock(); return; }
+    const uint32_t off = gWipeNext;
+    const uint32_t ringBytes = gSlots * (uint32_t)SLOT;
+    uint32_t n = ringBytes - off;
     if (n > WIPE_BLOCK) n = WIPE_BLOCK;
-    if (n) esp_partition_erase_range(gPart, off, n);
-    bool done = false;
-    portENTER_CRITICAL(&gWipeMux);
-    if (gWipeGen == gen) {           // no re-latch landed mid-erase; else the fresh sweep restarts at 0
-        gWipeNext = off + n;
-        if (gWipeNext >= gPart->size) { gWipePending = false; done = true; }
+    if (n && esp_partition_erase_range(gPart, off, n) != ESP_OK) {
+        latchFaultLocked(DET_LOG_FAULT_ERASE);
+        // Do not hammer a failing flash block on every loop pass. The persisted wipe latch
+        // remains set and appends remain blocked. Another explicit clear or a reboot retries.
+        gWipeStalled = true;
+        ioUnlock();
+        return;
     }
-    portEXIT_CRITICAL(&gWipeMux);
-    if (done) { Preferences p; p.begin(NVS_NS, false); p.putBool("wipe", false); p.end(); }
+    gWipeNext = off + n;
+    if (gWipeNext >= ringBytes) {
+        gWipePending = false;
+        gWipeStalled = false;
+        gFaults = DET_LOG_FAULT_NONE;
+        Preferences p; p.begin(NVS_NS, false);
+        p.putBool("wipe", false);
+        p.putUInt("fault", DET_LOG_FAULT_NONE);
+        p.end();
+    }
+    ioUnlock();
 }
 
-bool detLogWipePending() { return gWipePending; }
+bool detLogWipePending() {
+    if (!ioLock()) return gWipePending;
+    const bool value = gWipePending;
+    ioUnlock();
+    return value;
+}
 
-uint32_t detLogCount() { return (gHead > gOldest) ? (gHead - gOldest) : 0; }
+uint32_t detLogCount() {
+    if (!ioLock()) return 0;
+    const uint32_t value = countLocked();
+    ioUnlock();
+    return value;
+}
 
 // Records still queued for the current drain (seq in (gDrain, gHead)). Valid after
 // detLogStartDrain, which clamps gDrain to >= gOldest-1, so none of these are evicted and this
 // equals exactly what the replay will send. 0 when no drain is armed / nothing is queued.
-uint32_t detLogPendingDrain() { return (gHead > gDrain + 1) ? (gHead - 1 - gDrain) : 0; }
+uint32_t detLogPendingDrain() {
+    if (!ioLock()) return 0;
+    const uint32_t value = gDraining && gHead > gDrain + 1 ? gHead - 1 - gDrain : 0;
+    ioUnlock();
+    return value;
+}
 
 // Next seq the armed drain will send (gDrain + 1). Carried as "from" in the {"hist":"begin"}
 // sentinel so the app can rebase its persisted cursor after a board-side wipe reset the seq
 // generation (see the clamp in detLogStartDrain) - otherwise every reconnect re-replays the
 // whole ring until the new generation climbs past the stale cursor.
-uint32_t detLogDrainFrom() { return gDrain + 1; }
+uint32_t detLogDrainFrom() {
+    if (!ioLock()) return 0;
+    const uint32_t value = gDrain + 1;
+    ioUnlock();
+    return value;
+}
+
+uint32_t detLogFaults() {
+    if (!ioLock()) return gFaults | DET_LOG_FAULT_LOCK;
+    const uint32_t value = gFaults;
+    ioUnlock();
+    return value;
+}
+
+#ifdef ACAB_HOST_TEST
+void detLogHostResetRuntime() {
+    if (!gIoMutex) gIoMutex = xSemaphoreCreateMutexStatic(&gIoMutexStorage);
+    if (!ioLock()) return;
+    gPart = nullptr;
+    gSlots = 0;
+    gHead = 1;
+    gOldest = 1;
+    gBoot = 0;
+    gDrain = 0;
+    gDraining = false;
+    gWipePending = false;
+    gWipeNext = 0;
+    gWipeStalled = false;
+    gEnabled = false;
+    gBufferAll = false;
+    gSaturated = false;
+    gSatDrops = 0;
+    gFaults = DET_LOG_FAULT_NONE;
+    memset(gKey, 0, sizeof(gKey));
+    gHaveKey = false;
+    memset(gKeyFp, 0, sizeof(gKeyFp));
+    gHaveKeyFp = false;
+    gEpochUnix = 0;
+    gEpochAtMs = 0;
+    memset(gAnchors, 0, sizeof(gAnchors));
+    gAnchorNext = 0;
+    ioUnlock();
+}
+#endif

@@ -55,9 +55,11 @@ inline uint32_t acabPairWindowRemainingAt(uint32_t nowMs, uint32_t untilMs, bool
 ///
 /// Four inputs, and each rejection reason is a distinct product decision:
 ///
-///   gateEnabled  - does this TARGET enforce at all. False on any build that never arms a window
-///                  (mesh-detect), which must keep its pre-feature behaviour rather than inherit a
-///                  rejection it can never open a window to satisfy.
+///   gateEnabled  - does this TARGET enforce at all. Every GATT-serving production target now
+///                  enables it (beacon-board from its power-gate signals, mesh-detect from the
+///                  reset reason with cellAbsent=true); false remains the pre-feature behaviour
+///                  for any build that never arms a window, which must not inherit a rejection
+///                  it can never open a window to satisfy.
 ///   boardHasBond - does the board already have an owner. A board with ZERO bonds pairs freely,
 ///                  which is the whole out-of-box experience: a unit that shipped weeks ago, or sat
 ///                  in a drawer, must connect on the customer's first try with no ritual. There is
@@ -74,6 +76,28 @@ inline bool acabPairAdmit(bool gateEnabled, bool boardHasBond, bool known, bool 
     if (!boardHasBond) return true;   // unowned board: first pairing always works
     if (known)         return true;   // the owner, reconnecting
     return windowOpen;                // a stranger: only during the window
+}
+
+/// May a connected peer remain on the link while security is still being established?
+///
+/// Admission is re-evaluated because a stranger can connect during the physical pairing window
+/// and then deliberately stall SMP until after it closes. The elapsed-time check is deliberately
+/// subtraction based, so it remains correct when millis() rolls over.
+inline bool acabPairPreAuthMayContinue(bool gateEnabled, bool boardHadBondAtConnect,
+                                       bool knownAtConnect, bool windowOpen,
+                                       uint32_t elapsedMs, uint32_t timeoutMs) {
+    if (elapsedMs >= timeoutMs) return false;
+    return acabPairAdmit(gateEnabled, boardHadBondAtConnect, knownAtConnect, windowOpen);
+}
+
+/// May this session arm the legacy nRF bootloader?
+///
+/// The stock legacy DFU bootloader cannot authenticate an image itself. Firmware can at least
+/// require both a secure bonded app session and the short RAM-only window proving a person just
+/// power-cycled the board. This is a physical/session gate, not a substitute for migrating the
+/// bootloader to signed Secure DFU.
+inline bool acabLegacyDfuMayArm(bool secureReady, bool physicalWindowOpen) {
+    return secureReady && physicalWindowOpen;
 }
 
 /// Was this boot a PHYSICAL start, i.e. did a person just apply power or deliberately switch it on?

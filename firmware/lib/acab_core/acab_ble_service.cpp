@@ -136,12 +136,38 @@ __attribute__((weak)) int acabNrfVersion() { return -1; }
 __attribute__((weak)) bool acabNrfDfuActive() { return false; }
 
 // {"nrfdfu":true} request latch. Set on the NimBLE host task, drained from loop() so the S3
-// forwards the DFU trigger off the host task (see acabBleTakeNrfDfuRequest). Plain non-atomic
-// read-clear: the only writer that sets it is the config-write callback and the only reader that
-// clears it is loop(); a set racing the clear just services one loop later, harmless for a manual
-// one-shot. Left non-atomic deliberately.
-static volatile bool gNrfDfuReq = false;
-bool acabBleTakeNrfDfuRequest() { bool r = gNrfDfuReq; gNrfDfuReq = false; return r; }
+// forwards the DFU trigger off the host task (see acabBleTakeNrfDfuRequest). An atomic exchange
+// makes the read-and-clear indivisible: a request that arrives while loop() drains the latch is
+// either consumed by that exchange or remains set for the next pass.
+static std::atomic<bool> gNrfDfuReq{false};
+static bool nrfDfuMayArmNow();
+bool acabBleTakeNrfDfuRequest() {
+    const bool requested = gNrfDfuReq.exchange(false, std::memory_order_acq_rel);
+    if (!requested) return false;
+    const bool allowed = nrfDfuMayArmNow();
+    if (!allowed) {
+        Serial.println("[nrf] DFU request expired or link is not secure; power-cycle and retry");
+    }
+    return allowed;
+}
+
+// {"poweroff":true} request latch. SAME host-task-set / loop()-drained discipline as gNrfDfuReq
+// above, because powerOffDeepSleep blocks on the nRF park handshake and then never returns - it
+// cannot run on the NimBLE host task. Unlike DFU there is NO physical-pairing-window gate: powering
+// off a board is low-risk (the user just presses the button to bring it back), and WRITE_ENC already
+// means only a bonded peer reaches the write. The rev-B check and the mid-OTA guard live at the loop
+// drain, not here.
+static std::atomic<bool> gPowerOffReq{false};
+bool acabBleTakePowerOffRequest() {
+    return gPowerOffReq.exchange(false, std::memory_order_acq_rel);
+}
+// Tell a connected app the board is deep-sleeping ON PURPOSE (a button-hold or app power-off), so it
+// flags the coming link drop as a clean shutdown instead of an error / reconnect spin. Sent by
+// powerOffDeepSleep only when it is really about to drop, so the app arms its intent on this and not
+// on the mere request - a board that never reaches here never sends it. otaNotify is a no-op with no
+// subscriber, and is safe from the loop task (same path acabBleUpdateStatus already notifies from).
+static void otaNotify(const char* json);   // defined further down (needs the OTA char handle); fwd-declared for this early caller
+void acabBleNotifyPoweringOff() { otaNotify("{\"pwr\":\"off\"}"); }
 
 // The buzzer (alerts) is OUI-Spy hardware; the Mesh-Detect board has none. These
 // weak no-ops let this shared service link on a buzzer-less build - oui-spy's
@@ -179,8 +205,18 @@ static volatile bool     gPairWindowArmed = false;
 // uptime and would report the window OPEN again. Once closed, stays closed until a power cycle,
 // which is already the only documented way to reopen it.
 static volatile bool     gPairWindowLatchedClosed = false;
-// Does THIS TARGET enforce the pairing window at all? False unless the target armed the window at
-// least once, which only beacon-board does.
+// Does THIS TARGET enforce the pairing window at all? False until the target opts in, via EITHER
+// of two entry points:
+//
+//   acabBlePairGateEnable()    - enforcement ONLY. beacon-board calls this UNCONDITIONALLY, so a
+//                                warm boot enforces the gate without opening any window.
+//   acabBleOpenPairingWindow() - opens a window AND enables, for a genuine physical start.
+//
+// "unless the target armed the window at least once" was the old test, and it is no longer true:
+// enforcement and "a person just turned this on" were deliberately split into separate questions
+// and separate calls, precisely so a warm continuation can enforce without arming. Before that
+// split, every OTA restart, panic, watchdog and brownout came back with the gate OFF and admitted
+// any phone indefinitely.
 //
 // This flag exists because the gate lives in shared code. Without it, a target that never calls
 // acabBleOpenPairingWindow() (mesh-detect) inherits the REJECTION with no way to ever open a
@@ -204,7 +240,21 @@ static NimBLECharacteristic* gDetChar = nullptr;
 static NimBLECharacteristic* gCfgChar = nullptr;
 static NimBLECharacteristic* gStatChar = nullptr;
 static NimBLECharacteristic* gOtaChar = nullptr;
-static volatile bool         gConnected = false;
+// A physical GAP link is not yet a trusted app session. Keep the two states separate so a peer
+// that stalls before encrypted bonding cannot suppress offline logging, receive notifications, or
+// make the UI report a connection. gLinkConnected only prevents advertising from being restarted
+// underneath the controller while SMP is in flight.
+static volatile bool         gLinkConnected = false;
+static volatile bool         gConnected = false;       // encrypted and bonded, or known bonded
+static volatile uint16_t     gConnHandle = 0xffff;
+static volatile uint32_t     gAuthStartedMs = 0;
+static volatile bool         gPeerKnownAtConnect = false;
+static volatile bool         gBoardHadBondAtConnect = false;
+static const uint32_t        AUTH_TIMEOUT_MS = 30000;
+
+static bool nrfDfuMayArmNow() {
+    return acabLegacyDfuMayArm(gConnected, acabBlePairWindowOpen());
+}
 
 // NimBLE host-privacy re-arm. Private header (ble_hs_pvcy_priv.h), no NimBLE-Arduino wrapper.
 extern "C" int ble_hs_pvcy_rpa_config(uint8_t enable);
@@ -264,7 +314,7 @@ static int acabGapTap(ble_gap_event* ev, void*) {
 // Restarting from inside the callback is legal: preempt_done clears the preempted flag inside the
 // lock BEFORE dispatching, so start() here does not return BLE_HS_EPREEMPTED.
 static void advCompleteCb(NimBLEAdvertising* a) {
-    if (!gConnected && a) a->start(0, advCompleteCb);
+    if (!gLinkConnected && a) a->start(0, advCompleteCb);
 }
 static uint32_t              gHistSent  = 0;     // records sent so far in the current replay drain
 static bool                  gHistBeginSent = false;  // whether this drain's {"hist":"begin","n":N} lead-in went out
@@ -391,14 +441,16 @@ class ServerCb : public NimBLEServerCallbacks {
         // resolved identity once the controller matched its IRK, peer_ota_addr is what is on air
         // (still the rotating RPA when resolution has not happened). Treating "known" as the OR of
         // the two is what lets an existing iPhone reconnect outside the window.
+        bool known = false;
+        const bool boardHadBond = acabBleBondCount() > 0;
         if (d) {
-            const bool known = NimBLEDevice::isBonded(NimBLEAddress(d->peer_id_addr)) ||
-                               NimBLEDevice::isBonded(NimBLEAddress(d->peer_ota_addr));
+            known = NimBLEDevice::isBonded(NimBLEAddress(d->peer_id_addr)) ||
+                    NimBLEDevice::isBonded(NimBLEAddress(d->peer_ota_addr));
             // See acabPairAdmit for what each input means and why. Short version: the only peer
             // ever refused is a stranger, outside the window, on a board that ALREADY has an owner.
             // A board with no bonds pairs freely, so an out-of-box unit never makes the customer
             // learn the recovery step on their very first connect.
-            if (!acabPairAdmit(gPairGateEnabled, acabBleBondCount() > 0, known,
+            if (!acabPairAdmit(gPairGateEnabled, boardHadBond, known,
                                acabBlePairWindowOpen())) {
                 Serial.println("[pair] window CLOSED and peer is not bonded -> rejecting. "
                                "Power-cycle the board to open a fresh 2-minute window.");
@@ -408,19 +460,29 @@ class ServerCb : public NimBLEServerCallbacks {
                 return;
             }
         }
-        gConnected = true;
+        gLinkConnected = true;
+        gConnected = false;
+        gConnHandle = d ? d->conn_handle : 0xffff;
+        gAuthStartedMs = millis();
+        gPeerKnownAtConnect = known;
+        gBoardHadBondAtConnect = boardHadBond;
         gPeerMtu = 23;   // reset to the BLE default; the MTU exchange bumps it right after connect
         gIgnoreStageN = 0; gWatchStageN = 0;   // fresh connection: drop any half-staged chunk sequence
         gIgnoreHadContent = false; gWatchHadContent = false;   // and this peer has proved nothing yet
         // Connection lifecycle on the wire. Added because the board previously said nothing when a
         // phone attached or left, which made "did the bond survive the update" impossible to answer
         // from the board side: a working reconnect and a silent failure looked identical here.
-        Serial.println("[ACAB] BLE peer connected");
+        Serial.println("[ACAB] BLE link connected; waiting for encrypted bond");
     }
     // Pairing outcome, which is the ONLY way to tell "the bond resolved" from "the link came up and
     // then security failed". Added 2026-08-02 after a bonded phone connected, chirped, and dropped:
     // from the board side those two look identical without this.
     void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
+        if (!desc) {
+            Serial.println("[ACAB] pairing failed: no connection descriptor");
+            if (gServer && gConnHandle != 0xffff) gServer->disconnect(gConnHandle);
+            return;
+        }
         Serial.printf("[ACAB] pairing: encrypted=%d authenticated=%d bonded=%d peer_id_type=%d "
                       "peer_id=%02x:%02x:%02x:%02x:%02x:%02x\n",
                       desc->sec_state.encrypted, desc->sec_state.authenticated,
@@ -428,6 +490,24 @@ class ServerCb : public NimBLEServerCallbacks {
                       desc->peer_id_addr.val[5], desc->peer_id_addr.val[4],
                       desc->peer_id_addr.val[3], desc->peer_id_addr.val[2],
                       desc->peer_id_addr.val[1], desc->peer_id_addr.val[0]);
+        // No-I/O Just Works pairing does not provide MITM authentication, so `authenticated` is
+        // expected to be false. The security boundary this product can enforce is encryption plus
+        // a persistent bond. A previously known bonded peer is accepted on an encrypted reconnect.
+        const bool secure = desc->sec_state.encrypted &&
+                            (desc->sec_state.bonded || gPeerKnownAtConnect);
+        const bool stillAdmitted = acabPairAdmit(gPairGateEnabled,
+                                                  gBoardHadBondAtConnect,
+                                                  gPeerKnownAtConnect,
+                                                  acabBlePairWindowOpen());
+        if (!secure || !stillAdmitted) {
+            Serial.println(!secure
+                ? "[ACAB] pairing failed to establish an encrypted bond; disconnecting"
+                : "[ACAB] pairing window closed before stranger authenticated; disconnecting");
+            if (gServer && gConnHandle != 0xffff) gServer->disconnect(gConnHandle);
+            return;
+        }
+        gConnected = true;
+        Serial.println("[ACAB] BLE peer secure and ready");
     }
     // Track the negotiated MTU so every notify path can size to what the peer accepts (see
     // notifyCap). Fires after connect once the client exchanges MTU.
@@ -436,7 +516,18 @@ class ServerCb : public NimBLEServerCallbacks {
         Serial.printf("[ACAB] MTU negotiated: %u\n", (unsigned)mtu);
     }
     void onDisconnect(NimBLEServer*) override {
+        gLinkConnected = false;
         gConnected = false;
+        gConnHandle = 0xffff;
+        gAuthStartedMs = 0;
+        gPeerKnownAtConnect = false;
+        gBoardHadBondAtConnect = false;
+        // A phone fix belongs to one authenticated connection. Keeping it after the
+        // owner leaves lets later scanner rows, and especially the public mesh target,
+        // inherit a precise observer location that is no longer current or consented.
+        portENTER_CRITICAL(&gGpsMux);
+        gPhoneLat = 0; gPhoneLon = 0; gPhoneGpsMs = 0;
+        portEXIT_CRITICAL(&gGpsMux);
         gIgnoreStageN = 0; gWatchStageN = 0;   // drop any half-staged chunk sequence on link drop
         gIgnoreHadContent = false; gWatchHadContent = false;
         // A link drop mid-update must not leave OTA stuck BUSY with the radios paused:
@@ -537,8 +628,12 @@ static void handleOtaControl(JsonObject o) {
         otaAbort();
         otaQuiesce(false);
     } else if (o["confirm"].is<bool>() && o["confirm"].as<bool>()) {
-        otaMarkHealthy();
-        otaNotify("{\"ota\":\"ok\"}");
+        // "ok" is a durable acknowledgement, not merely "the new image is running." A fresh
+        // trial must satisfy the product-health gate before otaMarkHealthy can commit and disarm
+        // rollback. Tell the app to retry until that succeeds; claiming ok here used to let both
+        // apps report completion while a quick power cycle could still revert the board.
+        if (otaMarkHealthy()) otaNotify("{\"ota\":\"ok\"}");
+        else otaNotify("{\"ota\":\"health-wait\"}");
     }
 }
 
@@ -717,10 +812,12 @@ class CfgCb : public NimBLECharacteristicCallbacks {
         // Phone GPS from the app: where we are, stamped onto detections + the mesh line.
         if (doc["lat"].is<float>() && doc["lon"].is<float>()) {
             double la = doc["lat"].as<double>(), lo = doc["lon"].as<double>();
-            uint32_t now = millis();
-            portENTER_CRITICAL(&gGpsMux);
-            gPhoneLat = la; gPhoneLon = lo; gPhoneGpsMs = now;
-            portEXIT_CRITICAL(&gGpsMux);
+            if (la >= -90.0 && la <= 90.0 && lo >= -180.0 && lo <= 180.0) {
+                uint32_t now = millis();
+                portENTER_CRITICAL(&gGpsMux);
+                gPhoneLat = la; gPhoneLon = lo; gPhoneGpsMs = now;
+                portEXIT_CRITICAL(&gGpsMux);
+            }
         }
         // --- offline detection buffer (det_log) ---
         if (doc["buffer"].is<bool>()) {
@@ -728,6 +825,23 @@ class CfgCb : public NimBLECharacteristicCallbacks {
             detLogSetEnabled(on);
             Serial.printf("[ACAB] Offline buffer %s\n", on ? "ENABLED" : "disabled");
         }
+        // "Record everything": also buffer uncategorized nearby devices, and re-arm capture on a
+        // timer, so a board left unattended can answer "did anything come by at all" instead of
+        // only "did a KNOWN signature come by". Deploy-and-leave only. See the long note in
+        // det_log.h, including the auto-wipe tradeoff the app must surface where the user flips it.
+        if (doc["bufall"].is<bool>()) {
+            bool on = doc["bufall"].as<bool>();
+            detLogSetBufferAll(on);
+            Serial.printf("[ACAB] Offline buffer: record-everything %s\n", on ? "ENABLED" : "disabled");
+        }
+#ifdef ACAB_CAPTURE_BUILD
+        // {"mark":"<label>"} - ground-truth marker for field validation. CAPTURE BUILDS ONLY, and
+        // that is the point: it exists to justify signatures, not to be one. It changes no
+        // classification, emits no detection and returns nothing to the app; the output goes to
+        // the serial capture. Ignored entirely by a shipping build, so an app that sends it to a
+        // production board simply gets no effect rather than an error.
+        if (doc["mark"].is<const char*>()) acabScannerMark(doc["mark"].as<const char*>());
+#endif
         if (doc["key"].is<const char*>()) {            // 64 hex chars -> 32-byte at-rest key
             uint8_t k[32];
             if (hexToBytes(doc["key"].as<const char*>(), k, 32)) detLogSetKey(k);
@@ -741,9 +855,29 @@ class CfgCb : public NimBLECharacteristicCallbacks {
         // Dual-radio black box on the nRF: replay its records, or wipe it (seizure-aware).
         if (doc["bbdump"].is<bool>()  && doc["bbdump"].as<bool>())  acabScannerSendCoProcCmd("DUMP");
         if (doc["bbclear"].is<bool>() && doc["bbclear"].as<bool>()) acabScannerSendCoProcCmd("BCLR");
-        // Kick the companion nRF into BLE OTA DFU (dual board; no-op elsewhere). Just latch the
-        // request here - loop() forwards the "DFU" trigger over UART off the NimBLE host task.
-        if (doc["nrfdfu"].is<bool>() && doc["nrfdfu"].as<bool>()) gNrfDfuReq = true;
+        // The stock legacy nRF bootloader cannot authenticate an image. In addition to the app's
+        // signed-package verification, require the encrypted bonded link and the short RAM-only
+        // physical-start window before arming it. The drain re-checks both so a delayed request
+        // cannot escape the session that authorized it.
+        if (doc["nrfdfu"].is<bool>() && doc["nrfdfu"].as<bool>()) {
+            if (nrfDfuMayArmNow()) {
+                gNrfDfuReq.store(true, std::memory_order_release);
+                otaNotify("{\"ota\":\"nrf-ready\"}");
+            } else {
+                Serial.println("[nrf] DFU denied: power-cycle, reconnect securely, then retry");
+                otaNotify("{\"ota\":\"nrf-denied\",\"e\":\"physical\"}");
+            }
+        }
+        // App power-off ({"poweroff":true}). Latch ONLY - the real deep-sleep shutdown runs from the
+        // beacon-board loop(), never here: powerOffDeepSleep blocks on the nRF park handshake and then
+        // never returns, which on the NimBLE host task would freeze the whole BLE stack. The rev-B gate
+        // and the mid-OTA guard are applied by the loop drain. The {"pwr":"off"} heads-up to the app is
+        // sent from powerOffDeepSleep itself, and ONLY when the board is genuinely about to drop - so a
+        // board that ignores this key (older firmware) never tells the app "off", and the app therefore
+        // never mis-arms its intentional-disconnect flag against a board that will keep running.
+        if (doc["poweroff"].is<bool>() && doc["poweroff"].as<bool>()) {
+            gPowerOffReq.store(true, std::memory_order_release);
+        }
         // Firmware update control. Handled last: an {"ota":{"end"}} reboots the board.
         if (doc["ota"].is<JsonObject>()) handleOtaControl(doc["ota"].as<JsonObject>());
         acabBleUpdateStatus();
@@ -980,6 +1114,9 @@ static size_t serializeDetection(const AcabDetection& d, bool isNew, char* buf, 
     if (d.name[0])   doc["name"] = d.name;
     if (d.id[0])     doc["id"]   = d.id;
     if (d.detail[0]) doc["det"]  = d.detail;
+    // BLE mfg-specific company ID, for diagnosability (ble-protocol.md): the glasses and tracker
+    // detectors key on it, so the detail screen can show which company ID the board actually saw.
+    if (d.companyId && acabElideKeeps(ACAB_FIELD_CID, elide)) doc["cid"] = d.companyId;
     if (d.lat || d.lon)           { doc["lat"]  = d.lat;  doc["lon"]  = d.lon; }
     if (d.gpsAgeMs)               doc["gage"] = (uint32_t)(d.gpsAgeMs / 1000);   // GPS fix age (s)
     if ((d.pilotLat || d.pilotLon) && acabElideKeeps(ACAB_FIELD_PILOT, elide)) {
@@ -1028,7 +1165,25 @@ void acabBleDrainTick() {
     // lands while the callback pointer is momentarily unset. Rate-limited so a genuinely failing
     // start() cannot spin, and it logs, because a board recovering itself in silence teaches
     // nobody anything.
-    if (!gConnected && gAdvIntended) {
+    // Drop an unauthenticated link promptly. Besides bounding an SMP resource hold, this keeps a
+    // raw connection from parking the radio indefinitely. The physical pairing decision is
+    // re-evaluated so a stranger cannot connect just before the window closes and authenticate
+    // later. Offline logging continues throughout this state because gConnected remains false.
+    if (gLinkConnected && !gConnected) {
+        const uint32_t elapsed = (uint32_t)(millis() - gAuthStartedMs);
+        if (!acabPairPreAuthMayContinue(gPairGateEnabled,
+                                        gBoardHadBondAtConnect,
+                                        gPeerKnownAtConnect,
+                                        acabBlePairWindowOpen(),
+                                        elapsed, AUTH_TIMEOUT_MS)) {
+            Serial.println(elapsed >= AUTH_TIMEOUT_MS
+                ? "[ACAB] BLE authentication timed out; disconnecting"
+                : "[ACAB] pairing window closed before authentication; disconnecting");
+            if (gServer && gConnHandle != 0xffff) gServer->disconnect(gConnHandle);
+        }
+    }
+
+    if (!gLinkConnected && gAdvIntended) {
         NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
         static uint32_t lastKick = 0;
         const uint32_t now = millis();
@@ -1146,8 +1301,9 @@ void acabBleNotifyDetection(const AcabDetection& d, bool isNew) {
     // DEGRADE, DO NOT DROP. Over the peer's usable MTU budget (an iPhone negotiating 185 leaves
     // ~182 usable bytes, and a fully-populated drone Remote ID record exceeds that), give up the
     // optional enrichment one field at a time in the documented order until it fits, instead of
-    // skipping the sighting. The COMPLETE record still reaches the offline buffer, whose drain path
-    // has seq/resync; the live notify's job is the alert, not the archive. See detect_elide.h.
+    // skipping the sighting. An elided field is LOST, not deferred: StoredDet persists none of
+    // the elidable fields, so replay cannot restore them. The live notify's job is the alert,
+    // not the archive, and the fields it depends on are never elidable. See detect_elide.h.
     uint8_t used = ACAB_ELIDE_NONE;
     while (len > notifyCap() && used < ACAB_ELIDE_MAX) {
         used++;
@@ -1256,6 +1412,7 @@ void acabBleSendDiag() {
     doc["sqHigh"] = acabScannerSinkHighWater();            // deepest the queue has been, of 32
     doc["nElide"] = acabBleNotifyElidedCount();            // live notifies that fit only after trimming
     doc["nOver"]  = acabBleNotifyOverCapCount();           // live notifies lost even fully trimmed
+    if (uint32_t faults = detLogFaults()) doc["buferr"] = faults;
     doc["up"]     = (uint32_t)(millis() / 1000);
     // Retained core dump, if any. Metadata ONLY - the 64 KB image itself is not shipped over this
     // path (see coredump_report.h; a raw dump over unacked notifies is not acceptable and its
@@ -1311,7 +1468,7 @@ void acabBleUpdateStatus() {
     doc["wifi"]   = acabScannerWiFiEnabled();
     doc["wifiEco"]= acabScannerWifiEco();   // 0/3/7/15 s WiFi-sweep sleep; apps show the eco picker
 
-    doc["axon"]   = axonIsEnabled();   // body-cam toggle state; both apps read this (iOS "axon", Android falls back to it)
+    doc["axon"]   = axonIsEnabled();   // body-cam toggle state; both apps read "bodycam" first and fall back to this
     doc["moto"]   = policeIsEnabled(); // broad Motorola-OUI sub-toggle; apps treat an absent key as true (pre-split firmware)
     doc["tracker"]= trackerIsEnabled();
     doc["glasses"]= glassesIsEnabled();
@@ -1325,6 +1482,17 @@ void acabBleUpdateStatus() {
     doc["gps"]    = (gPhoneGpsMs != 0) && (millis() - gPhoneGpsMs < 60000);
     doc["buf"]    = detLogCount();          // stored offline records
     doc["bufon"]  = detLogEnabled();        // buffering opt-in state
+    // Only sent when ON. Absent means off, which is the default, so the common case costs no MTU
+    // bytes - same trick as "ledon" above. The app needs it to reconcile the switch AND to keep
+    // showing the weakened-auto-wipe warning for as long as the mode is actually armed.
+    if (detLogBufferAll()) doc["bufall"] = true;
+    // Ring saturation: the TAIL of the stored log is censored. Sent only when true, same idiom.
+    // This is not a settings-screen detail - the app must show it BESIDE THE LOG, because without
+    // it a full-looking replay cannot be distinguished from one that stopped recording days early.
+    if (detLogSaturated()) doc["bufsat"] = true;
+    // Latched flash fault bitmask. A nonzero value means the ring stopped accepting writes rather
+    // than pretending evidence was stored; only a fully successful physical wipe clears it.
+    if (uint32_t faults = detLogFaults()) doc["buferr"] = faults;
     if (detLogWipePending()) doc["wiping"] = true;   // deferred buffer erase still sweeping; absent = idle
     doc["desert"] = desertIsEnabled();      // Desert mode (report every device in range)
     doc["ign"]    = acabScannerIgnoreCount();  // ignore-list size, for app reconciliation

@@ -17,9 +17,11 @@
 #include "flock_detect.h"
 #include "drone_detect.h"
 #include "netcam_detect.h"
+#include "desert_detect.h"   // desertRestoreEnabled: persisted Desert toggle
 #include "acab_version.h"
 #include "acab_banner.h"
 #include "acab_ble_service.h"
+#include "pair_window.h"   // acabPhysicalStart: the host-tested rule production must CALL, not restate
 #include "mesh_link.h"
 #include "det_log.h"
 #include "ota_update.h"
@@ -66,15 +68,24 @@ void alertsSetLedEnabled(bool on) {
 // only loop() may drive the pin so the blink and the idle heartbeat cannot fight. 0 = none.
 static volatile uint32_t gBlinkReqMs = 0;
 
+static bool otaRuntimeHealthy() {
+    return millis() >= 20000 && acabScannerHealthy();
+}
+
 // Scanner sink: forward every hit to the app (if connected) and the mesh, blink the
 // LED on first sighting.
 static void onDetection(const AcabDetection& d0, bool isNew) {
     AcabDetection d = d0;
-    // Tag non-drone hits with the phone's GPS, but ONLY while the app is connected:
-    // no app means no location source, so the mesh line carries no coords. Drones
-    // already broadcast their own coords, so those still go out regardless.
-    if (d.type != ACAB_DRONE && !(d.lat || d.lon) && acabBleClientConnected())
-        acabBleGetPhoneGps(&d.lat, &d.lon, 60000);
+    // Final privacy gate at the transmission boundary. Shared scanner rows may have
+    // been queued with an older phone fix before a disconnect, so do not trust a
+    // pre-populated non-drone coordinate here. Re-acquire a fix that is both attached
+    // to the current connection and at most 60 seconds old. Drone coordinates remain
+    // untouched because they are broadcast by the aircraft, not supplied by the phone.
+    if (d.type != ACAB_DRONE) {
+        d.lat = 0; d.lon = 0; d.gpsAgeMs = 0;
+        if (acabBleClientConnected())
+            acabBleGetPhoneGps(&d.lat, &d.lon, 60000, &d.gpsAgeMs);
+    }
 
     acabBleNotifyDetection(d, isNew);   // stream to the app over BLE, same as oui-spy
     meshLinkSend(d, isNew);             // and over the Meshtastic uplink
@@ -91,6 +102,7 @@ static void onDetection(const AcabDetection& d0, bool isNew) {
 void setup() {
     // Rollback gate: if a prior OTA image booted without confirming health, revert now
     // (may esp_restart()). Must run first so a bad image can't wedge in later init.
+    otaSetHealthCheck(otaRuntimeHealthy);
     otaBootCheck();
 
     Serial.begin(115200);
@@ -124,7 +136,30 @@ void setup() {
         snprintf(fwLabel, sizeof(fwLabel), "mesh-detect-ACAB");
     else
         snprintf(fwLabel, sizeof(fwLabel), "mesh-detect-ACAB-ch%d", ACAB_MESH_CHANNEL);
-    acabBleBegin("ACAB-mesh", fwLabel);
+    // startAdvertising=false: configure the pairing gate BEFORE going on air, so no phone can
+    // reach a board that has not decided (same ordering as beacon-board).
+    acabBleBegin("ACAB-mesh", fwLabel, false);
+
+    // Pairing gate. Without it acabPairAdmit admits any stranger in radio range, and a bonded
+    // stranger reaches the whole config surface: {"clearlog":true} erases the offline buffer,
+    // a new {"key":...} triggers the mismatch wipe, and every detector toggle can be switched
+    // off. Enforcement is unconditional on every boot; the window only opens on a PHYSICAL
+    // start. This build has no slide switch, button, or battery cell (XIAO on USB power), so
+    // the inputs mirror the slim SKU: cellAbsent=true makes plugging in the only "switch",
+    // and unplug/replug is the documented recovery ("turn it off and on, then connect within
+    // two minutes"). A warm restart (OTA, panic, watchdog) opens no window; bonded phones
+    // still reconnect.
+    acabBlePairGateEnable();
+    const esp_reset_reason_t meshRr = esp_reset_reason();
+    if (acabPhysicalStart(meshRr == ESP_RST_POWERON, meshRr == ESP_RST_DEEPSLEEP,
+                          /*cellAbsent=*/true, /*buttonHeld=*/false,
+                          /*switchLow=*/false, /*benchBuild=*/false)) {
+        acabBleOpenPairingWindow();
+    } else {
+        Serial.println("[pair] warm continuation (not a physical start) - window NOT opened; "
+                       "enforcement is ON, bonded phones still reconnect");
+    }
+    acabBleStartAdvertising();
 
     // Offline detection buffer: mount the flash ring + bump the boot counter. Stays
     // inert (no capture) until the app enables it and pushes an at-rest key.
@@ -167,6 +202,12 @@ void setup() {
     // acabScannerBegin so the promiscuous filter matches the persisted choice. See netcam_detect.cpp.
     netcamRestoreEnabled(false);
 
+    // Desert mode. Persisted as of 2026-08-08 (it was the only detector toggle that was not),
+    // because a board deployed unattended must not silently stop recording after a brownout
+    // reset - the owner comes back unable to tell "nothing came by" from "it turned itself off".
+    // Default OFF: it is a deliberate, high-volume mode, not something to inherit by accident.
+    desertRestoreEnabled(false);
+
     // Broad Motorola Solutions OUI proxy: default OFF on the mesh build - it would add
     // chatter to the rate-limited LoRa uplink. Now its own persisted sub-toggle of the
     // body-cam category rather than a hard false, so a mesh operator who deliberately
@@ -191,6 +232,10 @@ void setup() {
 
 void loop() {
     esp_task_wdt_reset();   // pet the task WDT each pass; loop() never blocks long on this build
+    // Re-arm offline capture on a timer while "record everything" is on, so a board left
+    // unattended records a REVISIT instead of collapsing a week into one row per device.
+    // Self-throttling and a no-op when the mode is off or a phone is connected.
+    acabScannerBufferAllTick();
 
     static uint32_t lastBeat = 0;
     static uint32_t lastMeshBeat = 0;
@@ -215,7 +260,13 @@ void loop() {
 
     // OTA self-heal: a freshly-updated image that reaches a stable uptime is presumed good,
     // so disarm rollback even if the app never sends {"ota":{"confirm":true}}.
-    if (otaOnTrial() && millis() > 20000) otaMarkHealthy();
+    if (otaOnTrial() && millis() > 20000) {
+        if (!otaMarkHealthy() && millis() > 60000) {
+            Serial.println("[ota] trial health deadline missed; rebooting to trigger rollback");
+            delay(50);
+            ESP.restart();
+        }
+    }
 
     // One-time boot self-test: announce on the mesh ~10s after power-up, once the
     // Heltec is up, to check the send path without waiting for a detection.

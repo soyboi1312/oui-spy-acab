@@ -90,6 +90,33 @@ int main() {
     chk("gate disabled + unowned + closed -> admit",
         acabPairAdmit(false, false, false, false), true);
 
+    // A raw GAP link is not an authenticated app session. A stranger admitted while the physical
+    // window is open must finish encrypted bonding before either the window or the auth deadline
+    // closes. Otherwise it could keep a pre-auth link alive indefinitely and suppress offline
+    // logging without ever proving possession of a bond.
+    printf("\n  -- pre-auth link --\n");
+    chk("stranger may authenticate while physical window remains open",
+        acabPairPreAuthMayContinue(true, true, false, true, 1000, 30000), true);
+    chk("stranger is dropped when physical window closes before auth",
+        acabPairPreAuthMayContinue(true, true, false, false, 1000, 30000), false);
+    chk("known owner may authenticate after physical window closes",
+        acabPairPreAuthMayContinue(true, true, true, false, 1000, 30000), true);
+    chk("unowned first pairing is not tied to a physical window",
+        acabPairPreAuthMayContinue(true, false, false, false, 1000, 30000), true);
+    chk("every pre-auth link is dropped at the timeout boundary",
+        acabPairPreAuthMayContinue(false, false, false, false, 30000, 30000), false);
+    chk("elapsed subtraction remains valid across millis rollover",
+        acabPairPreAuthMayContinue(true, true, true, false,
+                                   (uint32_t)(0x00000010UL - 0xfffffff0UL), 30000), true);
+
+    printf("\n  -- legacy nRF DFU physical/session gate --\n");
+    chk("secure session during physical window may arm DFU",
+        acabLegacyDfuMayArm(true, true), true);
+    chk("pre-auth link cannot arm DFU",
+        acabLegacyDfuMayArm(false, true), false);
+    chk("remote session outside physical window cannot arm DFU",
+        acabLegacyDfuMayArm(true, false), false);
+
     // ---- physical start (boot sequencing) -----------------------------------------------------
     // Args: (powerOnReset, deepSleepWake, cellAbsent, buttonHeld, switchLow, benchBuild)
     printf("\n  -- physical start --\n");

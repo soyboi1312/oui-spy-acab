@@ -109,6 +109,13 @@ static portMUX_TYPE  gTrackMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Find this frame's track, creating/evicting as needed. Caller holds gTrackMux.
 static DroneTrack* trackFind(const uint8_t mac[6], const char* uasId, uint32_t now) {
+    // TTL means forget, not merely "this slot may be reused". Expire first so a
+    // location-only frame cannot inherit an old UAS ID, operator fix, or telemetry
+    // just because it arrived from the same transmitter address after a long gap.
+    for (int i = 0; i < DRONE_TRACK_MAX; i++) {
+        if (gTracks[i].used && now - gTracks[i].lastSeen > DRONE_TRACK_TTL)
+            memset(&gTracks[i], 0, sizeof(gTracks[i]));
+    }
     if (uasId && uasId[0]) {
         // match by UAS-ID
         for (int i = 0; i < DRONE_TRACK_MAX; i++)
@@ -181,7 +188,14 @@ static bool fillFromODID(const ODID_UAS_Data* uas, const uint8_t mac[6],
         if (uas->Location.SpeedVertical   < 63.0f)   t->speedV    = uas->Location.SpeedVertical;
         if (uas->Location.Direction       < 361.0f)  t->heading   = uas->Location.Direction;
         if (uas->Location.Height          > -1000.0f) t->heightAGL = uas->Location.Height;
-        t->ridStatus = (uint8_t)uas->Location.Status;
+        // Read through the underlying byte, NOT the enum: the decoder writes the raw 4-bit wire
+        // field, so an attacker-chosen 5-15 lands in an enum whose declared range is 0-4, and
+        // loading an out-of-range value from an enum lvalue is UB (UBSan flags it). Clamp the
+        // reserved values to 0 ("undeclared") at the decode boundary.
+        {
+            uint8_t st; memcpy(&st, &uas->Location.Status, 1);
+            t->ridStatus = st <= 4 ? st : 0;
+        }
     }
     if (uas->SystemValid &&
         uas->System.OperatorLatitude  >= -90.0  && uas->System.OperatorLatitude  <= 90.0 &&
@@ -212,9 +226,14 @@ static bool fillFromODID(const ODID_UAS_Data* uas, const uint8_t mac[6],
 // Returns the vendor label on a hit, or nullptr when no OUI matched.
 static const char* droneVendorOui(const uint8_t mac[6]) {
     if (mac[0] & 0x02) return nullptr; // skip randomized / locally-administered MACs (no real OUI), like flock/police
-    for (size_t i = 0; i < DRONE_VENDOR_OUI_COUNT; i++)
-        if (mac[0] == DRONE_VENDOR_OUI[i].oui[0] && mac[1] == DRONE_VENDOR_OUI[i].oui[1] &&
-            mac[2] == DRONE_VENDOR_OUI[i].oui[2]) return DRONE_VENDOR_OUI[i].vendor;
+    for (size_t i = 0; i < DRONE_VENDOR_OUI_COUNT; i++) {
+        const DroneOui& o = DRONE_VENDOR_OUI[i];
+        if (mac[0] != o.prefix[0] || mac[1] != o.prefix[1] || mac[2] != o.prefix[2]) continue;
+        if (o.prefixBits == 28 && (mac[3] & 0xF0) != o.prefix[3]) continue;
+        if (o.prefixBits == 36 &&
+            (mac[3] != o.prefix[3] || (mac[4] & 0xF0) != o.prefix[4])) continue;
+        return o.vendor;
+    }
     return nullptr;
 }
 

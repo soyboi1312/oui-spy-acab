@@ -14,6 +14,7 @@
 // Everything here locks in CURRENT behaviour, including two things worth a second look. Both are
 // flagged CONCERN below and both are asserted as-is, not as I think they should be.
 #include "police_detect.h"
+#include <Preferences.h>   // wipeAll(): the stub stores for real now
 #include "police_signatures.h"
 #include "axon_detect.h"     // for the axonIsEnabled() declaration this file has to satisfy
 #include "desert_detect.h"   // ditto desertIsEnabled()
@@ -126,9 +127,12 @@ int main() {
     setGates(false, true, false);
     chk("toggled back OFF -> stops matching again", runBle(MAC_MOTO), false);
 
-    // The host Preferences stub always reports "nothing saved", so this exercises the
-    // default-value branch of the boot restore, which is the branch that decides what a
-    // freshly-flashed board does. Per-board defaults live in main.cpp; the module honours them.
+    // Preferences::wipeAll() is what MAKES "nothing saved" true, and it has to be explicit. The
+    // host stub used to discard every write, so this exercised the default-value branch by
+    // accident; with real storage the toggles above persist. That branch still matters - it is
+    // what decides how a freshly-flashed board behaves - so keep testing it, just on purpose.
+    // Per-board defaults live in main.cpp; the module honours them.
+    Preferences::wipeAll();
     policeRestoreEnabled(true);
     chkVal("restore(true), nothing saved -> enabled", policeIsEnabled() ? 1 : 0, 1);
     policeRestoreEnabled(false);

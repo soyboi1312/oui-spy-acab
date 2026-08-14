@@ -14,6 +14,7 @@
 // asserted as-is and flagged with a CONCERN comment, never "corrected" here.
 #include "axon_detect.h"
 #include "axon_signatures.h"
+#include <Preferences.h>   // wipeAll(): the stub stores for real now, so "no saved value" must be made true
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -308,14 +309,35 @@ int main() {
     gDesertOn = false;
     { std::vector<uint8_t> a;
       chk("Desert back off -> silent again", runBLE(MAC_AXON, a), false); }
-    // NVS restore. The Preferences stub never persists, so this asserts the DEFAULT branch:
-    // a board with nothing saved yet takes defaultEnabled, and restore bypasses the
-    // "same value, do nothing" short-circuit in axonSetEnabled.
+    // NVS restore, i.e. what setup() does after a power cycle. Preferences::wipeAll() is what
+    // MAKES "no saved value" true, and it has to be explicit: the host stub used to discard every
+    // write, so this block asserted the default branch by accident rather than by construction.
+    // Now that the stub really stores, the axonSetEnabled(false) calls above genuinely persist and
+    // a restore reads THAT back instead of the default the case name promises.
+    Preferences::wipeAll();
     axonRestoreEnabled(true);
     chkInt("restoreEnabled(true) with no saved value -> on", axonIsEnabled() ? 1 : 0, 1);
+    Preferences::wipeAll();
     axonRestoreEnabled(false);
     chkInt("restoreEnabled(false) with no saved value -> off", axonIsEnabled() ? 1 : 0, 0);
+    // The other branch, which nothing could observe before: a PERSISTED value beats the
+    // compiled-in default. That is the property a deployed board depends on across a brownout,
+    // and until the stub stored anything it was untested on every detector in the tree.
+    // NOTE the toggle-through: axonSetEnabled early-returns when the value is unchanged, so
+    // calling it with the value the flag ALREADY holds writes nothing. After a wipeAll the in-RAM
+    // state and NVS have diverged, and only a real transition re-syncs them. Getting this wrong is
+    // how the first draft of these two cases asserted the opposite of the truth.
+    axonSetEnabled(true); axonSetEnabled(false);          // ends false, and false is now SAVED
     axonRestoreEnabled(true);
+    chkInt("restoreEnabled(true) with false SAVED -> stays off", axonIsEnabled() ? 1 : 0, 0);
+    axonSetEnabled(true);                                 // transition, so true is SAVED
+    axonRestoreEnabled(false);
+    chkInt("restoreEnabled(false) with true SAVED -> stays on", axonIsEnabled() ? 1 : 0, 1);
+    // Re-enable EXPLICITLY for the signature cases below. This used to be a bare
+    // axonRestoreEnabled(true), which only produced "enabled" because writes vanished; with real
+    // storage it reads back whatever was last persisted and silently disables every case after
+    // it, which is how 22 assertions failed at once the first time the stub was fixed.
+    axonSetEnabled(true);
 
     // -- swappable signatures (the other match sources) --------------------------------------
     printf("\n-- swappable signature fields --\n");

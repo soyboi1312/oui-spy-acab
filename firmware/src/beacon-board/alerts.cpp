@@ -18,6 +18,7 @@
 #define BUZZER_DUTY_MAX     128     // ~50% duty = loudest into a piezo
 
 static QueueHandle_t gAlertQ = nullptr;
+static TaskHandle_t  gAlertTask = nullptr;   // kept so shutdown can suspend it and own the buzzer alone
 static volatile bool    gBuzzer = true;
 static volatile uint8_t gVolume = 80;   // 0..100
 // Onboard LED master. On = idle heartbeat + detection flashes + boot sweep; "lights out" = false.
@@ -241,7 +242,7 @@ void alertsInit() {
     loadAudio();
 
     gAlertQ = xQueueCreate(16, sizeof(AcabDeviceType));
-    xTaskCreatePinnedToCore(alertTask, "acabAlert", 4096, nullptr, 1, nullptr, 1);
+    xTaskCreatePinnedToCore(alertTask, "acabAlert", 4096, nullptr, 1, &gAlertTask, 1);
     gArmReveal = true;   // a standalone (no-app) board still reveals its first catch
 }
 
@@ -264,6 +265,31 @@ void alertsBootJingle() {
     beep(1850, 95, 60); vTaskDelay(pdMS_TO_TICKS(50));   //    DEE
     warble(1700, 220, 3, 22, 60);            // 3. head-cock trill
     caw(1500, 2500, 170, 60);                // 4. "...alive?" - ends high, never resolves down
+}
+
+void alertsPowerDown() {
+    // Own the buzzer + LED alone for the shutdown cue. The alertTask time-slices with this (loop) task
+    // on core 1, so without this a detection pattern firing at the same instant would overwrite the
+    // cue's tone and toggle the LED mid-motif; and detections queued during the multi-second nRF park
+    // that follows would keep beeping AFTER the cue, so it would not be the last thing heard. Suspend
+    // the alert task and clear whatever it left mid-pattern, so the descending "off" motif plays clean
+    // and is the final sound. We only get here on a committed power-off, so the task never resumes.
+    if (gAlertTask) vTaskSuspend(gAlertTask);
+    buzzerOff();
+    ledOff();
+    // Johnny Five going back to sleep. The EXACT inverse of the boot jingle above: where boot steps
+    // UP (da-da-DEE) and ends on a rising, unresolved "...alive?", this steps DOWN and settles to the
+    // floor - the ear reads "off" the moment it resolves low. Same 500-2500 Hz band and 60% scale as
+    // boot; and it still obeys the whoosh-era rule that nothing SWEEPS BACK UP (a symmetric up/down
+    // pair reads as a siren) - this only ever descends. beep/caw/warble honor the buzzer + LED master
+    // flags, so "lights out" leaves it silent and dark, and the board's BLE drop is that user's off
+    // signal. ~0.7s, and it runs before the multi-second nRF park handshake, so deep sleep never
+    // clips it.
+    beep(1850, 90, 60); vTaskDelay(pdMS_TO_TICKS(30));   // DEE   - boot's top note, now the START
+    beep(1450, 70, 60); vTaskDelay(pdMS_TO_TICKS(30));   //  da   - stepping down (boot stepped up)
+    beep(1150, 70, 60); vTaskDelay(pdMS_TO_TICKS(40));   //   da
+    warble(950, 160, 3, 26, 60);                          // slowing "spin-down" wobble, lower + lazier
+    caw(1400, 500, 220, 60);                              // settle: sweep DOWN to the floor, ends low = off
 }
 
 // Fire the "app linked" chirp and re-arm the first-catch reveal for this session.

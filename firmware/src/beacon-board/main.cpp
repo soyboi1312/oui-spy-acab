@@ -21,6 +21,7 @@
 #include "flock_detect.h"
 #include "drone_detect.h"
 #include "netcam_detect.h"
+#include "desert_detect.h"   // desertRestoreEnabled: persisted Desert toggle
 #include "acab_ble_service.h"
 #include "alerts.h"
 #include "det_log.h"
@@ -222,6 +223,7 @@ static void nrfCmdSink(const char* line) { Serial1.println(line); }
 // The nRF stops scanning, flushes, sets GPREGRET, and soft-resets into its bootloader, which then
 // advertises for DFU as a SEPARATE device. The app verifies the .zip's sha256 + ECDSA signature
 // BEFORE arming (legacy DFU itself is CRC-only), then runs the transfer with a Nordic DFU lib.
+// The shared BLE gate also requires this secure session to be inside the physical-start window.
 // The app is responsible for pausing auto-reconnect and re-reading "nrfv" once the nRF is back.
 static void nrfEnterDfu() {
     Serial.println("[nrf] forwarding DFU trigger -> co-processor reboots into BLE OTA DFU");
@@ -406,10 +408,23 @@ static void pwrCommit(bool on) {
 static void btnWaitRelease(uint32_t capMs);   // defined below; powerOffDeepSleep must wait out the off-press before arming ext0
 static bool btnHeldFor(uint32_t holdMs);
 
-static void powerOffDeepSleep() {
+// announce = play the power-down cue first. Only the RUNNING->off call sites pass true (the loop
+// off-poll and the app power-off drain); the boot-gate re-sleeps (a bump-wake that fails the hold)
+// pass false and stay SILENT, the same reason the boot jingle now sits below the gate - a pocket
+// bump must never make a sound.
+static void powerOffDeepSleep(bool announce = false) {
     Serial.println("[pwr] switch OFF -> parking nRF + deep sleep (flip to 'on' to wake)");
     pwrCommit(false);   // record the decision FIRST: if anything below crashes, the next boot
                         // must still know the unit chose OFF (see pwrCommittedOn)
+    if (announce) {
+        // A real running->off (button-hold or app request), not a boot-gate re-sleep. Tell a
+        // connected app FIRST so it flags the coming drop as a clean shutdown (the app arms its
+        // intent on this notify, never on the bare request - so an old board that ignores the key
+        // never mis-arms it), then play the mirror-of-boot power-down cue. Both are skipped on the
+        // silent boot-gate paths so a pocket bump makes no sound and tells no app anything.
+        acabBleNotifyPoweringOff();
+        alertsPowerDown();
+    }
     // Resend 'P' until the nRF acks, capped at 3s. A blind single send races the nRF's boot:
     // if the switch is flipped off within ~2s of power-on the co-processor hasn't started its
     // UART command loop yet, drops the 'P', and keeps scanning while we sleep. The nRF echoes
@@ -582,6 +597,18 @@ static void nrfConsolePoll() {
 }
 #endif // ACAB_DUAL_RADIO
 
+static bool otaRuntimeHealthy() {
+    if (millis() < 20000 || !acabScannerHealthy()) return false;
+#ifdef ACAB_DUAL_RADIO
+    // The dual-radio image is not healthy until the companion has actually spoken on UART. The
+    // version proves the parser/link path, and liveness rejects a co-processor that spoke once and
+    // then died before confirmation.
+    return gNrfVersion >= 0 && acabScannerCoProcAlive();
+#else
+    return true;
+#endif
+}
+
 void setup() {
     Serial.begin(115200);
     delay(200);
@@ -616,11 +643,14 @@ void setup() {
 
     // Rollback gate: if a prior OTA image booted without confirming health, revert now
     // (may esp_restart()). Must run before heavy init so a bad image can't wedge here first.
+    otaSetHealthCheck(otaRuntimeHealthy);
     otaBootCheck();
     if (otaOnTrial()) Serial.println("[ota] running a freshly-updated image (trial boot)");
 
     alertsInit();
-    alertsBootJingle();
+    // Boot jingle MOVED to after the soft-power gate (below). The sound now plays only once the
+    // board commits to staying on, so a too-short button hold parks SILENTLY instead of beeping a
+    // boot it then abandons. See the hold-time note at the gate.
 
     // BLE identity. The dual-radio build advertises as "beacon" + reports the "beacon board"
     // fw label; the single-radio oui-spy stays "ACAB" / "ACAB-ouispy".
@@ -713,10 +743,23 @@ void setup() {
     // the persisted choice from the first frame. See netcam_detect.cpp.
     netcamRestoreEnabled(false);
 
-    // Did a PERSON start this board? Set by whichever soft-power branch fires below. Derived from
-    // the gate's own decision rather than esp_reset_reason(): soft-off is deep sleep, so the
-    // recovery the apps instruct ("turn it off and on") wakes as ESP_RST_DEEPSLEEP, and a
-    // reset-reason test never opened a window for it. See acabPhysicalStart in pair_window.h.
+    // Desert mode. Persisted as of 2026-08-08 (it was the only detector toggle that was not),
+    // because a board deployed unattended must not silently stop recording after a brownout
+    // reset - the owner comes back unable to tell "nothing came by" from "it turned itself off".
+    // Default OFF: it is a deliberate, high-volume mode, not something to inherit by accident.
+    desertRestoreEnabled(false);
+
+    // Did a PERSON start this board? The soft-power branches below COLLECT INPUTS; they do not
+    // decide. acabPhysicalStart (pair_window.h) combines them WITH the reset reason at the call
+    // site, and is host-tested.
+    //
+    // This used to say the decision was "derived from the gate's own decision rather than
+    // esp_reset_reason()". That describes a design which was considered and REJECTED, and leaving
+    // it here is how a future cleanup deletes the reset inputs. The reset reason is load-bearing:
+    // without it the switch SKU reopens a pairing window on every OTA and every panic, since the
+    // switch still reads ON after a warm restart. What the reset reason cannot do ALONE is
+    // recognise the app-instructed recovery, because soft-off is deep sleep and that wake reports
+    // ESP_RST_DEEPSLEEP rather than ESP_RST_POWERON. Both inputs, one rule, one call.
     //
     // Declared OUTSIDE the dual-radio guard because the pairing decision below is outside it too.
     // Targets with no soft-power gate never reach a branch that could set this, and for them
@@ -836,20 +879,25 @@ void setup() {
         pwrCommit(true);
         pwrCellAbsent = true;    // applying power to a USB-only board IS the intent to start it
     } else {
-        // NOTE ON THE REAL HOLD TIME: kBtnOnHoldMs is measured from HERE, not from the press, and
-        // this gate sits a long way into setup(). Serial.begin + delay(200), alertsBootJingle()
-        // (~0.9s, fully synchronous), NimBLE init, the flash-ring mount and the NVS toggle restores
-        // all run first, so the user's true hold is roughly kBtnOnHoldMs + ~1.1s. Do not print
-        // "~1s" here - a user who releases at 1s gets a unit that beeps its boot jingle and THEN
-        // goes dead, which reads as a fault. Exact number is a stopwatch job on real rev-B
-        // hardware; when that happens the better fix is to move this gate ABOVE the jingle so the
-        // board does not announce a boot it may be about to abandon.
+        // NOTE ON THE REAL HOLD TIME: kBtnOnHoldMs is measured from HERE, not from the press. The
+        // boot jingle was MOVED BELOW this gate (2026-08-12) so the board no longer announces a
+        // boot it may abandon: a too-short hold now parks SILENTLY, and the jingle plays only after
+        // the gate commits to ON. NimBLE init, the flash-ring mount and the NVS restores still run
+        // before this point, so the true hold is roughly kBtnOnHoldMs plus that init, not a bare 1s.
+        // A user who releases early no longer hears a jingle, so the sound stops reading as a fault.
         if (!btnHeldFor(kBtnOnHoldMs)) {
             Serial.println("[pwr] button not held at boot -> parking (keep holding ~2s to power on)");
             powerOffDeepSleep();
         }
         Serial.println("[pwr] button held -> powering on");
         pwrCommit(true);
+        // ACK CHIRP at the commit (2026-08-12, from a real build: power-on "took 5-8s"). Without it
+        // the user's only feedback is the boot jingle, which plays AFTER the release-wait below (up
+        // to 3s while they keep holding) plus the scanner bring-up - so they hold the whole time and
+        // the board feels slow. One short beep the instant the hold passes says "on - let go now";
+        // release then skips the wait cap and the jingle lands seconds sooner. Queued/non-blocking,
+        // honors mute/volume, and can never fire on a pocket bump (the hold above already passed).
+        alertsBeepTest();
         // THE RECOVERY PATH the apps instruct. Soft-off is deep sleep, so this wakes with
         // ESP_RST_DEEPSLEEP, never ESP_RST_POWERON - which is exactly why the old reset-reason
         // test never opened a window here and "turn it off and on" did not work.
@@ -879,6 +927,12 @@ void setup() {
     acabScannerSendCoProcCmd("V");   // mutex sink, same interleave class as the DFU relay fix
 #endif
 
+    // Committed to staying on now: every park path above this deep-sleeps and never returns here,
+    // so this is the first safe place to announce the boot. MOVED here from before the soft-power
+    // gate (2026-08-12) so a too-short button hold parks SILENTLY instead of beeping a boot it then
+    // abandons, and the effective turn-on hold shrinks by the ~0.9s the jingle used to add.
+    alertsBootJingle();
+
     // Open the new-phone pairing window, ONCE, and only now: every path above this line can still
     // decide the board should be off (switch off at boot, button not held, cell absent), and a
     // board that boots merely to conclude it should sleep must never advertise itself as pairable.
@@ -891,9 +945,22 @@ void setup() {
     // restart, a task-watchdog panic (panic=true, so it reboots), a brownout on a sagging cell, and
     // any crash loop. Arming on those would mean every update reopens pairing for two minutes, and
     // worse, that anything able to induce a crash from radio range gets a pairing window handed to
-    // it. ESP_RST_POWERON covers the cold paths that matter: first power-up, the button-held start,
-    // the switch-on start, and the rev-B battery SKU's automatic boot gate (which has no button but
-    // is still a genuine physical power-on).
+    // it.
+    //
+    // THE RESET REASON IS NECESSARY BUT NOT SUFFICIENT, AND NEITHER IS THE SWITCH. An earlier
+    // version of this comment claimed "ESP_RST_POWERON covers the cold paths that matter: first
+    // power-up, the button-held start, the switch-on start". That is FALSE for the button-held
+    // start, which is a deep-sleep wake and reports ESP_RST_DEEPSLEEP (see the recovery-path note
+    // above, at the pwrButtonHeld assignment). The sentence read as an argument that the reset
+    // reason alone decides, and a reviewer following it proposed DELETING the reset inputs
+    // entirely. That would have reopened a 2-minute pairing window on every OTA and every panic
+    // reboot for the switch SKU, because the switch still reads ON after a warm restart - which is
+    // the exact hole this gate was written to close.
+    //
+    // The rule is POWERON *or* DEEPSLEEP, combined with evidence of INTENT: the button was held,
+    // the switch reads on, the cell is absent (USB-only SKU), or this is a bench build. Neither
+    // half decides alone, and a warm cause stays closed whatever the switch reads. acabPhysicalStart
+    // owns that combination and is host-tested; the branches above only collect the inputs.
     // ENFORCEMENT IS UNCONDITIONAL. It used to be switched on only inside the window opener, and
     // the opener only ran on a physical start, so every OTA restart, panic, watchdog and brownout
     // came back with the gate OFF and admitted any phone indefinitely. Enforcement and "a person
@@ -1073,6 +1140,10 @@ static int readBatteryPct() {
 
 void loop() {
     esp_task_wdt_reset();   // pet the task WDT each pass
+    // Re-arm offline capture on a timer while "record everything" is on, so a board left
+    // unattended records a REVISIT instead of collapsing a week into one row per device.
+    // Self-throttling and a no-op when the mode is off or a phone is connected.
+    acabScannerBufferAllTick();
 
     // "App linked" chirp on the rising edge of a client connection (and arm the
     // first-catch reveal for the session). Polled here because the core BLE service
@@ -1086,20 +1157,37 @@ void loop() {
     // so disarm the rollback even if the app never sends {"ota":{"confirm":true}}. Rollback
     // then only fires if the new image fails to run this long. (No-op once confirmed/healthy.)
     if (otaOnTrial() && millis() > 20000) {
-        otaMarkHealthy();
-        Serial.println("[ota] trial image healthy (20s uptime) - rollback disarmed");
+        if (otaMarkHealthy()) {
+            Serial.println("[ota] trial image healthy: scanner pipeline ready; rollback disarmed");
+        } else if (millis() > 60000) {
+            Serial.println("[ota] trial health deadline missed; rebooting to trigger rollback");
+            delay(50);
+            ESP.restart();
+        }
     }
 
 #ifdef ACAB_DUAL_RADIO
-    if (swSensePollOff()) powerOffDeepSleep();   // rev-A: slide flipped to 'off'; rev-B: button held ~1.5s
+    if (swSensePollOff()) powerOffDeepSleep(true);   // rev-A: slide flipped to 'off'; rev-B: button held ~1.5s (announce: real running->off)
     uartIngestPoll();   // pull BLE adverts forwarded by the companion nRF52840
     nrfConsolePoll();   // bench: type "nrfdfu" on USB serial to boot the nRF into BLE OTA DFU
     // App-requested BLE DFU ({"nrfdfu":true}) - drain the latch here, off the NimBLE host task.
     // Drain UNCONDITIONALLY so a request written mid-OTA is consumed now, not left to fire when the
     // OTA later ends or aborts. Gated on OTA: if the S3 is mid self-update, drop it (the user
     // re-taps) rather than kick the co-processor into DFU. Once triggered, the nRF reboots into its
-    // bootloader and the app drives the transfer.
+    // bootloader and the app drives the transfer. The take function re-checks the secure link and
+    // physical-start window, so a queued request cannot fire after that authorizing session ends.
     { bool dfuReq = acabBleTakeNrfDfuRequest(); if (dfuReq && !otaInProgress()) nrfEnterDfu(); }
+    // App-requested power-off ({"poweroff":true}) - SAME deferred-latch discipline as the nrfdfu
+    // drain above, and for the same reason: powerOffDeepSleep blocks on the multi-second nRF park
+    // handshake and then NEVER RETURNS, so running it on the NimBLE host task (the write callback)
+    // would freeze the whole BLE stack and kill the link with no clean disconnect. The callback only
+    // sets the latch; the real shutdown happens HERE on the loop task. rev-B ONLY: on a rev-A slide
+    // board the wake line is held LOW by the slide, so deep sleep would re-wake instantly - drop the
+    // request there (the app never offers the button on rev-A anyway). Dropped mid-OTA too, so a
+    // self-update is not interrupted (the user re-taps). announce=true: this is a real running->off,
+    // so the power-down cue plays, unlike a boot-gate re-sleep.
+    { bool offReq = acabBleTakePowerOffRequest();
+      if (offReq && acabBoardIsRevB() && !otaInProgress()) powerOffDeepSleep(true); }
     // Keep asking the nRF its version until we actually have one. It announces the version at its
     // own boot AND replies to a "V" query, but a single boot-time query (setup) can be lost to the
     // advert flood or the S3-boot reset race - leaving gNrfVersion == -1, so the status doc omits
@@ -1126,15 +1214,38 @@ void loop() {
         // Capture builds only. diag_drop>0 means the promiscuous callback outran the serial
         // task and records were thrown away, so the capture is INCOMPLETE: an absent signal in
         // that log proves nothing. Printed on its own line so a grep for it is unambiguous.
-        Serial.printf("[diag] wifi_diag sent=%lu dropped=%lu"
+        // app=1 means a phone is CONNECTED right now, which is the difference between "the
+        // firmware never detected it" and "the firmware detected it and the app never saw it".
+        // bufen/buf say whether the offline buffer would have caught it while the app was away.
+        // The 2026-08-08 drive could not tell those apart: bonds=2 only proves bonds exist.
+        // falcon_data / falcon_mgmt / falcon_macs are the Falcon-OUI mode accounting (see
+        // FalconRec in acab_scanner.cpp). They answer, on any drive, the question the app's
+        // exported history raised: every WiFi ALPR hit this project ever recorded matched on a
+        // wildcard PROBE, and a unit that associates to its backhaul stops probing. A drive that
+        // returns falcon_mgmt=0 with falcon_data>0 says the hardware is present and associated,
+        // which no shipping rule can currently see. falcon_full>0 means FALCON_MAX overflowed and
+        // falcon_macs is a floor, not a count.
+        Serial.printf("[diag] wifi_diag sent=%lu dropped=%lu app=%d bufen=%d buf=%lu"
 #ifdef ACAB_CAPTURE_BUILD
-                      " watch_data=%lu"
+                      " watch_data=%lu falcon_data=%lu falcon_mgmt=%lu falcon_macs=%lu falcon_full=%lu"
+                      " axon_ble=%lu moto_ble=%lu vendor_macs=%lu vendor_full=%lu"
 #endif
                       "\n",
                       (unsigned long)acabScannerWifiDiagSent(),
-                      (unsigned long)acabScannerWifiDiagDropped()
+                      (unsigned long)acabScannerWifiDiagDropped(),
+                      acabBleClientConnected() ? 1 : 0,
+                      detLogEnabled() ? 1 : 0,
+                      (unsigned long)detLogCount()
 #ifdef ACAB_CAPTURE_BUILD
                       , (unsigned long)acabScannerWatchDataSeen()
+                      , (unsigned long)acabScannerFalconData()
+                      , (unsigned long)acabScannerFalconMgmt()
+                      , (unsigned long)acabScannerFalconMacs()
+                      , (unsigned long)acabScannerFalconTableFull()
+                      , (unsigned long)acabScannerVendorAxon()
+                      , (unsigned long)acabScannerVendorMoto()
+                      , (unsigned long)acabScannerVendorMacs()
+                      , (unsigned long)acabScannerVendorFull()
 #endif
                       );
 #endif

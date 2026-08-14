@@ -83,12 +83,18 @@ bool otaInProgress();
 uint32_t otaReceived();          // bytes written so far this session
 
 // --- rollback / health ---
+// Register the target's real health boundary. A trial cannot be confirmed until this returns true.
+// Beacon-board includes scanner readiness plus a live/versioned nRF UART; mesh requires its scanner.
+typedef bool (*OtaHealthCheck)();
+void otaSetHealthCheck(OtaHealthCheck fn);
+bool otaHealthReady();
 // Call ONCE at the very top of setup(). If a prior OTA image booted without being marked
 // healthy, this counts the attempt and, past the limit, reverts to the previous slot.
 void otaBootCheck();
 // Mark the running image healthy (disarms rollback). Call once the board reaches a known-
-// good state (BLE up + a stable uptime) and on an explicit app confirm.
-void otaMarkHealthy();
+// good state and on an explicit app confirm. Returns false while the registered health boundary
+// is not met or NVS could not durably clear the trial record.
+bool otaMarkHealthy();
 // True while the running image is on its unconfirmed trial boot after an OTA.
 bool otaOnTrial();
 

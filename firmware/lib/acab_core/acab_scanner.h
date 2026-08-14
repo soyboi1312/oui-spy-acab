@@ -13,9 +13,10 @@
 // This header is pulled in by acab_scanner.cpp, which every ESP32 env compiles, so the guard
 // covers oui-spy, mesh-detect, mesh-detect-ch1 and beacon-board alike.
 //
-// ACAB_ACTIVE_SCAN makes the scanner TRANSMIT (breaks the "passive, never transmits" framing) and
-// ACAB_BENCH_NO_SLEEP skips the soft-power park so the board ignores SW1 entirely. Both are
-// bench-only. They previously compiled clean into a signed release image: the commented
+// ACAB_ACTIVE_SCAN makes the scanner send requests to nearby targets instead of passively hearing
+// their broadcasts. The encrypted phone control link is separate. ACAB_BENCH_NO_SLEEP skips the
+// soft-power park so the board ignores SW1 entirely. Both are bench-only. They previously compiled
+// clean into a signed release image: the commented
 // -DACAB_ACTIVE_SCAN sits in the shared [env] build_flags block every env inherits, one
 // uncommented line away from shipping, and neither release script inspects the image before
 // signing it. Refuse to compile instead unless the capture intent is explicit.
@@ -69,6 +70,13 @@ void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t p
 // Re-arm offline-buffer capture (call when the app disconnects): the first sighting of
 // each device after this buffers once more, so capture isn't a single per-boot event.
 void acabScannerReArmCapture();
+
+// Periodic re-arm while "record everything" is on (detLogBufferAll, det_log.h). Call once per
+// main-loop tick; it self-throttles to REBUFFER_AFTER_MS and no-ops when the mode is off or a
+// phone is connected. Without it a week-long deployment writes ONE record per device for the
+// whole week, because the generation counter only advances on an app disconnect and no app is
+// coming - the log would say "this MAC existed" and never "something came by on Thursday".
+void acabScannerBufferAllTick();
 
 // Whitelist: silently drop detections from these MACs (no report/beep/mesh).
 // App-pushed over config; held in RAM (the app re-sends on reconnect).
@@ -137,6 +145,9 @@ void acabScannerSetBLE(bool on);
 void acabScannerSetWiFi(bool on);
 bool acabScannerBLEEnabled();
 bool acabScannerWiFiEnabled();
+// True only after the sink and every configured radio task were created successfully. Used by
+// OTA trial confirmation so stable uptime cannot bless an image with a missing scanner pipeline.
+bool acabScannerHealthy();
 
 // WiFi eco mode (battery SKU): seconds of promiscuous-RX sleep inserted AFTER each full channel
 // sweep. 0 = continuous (off). The app offers 0/3/7/15; the setter snaps to that ladder. Persisted
@@ -170,6 +181,45 @@ uint32_t acabScannerWifiDiagDropped();
 #ifdef ACAB_CAPTURE_BUILD
 // Every watched DATA frame seen, counted even when the rate limiter printed no line for it.
 uint32_t acabScannerWatchDataSeen();
+// Falcon-OUI mode accounting. Measures whether a data-frame rule for falconWifiOui() could ever
+// be safe, BEFORE one is written: how much Falcon-OUI traffic is data vs management, how many
+// distinct devices carry those OUIs on a normal drive, and whether FALCON_MAX was big enough to
+// believe the answer. falcon_full > 0 invalidates the device count.
+uint32_t acabScannerFalconData();
+uint32_t acabScannerFalconMgmt();
+uint32_t acabScannerFalconMacs();
+uint32_t acabScannerFalconTableFull();
+// Official vendor BLE identifiers (Bluetooth SIG assigned numbers), counted per advert. Axon/TASER
+// and Motorola Solutions are tallied separately because they are on different tracks: Axon is the
+// first field-validation target, Motorola rides along in capture only. vendor_full > 0 means the
+// per-MAC table overflowed and vendor_macs is a floor, not a count.
+uint32_t acabScannerVendorAxon();
+uint32_t acabScannerVendorMoto();
+uint32_t acabScannerVendorMacs();
+uint32_t acabScannerVendorFull();
+
+// Ground-truth marker window. {"mark":"<label>"} over config calls this: it CLOSES the open window
+// and prints its per-device summary, then opens a new one under the new label.
+//
+// Bracketing a visit therefore takes THREE commands, not two, because a mark only ever prints the
+// window it is closing:
+//     {"mark":"axon-near"}   opens `axon-near`                (prints nothing yet)
+//     {"mark":"left"}        prints `axon-near`, opens `left`
+//     {"mark":"end"}         prints `left`
+// Comparing the two summaries is what answers "did the signal disappear when I walked away",
+// i.e. device-on-person versus device-on-building.
+//
+// SCOPE: the summary is BLE ONLY - it is fed from the BLE ingest funnel, so WiFi frames and Remote
+// ID never reach it. Those must be read from the RAW capture, which is where a drone or Falcon
+// conclusion has to come from. An empty summary means no BLE advert qualified, NOT that nothing
+// was there.
+//
+// BOUNDARIES ARE READ FROM at_ms ON THE [mark] SWITCH LINE, not from where that line sits in the
+// serial stream. Diagnostics are printed by several tasks without a shared queue, so a line can
+// interleave; at_ms is sampled inside the same lock that closes the window, so it is exact.
+//
+// Capture builds only; produces no detection and never reaches the apps.
+void acabScannerMark(const char* label);
 #endif
 #endif
 

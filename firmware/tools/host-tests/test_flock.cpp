@@ -172,8 +172,9 @@ int main() {
     // off looks identical to a board that is simply not near a camera.
     printf("\n  -- toggle --\n");
     chkInt("flockIsEnabled() defaults to ON", flockIsEnabled() ? 1 : 0, 1);
-    // The Preferences stub never persists, so restore always lands on the default it is handed.
-    // That is exactly the boot path being asserted: "no key saved yet -> use defaultEnabled".
+    // The Preferences stub DOES persist now (it backs test_axon/test_desert's persistence
+    // assertions), but this binary never writes the flock key, so the store is genuinely empty
+    // here and this asserts the boot path: "no key saved yet -> use defaultEnabled".
     flockRestoreEnabled(false);
     chkInt("flockRestoreEnabled(false), nothing in NVS", flockIsEnabled() ? 1 : 0, 0);
     flockRestoreEnabled(true);
@@ -375,12 +376,13 @@ int main() {
       chk("mfg block with 1 data byte -> no hit", runBLE(MAC_RANDOM, a, &d), false); }
     { std::vector<uint8_t> a; a.push_back(1); a.push_back(0x09);
       chk("name AD with zero data bytes -> no hit", runBLE(MAC_RANDOM, a, &d), false); }
-    // svc16[] holds 16 entries. Padding past that silently drops later UUIDs, so a Raven service
-    // sitting behind 16 filler UUIDs is NOT seen. Asserted as reality; the concern is that a
-    // crafted (or merely chatty) advert can hide a real Raven behind filler.
+    // svc16[] holds 16 entries, but the Raven checks run on every UUID BEFORE the cap (evidence
+    // displaces proximity, mark_table.h), so filler can no longer hide a real Raven. This used to
+    // assert the drop as reality; the concern it recorded is now the fixed behaviour.
     { std::vector<uint8_t> a; for (int i = 0; i < 16; i++) addU16Svc(a, 0x1234);
       addU16Svc(a, RAVEN_SVC_GPS);
-      chk("Raven svc past the 16-slot cap -> no hit", runBLE(MAC_RANDOM, a, &d), false); }
+      chk("Raven svc past the 16-slot cap -> STILL hits", runBLE(MAC_RANDOM, a, &d), true,
+          d.confidence, 92, d.detail, "raven fw 1.2.x"); }
     { std::vector<uint8_t> a; for (int i = 0; i < 15; i++) addU16Svc(a, 0x1234);
       addU16Svc(a, RAVEN_SVC_GPS);
       chk("Raven svc in the 16th slot -> still hits", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 92, d.detail, "raven fw 1.2.x"); }
@@ -419,8 +421,15 @@ int main() {
       chk("'Flock-' not at the start -> no hit", runWiFi(f, &d), false); }
     { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "DATA-FALCON");
       chk("'DATA-FALCON' suffix = 85", runWiFi(f, &d), true, d.confidence, 85, d.detail, ""); }
-    { std::vector<uint8_t> f = mgmt(0x4, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "probe-falcon");
+    { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "probe-falcon");
       chk("Falcon suffix IS case-insensitive", runWiFi(f, &d), true, d.confidence, 85, d.detail); }
+    // Same self-attestation rule as the "Flock-" branch: a probe REQUEST names the network sought,
+    // not the transmitter, so the FALCON suffix cannot carry the 85 tier either. It regrades to the
+    // probe tier beside the "Flock-" probe form above. This used to assert 85 on a 0x4 frame, which
+    // pinned the missing gate in place.
+    { std::vector<uint8_t> f = mgmt(0x4, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "probe-falcon");
+      chk("probe-request '*-FALCON' -> probe tier, not 85", runWiFi(f, &d), true,
+          d.confidence, 72, d.detail, "probing for a Flock network"); }
     // Anchored as a suffix precisely so the sports team and the spaceship do not alert.
     { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Atlanta-Falcons");
       chk("'Atlanta-Falcons' -> no hit", runWiFi(f, &d), false); }
@@ -444,9 +453,16 @@ int main() {
       chk("same OUI in a probe RESPONSE -> no hit", runWiFi(f, &d), false); }
     { std::vector<uint8_t> f = mgmt(0x4, MAC_FALCONNM, BCAST); addSSID(f, "HomeWiFi");
       chk("neighbouring OUI d8:f3:bd -> no hit", runWiFi(f, &d), false); }
-    // SSID outranks the OUI path, so a Falcon broadcasting its own name reports 85, not 72.
+    // SSID outranks the OUI path. On a SELF-ATTESTED frame (beacon) a Falcon broadcasting its own
+    // name reports 85. On a probe REQUEST the same SSID can only reach the probe tier (the frame
+    // names the network sought, not the transmitter), and the SSID regrade still outranks the
+    // Falcon-OUI branch, so the detail says which signal won.
+    { std::vector<uint8_t> f = mgmt(0x8, MAC_FALCON, MAC_FALCON); addSSID(f, "PROBE-FALCON");
+      chk("Falcon OUI + '-FALCON' SSID in a beacon -> SSID wins (85)", runWiFi(f, &d), true,
+          d.confidence, 85, d.detail, ""); }
     { std::vector<uint8_t> f = mgmt(0x4, MAC_FALCON, BCAST); addSSID(f, "PROBE-FALCON");
-      chk("Falcon OUI + '-FALCON' SSID -> SSID wins (85)", runWiFi(f, &d), true, d.confidence, 85, d.detail, ""); }
+      chk("Falcon OUI + '-FALCON' SSID in a probe request -> probe tier, SSID detail",
+          runWiFi(f, &d), true, d.confidence, 72, d.detail, "probing for a Flock network"); }
 
     // -- WiFi: Flock's own OUI ----------------------------------------------
     printf("\n  -- WiFi: b4:1e:52 OUI --\n");

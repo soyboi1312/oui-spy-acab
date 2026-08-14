@@ -87,6 +87,69 @@ static const size_t POLICE_OUI_COUNT = sizeof(POLICE_OUI) / sizeof(POLICE_OUI[0]
 //
 // To promote either one: capture near a confirmed unit with the capture build
 // (pio run -e beacon-board-capture), which now logs every prober and its frame type, then record
-// the co-signals the way the netcam table records its own field validations.
+// the co-signals the way the netcam table records its own field validations. Bracket the visit
+// with {"mark":"digital-ally-near"}, then {"mark":"left"}, then {"mark":"end"} - three commands,
+// because a mark only ever prints the window it CLOSES - so the two summaries pair what was there
+// against what vanished on departure. The summary is BLE-only; read WiFi evidence from the raw log.
+//
+// ---------------------------------------------------------------------------------------------
+// CONFIDENCE LADDER. What a piece of evidence is allowed to claim. Every table in this project
+// that became embarrassing got that way by skipping a rung.
+//
+//   Validated product payload or name  -> name the DEVICE CLASS. Earned only by a capture that
+//                                         ties the value to hardware somebody actually saw.
+//   Two independent vendor co-signals  -> "<vendor> equipment", high confidence.
+//   One official SIG CID or UUID       -> "<vendor> equipment", moderate. Vendor, never type.
+//   Corporate OUI alone                -> diagnostics or an opt-in. Low confidence, nothing more.
+//
+// DELIBERATELY EXCLUDED, and not reopened without a new argument: generic "police" routers,
+// APX-style name matching, emergency-light vendors, shared Axis/Getac OUIs, and P25 radio
+// detection. Each is either a false-positive machine or turns this into a different hardware
+// project. The boundary is surveillance equipment, recording accessories and public-safety
+// drones, evidenced on 2.4 GHz and BLE. Not "police presence" in general.
+//
+// ---------------------------------------------------------------------------------------------
+// CAPTURE QUEUE: ACTIVATION ACCESSORIES. Probably better discovery targets than the cameras,
+// because short-range wireless signalling is their entire function. A holster sensor exists to
+// tell nearby cameras to start recording, so it MUST transmit, and at a range that puts it well
+// inside ours.
+//
+//   Axon Signal Sidearm, Signal Vehicle   (holster / vehicle activation for Body and Fleet)
+//   Motorola Holster Aware
+//   Reveal Bluetooth trigger accessories
+//   Axis body-camera activation sensors
+//
+// No values here yet, on purpose: nobody has observed one of these adverts. The Axon and Motorola
+// SIG identifiers already in the capture build (VENDOR_BLE_ID in acab_scanner.cpp) are the likely
+// route to a first sighting, since an accessory carries its vendor's assignment.
+//
+// LABEL RULE once one is confirmed: "camera activation accessory", NEVER "body camera". A holster
+// sensor is not a camera, and calling it one is the same category error this file already spends
+// forty lines warning about, with the twist that it would mislabel the MORE interesting finding as
+// the less interesting one.
+//
+// ---------------------------------------------------------------------------------------------
+// PUBLIC-SAFETY DRONES: THERE IS NO OUI TO ADD. SDPD's published technology inventory lists BRINC
+// Lemur-S, Acecore Zoe, Fotokite Sigma and Hoverfly Spectre HL alongside DJI aircraft. All four
+// non-DJI manufacturers were checked against the IEEE registries on 2026-08-08:
+//
+//   BRINC, Acecore, Fotokite, Hoverfly  ->  NOT PRESENT in MA-L, MA-M or MA-S.
+//
+// THE CONCLUSION IS NARROW, and worth stating precisely so it is not over-read: there is no
+// REGISTRY-BACKED OUI RULE available for these aircraft. That is not the same as "no diagnostic
+// signature could exist". A known flight may still expose a narrow advertised name, a service
+// UUID, a manufacturer identifier or a repeatable Remote ID pattern, and any of those would be
+// worth having. What is ruled out is the shortcut of adding a corporate OUI, because none of the
+// four HAS one, and whatever they transmit therefore rides on some module vendor's block - the
+// Liteon problem exactly: a table matching the module maker matches everything else that maker
+// sells.
+//
+// Remote ID stays the primary mechanism, and is the right one: standardised, carries a UAS ID and
+// operator ID, and public-safety operators are the population most likely to broadcast it
+// correctly. The way to build evidence is a KNOWN FLIGHT - bracket it with
+// {"mark":"brinc-lemur-flight"}, {"mark":"landed"}, {"mark":"end"} and read the RAW capture, not
+// the marker summary, which is BLE-only and will not contain Remote ID at all. Waiting for that
+// capture is the correct bounded choice. The city owning the equipment is not, by itself,
+// evidence of anything.
 
 #endif // ACAB_POLICE_SIGNATURES_H

@@ -164,6 +164,10 @@ struct AdvFields {
     uint16_t svc16[16];   // up to 16 short service UUIDs
     uint8_t  svcCount;
     bool     raven_gps, raven_power, raven_oldloc;
+    // Evidence must displace proximity (mark_table.h): the Raven checks run on every UUID in the
+    // advert, BEFORE the 16-entry svc16 cap, so an advert that packs 16 unrelated UUIDs ahead of a
+    // Raven vendor UUID cannot silently drop the one entry that carries the evidence.
+    bool     ravenVendor;
 };
 
 static void parseAdv(const uint8_t* adv, size_t len, AdvFields* f) {
@@ -194,9 +198,10 @@ static void parseAdv(const uint8_t* adv, size_t len, AdvFields* f) {
                 break;
             case 0x02: // incomplete list of 16-bit service UUIDs
             case 0x03: // complete list of 16-bit service UUIDs
-                for (uint8_t k = 0; k + 1 < dataLen && f->svcCount < 16; k += 2) {
+                for (uint8_t k = 0; k + 1 < dataLen; k += 2) {
                     uint16_t u = (uint16_t)data[k] | ((uint16_t)data[k+1] << 8);
-                    f->svc16[f->svcCount++] = u;
+                    if (f->svcCount < 16) f->svc16[f->svcCount++] = u;
+                    if (isRavenVendorSvc(u)) f->ravenVendor = true;
                     if (u == RAVEN_SVC_GPS)    f->raven_gps = true;
                     if (u == RAVEN_SVC_POWER)  f->raven_power = true;
                     if (u == RAVEN_SVC_OLDLOC) f->raven_oldloc = true;
@@ -212,11 +217,12 @@ static void parseAdv(const uint8_t* adv, size_t len, AdvFields* f) {
                 // and pull the 16-bit short back out for the Raven test below.
                 static const uint8_t BT_BASE_LE[12] =
                     { 0xfb,0x34,0x9b,0x5f,0x80,0x00,0x00,0x80,0x00,0x10,0x00,0x00 };
-                for (uint8_t k = 0; k + 16 <= dataLen && f->svcCount < 16; k += 16) {
+                for (uint8_t k = 0; k + 16 <= dataLen; k += 16) {
                     const uint8_t* u = &data[k];
                     if (memcmp(u, BT_BASE_LE, 12) != 0 || u[14] || u[15]) continue;
                     uint16_t s = (uint16_t)u[12] | ((uint16_t)u[13] << 8);
-                    f->svc16[f->svcCount++] = s;
+                    if (f->svcCount < 16) f->svc16[f->svcCount++] = s;
+                    if (isRavenVendorSvc(s)) f->ravenVendor = true;
                     if (s == RAVEN_SVC_GPS)    f->raven_gps = true;
                     if (s == RAVEN_SVC_POWER)  f->raven_power = true;
                     if (s == RAVEN_SVC_OLDLOC) f->raven_oldloc = true;
@@ -249,9 +255,9 @@ bool flockClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
     if (adv && advLen) parseAdv(adv, advLen, &f);
     else memset(&f, 0, sizeof(f));
 
-    bool ravenVendor = false;
-    for (uint8_t i = 0; i < f.svcCount; i++)
-        if (isRavenVendorSvc(f.svc16[i])) { ravenVendor = true; break; }
+    // Set during the AD walk on the raw UUIDs, not derived from svc16, so the 16-entry cap can
+    // never hide the evidence (see AdvFields).
+    const bool ravenVendor = f.ravenVendor;
 
     // --- Raven (audio/gunshot detector): most specific, so check it first ---
     if (ravenVendor) {
@@ -395,11 +401,14 @@ bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
     //     "*-FALCON" SSID by name - Flock-specific, no OUI gate needed, and unlike the
     //     probe-only OUI path it catches a Falcon in beacon / associated mode too
     //     (which is how a 24:B2:B9 "DATA-FALCON" unit slipped the OUI gate). ---
-    if (sawSSID && !emptySSID && ciEndsWith(ssid, FLOCK_SSID_FALCON_SUFFIX)) {
+    // SELF-ATTESTATION ONLY, same gate as the "Flock-" branch above and for the same reason: on a
+    // probe request the SSID names the network being SEARCHED FOR, so the frame attests nothing
+    // about the transmitter. The probe-borne form lands in the M_PROBE 72 regrade below.
+    if (selfAttested && sawSSID && !emptySSID && ciEndsWith(ssid, FLOCK_SSID_FALCON_SUFFIX)) {
         acabInit(out, ACAB_FLOCK_CAMERA, SRC_WIFI, addr2, (int16_t)rssi);
         out->method = M_SSID;
         out->confidence = 85;
-        strncpy(out->name, ssid, sizeof(out->name) - 1);
+        acabSanitizeAscii(out->name, (const uint8_t*)ssid, strlen(ssid), sizeof(out->name));
         return true;
     }
 
@@ -448,7 +457,8 @@ bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
     } else {
         out->method = M_OUI;
         out->confidence = 68;
-        if (ssid[0]) strncpy(out->name, ssid, sizeof(out->name) - 1);
+        // Attacker-controlled text: clamp like every other name path (acab_scanner.h contract).
+        if (ssid[0]) acabSanitizeAscii(out->name, (const uint8_t*)ssid, strlen(ssid), sizeof(out->name));
     }
     return true;
 }

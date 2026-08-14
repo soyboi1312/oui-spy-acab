@@ -3,13 +3,30 @@
  */
 #include "desert_detect.h"
 #include "acab_scanner.h"   // acabSanitizeAscii: clamp attacker-sourced strings on ingest
+#include <Preferences.h>    // persist the Desert toggle across reboots (NVS)
 #include <string.h>
 #include <stdio.h>
 
 static bool gEnabled = false;   // OFF by default; a special, opt-in mode
 
-void desertSetEnabled(bool enabled) { gEnabled = enabled; }
+// PERSISTED as of 2026-08-08. Desert was the ONLY detector toggle without NVS, so every reboot
+// silently turned it off with nothing in the log to say so. That already voided one drive test,
+// and it is fatal to the deploy-and-leave case this mode exists for: a board left at a water
+// cache for a week stops recording the moment a brownout resets it, and the owner comes back
+// unable to tell "nothing came by" from "the mode switched itself off on day two". Mirrors
+// flock/axon/tracker/glasses/netcam exactly.
+void desertSetEnabled(bool enabled) {
+    if (enabled == gEnabled) return;
+    gEnabled = enabled;
+    Preferences p; p.begin("acab-desert", false); p.putBool("on", enabled); p.end();
+}
 bool desertIsEnabled(void) { return gEnabled; }
+
+void desertRestoreEnabled(bool defaultEnabled) {
+    Preferences p; p.begin("acab-desert", true);
+    gEnabled = p.getBool("on", defaultEnabled);
+    p.end();
+}
 
 // A locally-administered MAC (bit 1 of the first octet) is a randomized/private
 // address - phones rotate these ~every 15 min. A globally-unique OUI means real

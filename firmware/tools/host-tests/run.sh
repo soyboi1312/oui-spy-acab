@@ -17,6 +17,13 @@ fail=0
 for t in test_*.cpp; do
     stem="${t#test_}"; stem="${stem%.cpp}"
     src="${CORE}/${stem}_detect.cpp"
+    extra_flags=""
+    if [ "$stem" = "det_log" ]; then
+        # det_log is a full subsystem rather than a classifier, but the host flash,
+        # Preferences, crypto, BLE, and FreeRTOS stubs let us compile its real source.
+        src="${CORE}/det_log.cpp"
+        extra_flags="-DACAB_HOST_TEST -pthread"
+    fi
     if [ ! -f "$src" ]; then
         # HEADER-ONLY SUITE. Not every testable unit is a classifier with a matching
         # <name>_detect.cpp: sink_claim.h is a pure decision extracted from acab_scanner.cpp
@@ -37,7 +44,7 @@ for t in test_*.cpp; do
     # that there are eight and CI invokes this script, where a truncated log reads as "the suite
     # is smaller than I thought" rather than "it died early". A failing test RUN already used
     # `|| fail=1` and continued, so this only makes the two paths behave the same way.
-    g++ -std=c++17 -Wall -I"$CORE" -Istubs -o "/tmp/$(basename "$t" .cpp)" "$t" ${src:+"$src"} \
+    g++ -std=c++17 -Wall ${extra_flags:+$extra_flags} -I"$CORE" -Istubs -o "/tmp/$(basename "$t" .cpp)" "$t" ${src:+"$src"} \
         || { echo "!! COMPILE FAILED: $t"; fail=1; continue; }
     "/tmp/$(basename "$t" .cpp)" || fail=1
 done

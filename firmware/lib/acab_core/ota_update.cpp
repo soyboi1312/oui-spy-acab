@@ -4,6 +4,7 @@
 #include "ota_update.h"
 #include "acab_version.h"
 #include "ota_pubkey.h"
+#include "ota_policy.h"
 
 #include <Arduino.h>
 #include <Update.h>
@@ -31,7 +32,9 @@ static uint32_t gCrc      = 0;         // running CRC32 accumulator
 static uint32_t gLastMark = 0;         // last progress-notify byte count
 static bool     gOnTrial  = false;
 static bool     gForce    = false;     // this session's force flag (from otaBegin), re-checked in otaFinish
+static uint32_t gDeclaredVersion = 0;  // client declaration, later bound to the signed descriptor
 static uint32_t gLastActivity = 0;     // millis of the last otaBegin/otaWrite (stall watchdog)
+static OtaHealthCheck gHealthCheck = nullptr;
 
 // Pending detached ECDSA signature (DER), pushed by the app before begin. A P-256 DER
 // ECDSA signature is ~70-72 bytes; 80 leaves headroom. Verified in otaFinish.
@@ -107,46 +110,70 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t* d, size_t n) {
     return ~crc;
 }
 
-// "a.b.c" -> packed comparable int; ignores any trailing "-suffix".
-static uint32_t verPack(const char* s) {
-    uint32_t p[3] = {0, 0, 0}; int i = 0;
-    if (!s) return 0;
-    while (*s && i < 3) {
-        uint32_t v = 0;
-        while (*s >= '0' && *s <= '9') { v = v * 10 + (uint32_t)(*s - '0'); s++; }
-        p[i++] = (v > 1023) ? 1023 : v;   // clamp to the 10-bit field so packing stays monotonic
-        if (*s == '.') s++; else break;
-    }
-    return (p[0] << 20) | (p[1] << 10) | p[2];
+// Read the authenticated pending image descriptor from the inactive update partition. Both its
+// version and project name ride under the whole-image signature checked before this helper is
+// trusted. The project name is the hardware/product identity, including the distinct rev-B image.
+static bool pendingImageDescription(esp_app_desc_t* desc) {
+    const esp_partition_t* upd = esp_ota_get_next_update_partition(NULL);
+    return upd && desc && esp_ota_get_partition_description(upd, desc) == ESP_OK;
 }
 
 #ifdef ACAB_OTA_VERSION_FLOOR
-// Read the version string baked into the PENDING image's esp_app_desc_t (in the inactive
-// update partition). That field rides UNDER the whole-image signature verified in otaFinish,
-// so unlike otaBegin's client-supplied "ver" it cannot be forged by a bonded/MITM client.
-// Returns false (fail closed) if the description cannot be read. Parses the dotted version
-// with the same verPack used for the running version, for an apples-to-apples compare.
-// NOTE: only meaningful once the build stamps esp_app_desc.version = ACAB_FW_VERSION (see the
-// gate in otaFinish); gated with the floor so an unstamped default build has no unused helper.
-static bool pendingImageVersion(uint32_t* packed) {
-    const esp_partition_t* upd = esp_ota_get_next_update_partition(NULL);
-    if (!upd) return false;
-    esp_app_desc_t desc;
-    if (esp_ota_get_partition_description(upd, &desc) != ESP_OK) return false;
-    desc.version[sizeof(desc.version) - 1] = '\0';   // ensure NUL-terminated before parsing
-    *packed = verPack(desc.version);
-    return true;
-}
-
 // NVS-persisted anti-rollback floor: the lowest packed version this board accepts over BLE.
 // Raised to the running version on each confirmed-healthy boot (otaMarkHealthy). 0 until the
 // first healthy boot writes it, so a fresh board falls back to the running-version compare.
-static uint32_t otaVersionFloor() {
-    Preferences p; uint32_t f = 0;
-    if (p.begin("ota", true)) { f = p.getUInt("floor", 0); p.end(); }
-    return f;
+static bool otaVersionFloor(uint32_t* floor) {
+    Preferences p;
+    // Open read-write so a fresh board creates the namespace and legitimately returns floor 0.
+    // A real NVS failure is different and must fail closed rather than skip an existing floor.
+    if (!p.begin("ota", false)) return false;
+    *floor = p.getUInt("floor", 0);
+    p.end();
+    return true;
 }
 #endif  // ACAB_OTA_VERSION_FLOOR
+
+void otaSetHealthCheck(OtaHealthCheck fn) { gHealthCheck = fn; }
+bool otaHealthReady() { return gHealthCheck && gHealthCheck(); }
+
+static bool putU8(Preferences& p, const char* key, uint8_t value) {
+    return p.putUChar(key, value) == sizeof(value);
+}
+static bool putU32(Preferences& p, const char* key, uint32_t value) {
+    return p.putUInt(key, value) == sizeof(value);
+}
+
+// State is written last. A power loss during the metadata writes therefore leaves state 0 and the
+// old image remains authoritative. The target address lets boot distinguish a real trial from a
+// prepared record left behind when Update.end failed or power was lost before the slot switch.
+static bool armTrialRecord(uint32_t targetAddress, uint32_t targetVersion) {
+    Preferences p;
+    if (!p.begin("ota", false)) return false;
+    bool ok = putU8(p, "state", 0) &&
+              putU8(p, "tries", 0) &&
+              putU32(p, "target", targetAddress) &&
+              putU32(p, "trialver", targetVersion) &&
+              putU8(p, "state", 1);
+    p.end();
+    return ok;
+}
+
+static bool clearTrialRecord(Preferences& p) {
+    // State first makes a partial cleanup safe. The remaining fields are zeroed so later
+    // diagnostics cannot mistake stale metadata for an armed update.
+    bool ok = putU8(p, "state", 0);
+    ok = putU8(p, "tries", 0) && ok;
+    ok = putU32(p, "target", 0) && ok;
+    ok = putU32(p, "trialver", 0) && ok;
+    return ok;
+}
+
+static void clearPreparedTrialBestEffort() {
+    Preferences p;
+    if (!p.begin("ota", false)) return;
+    clearTrialRecord(p);
+    p.end();
+}
 
 // Store the pending image signature the app pushes before begin. Do NOT clear it in
 // otaBegin (the sig legitimately arrives first); it is cleared in otaFinish/otaAbort.
@@ -169,8 +196,9 @@ OtaResult otaBegin(uint32_t size, uint32_t crc, const char* newVer, bool force) 
     // honoring force for a downgrade would let a bonded client roll the board back to an old
     // signed build with a since-patched bug (a rollback attack). Downgrades need a USB re-flash.
     {
-        uint32_t nv = verPack(newVer), cur = verPack(ACAB_FW_VERSION);
+        uint32_t nv = acabOtaVersionPack(newVer), cur = acabOtaVersionPack(ACAB_FW_VERSION);
         if (force ? (nv < cur) : (nv <= cur)) return OTA_ERR_VERSION;
+        gDeclaredVersion = nv;
     }
     if (!Update.begin(size)) return OTA_ERR_BEGIN;   // checks the target slot has room
     // Start a fresh running SHA-256 over the incoming image (generic mbedtls_md API).
@@ -288,48 +316,61 @@ static OtaResult otaDoFinish() {
     }
     gHasSig = false; gSigLen = 0;   // signature consumed
 
+    // Bind both version and product identity to the authenticated pending descriptor. All ACAB
+    // images share one signing key, so a valid signature alone cannot distinguish rev-A, rev-B,
+    // Mesh, or OUI-Spy artifacts. Refuse a cross-product image before Update.end can select it.
+    esp_app_desc_t pendingDesc;
+    const esp_app_desc_t* runningPtr = esp_ota_get_app_description();
+    if (!pendingImageDescription(&pendingDesc) || !runningPtr) {
+        Update.abort(); gActive = false; return OTA_ERR_IMAGE;
+    }
+    esp_app_desc_t runningDesc = *runningPtr;
+    pendingDesc.version[sizeof(pendingDesc.version) - 1] = '\0';
+    pendingDesc.project_name[sizeof(pendingDesc.project_name) - 1] = '\0';
+    runningDesc.version[sizeof(runningDesc.version) - 1] = '\0';
+    runningDesc.project_name[sizeof(runningDesc.project_name) - 1] = '\0';
+    if (!acabOtaProjectMatches(runningDesc.project_name, pendingDesc.project_name)) {
+        Update.abort(); gActive = false; return OTA_ERR_IMAGE;
+    }
+    const uint32_t authenticatedVersion = acabOtaVersionPack(pendingDesc.version);
+    if (authenticatedVersion == 0 || authenticatedVersion != gDeclaredVersion) {
+        Update.abort(); gActive = false; return OTA_ERR_VERSION;
+    }
+
     // SEC-2: anti-rollback bound to the AUTHENTICATED image version, not the client's "ver".
     // otaBegin already screened the client-supplied "ver", but a bonded/MITM client can lie there
     // to install a since-patched but validly-signed OLDER build. The real version lives in the
     // pending image's esp_app_desc_t (under the whole-image signature we just verified), so read it
     // back and gate against a value the attacker cannot forge.
     //
-    // *** DEFAULT OFF (ACAB_OTA_VERSION_FLOOR) - UNVERIFIED, do NOT enable without the two steps below. ***
-    // This only works once the build STAMPS esp_app_desc_t.version with ACAB_FW_VERSION. Under
-    // PlatformIO/arduino-esp32 that field is a FIXED build constant, NOT the ACAB version, so an
-    // unstamped build would compare a bogus value and could REJECT every legitimate signed OTA
-    // (brick the update path). So this stays gated off until: (a) a pre-sign build step stamps the
-    // descriptor version[32] (image offset 48) with ACAB_FW_VERSION, and (b) an on-device OTA test
-    // proves pendingImageVersion() == verPack(ACAB_FW_VERSION). Until then the OTA gate is otaBegin's
-    // client-ver-increase screen + force-block + the ECDSA signature (the proven, pre-existing
-    // posture). See firmware/OTA.md.
+    // stamp_app_desc.py stamps ACAB_FW_VERSION into esp_app_desc_t before the image is signed, and
+    // the release verifier checks the raw descriptor bytes. Therefore an unreadable, zero, or
+    // declaration-mismatched authenticated version is a hard rejection, never a skipped check.
 #ifdef ACAB_OTA_VERSION_FLOOR
     {
-        uint32_t authVer = 0;
-        if (!pendingImageVersion(&authVer) || authVer == 0) {
-            // fail LOUD + fail SAFE: an unreadable/unstamped descriptor version means the stamp is
-            // misconfigured, NOT that the image is old. never reject a validly-signed image over it.
-            Serial.println("[ota] version-floor: pending descriptor version unreadable/0 - floor SKIPPED (stamp misconfigured?)");
-        } else {
-            uint32_t floor = otaVersionFloor();
-            uint32_t cur   = verPack(ACAB_FW_VERSION);
-            // never below the persisted rollback floor (raised to the running version on each
-            // confirmed-healthy boot) - even with force; plus the force/non-force downgrade block,
-            // now on the trustworthy version. force re-flashes the SAME version but never older;
-            // non-force requires strictly newer than the running.
-            if (authVer < floor || (gForce ? (authVer < cur) : (authVer <= cur))) {
-                Update.abort(); gActive = false; return OTA_ERR_VERSION;
-            }
+        uint32_t floor = 0;
+        const uint32_t cur = acabOtaVersionPack(ACAB_FW_VERSION);
+        if (!otaVersionFloor(&floor) ||
+            !acabOtaAuthenticatedVersionAllowed(gDeclaredVersion, authenticatedVersion,
+                                                 cur, floor, gForce)) {
+            Update.abort(); gActive = false; return OTA_ERR_VERSION;
         }
     }
 #endif
 
-    if (!Update.end(true))              { gActive = false; return OTA_ERR_IMAGE; }  // validate + set boot slot
+    const esp_partition_t* target = esp_ota_get_next_update_partition(NULL);
+    if (!target || !armTrialRecord(target->address, authenticatedVersion)) {
+        Update.abort(); gActive = false; return OTA_ERR_STATE;
+    }
+    // The trial record is durable before the boot-slot switch. If Update.end fails, clear it best
+    // effort; if cleanup also fails, otaBootCheck sees that the running address is not `target` and
+    // clears the stale prepared record instead of condemning the old image.
+    if (!Update.end(true)) {
+        gActive = false;
+        clearPreparedTrialBestEffort();
+        return OTA_ERR_IMAGE;
+    }
     gActive = false;
-    // Arm boot-attempt rollback: mark "trying" with a fresh attempt count. The new image
-    // clears this via otaMarkHealthy once it is up; otaBootCheck reverts if it never does.
-    Preferences p;
-    if (p.begin("ota", false)) { p.putUChar("state", 1); p.putUChar("tries", 0); p.end(); }
     notify("{\"ota\":\"done\"}");
     return OTA_OK;
 }
@@ -351,6 +392,24 @@ void otaBootCheck() {
     if (!p.begin("ota", false)) return;
     uint8_t state = p.getUChar("state", 0);
     if (state != 1) { p.end(); return; }
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    const uint32_t targetAddress = p.getUInt("target", 0);
+    const uint32_t targetVersion = p.getUInt("trialver", 0);
+    const esp_app_desc_t* runningDesc = esp_ota_get_app_description();
+    const uint32_t runningVersion = runningDesc
+        ? acabOtaVersionPack(runningDesc->version) : 0;
+    if (!running || !acabOtaTrialMatches(running->address, targetAddress) ||
+        targetVersion == 0 || runningVersion != targetVersion) {
+        // Prepared but never switched, Update.end failure, or corrupt/stale metadata. This running
+        // image is not the trial the record names, so clear it rather than rolling back good code.
+        // KNOWN ONE-HOP GAP: an OTA taken FROM firmware that predates the "target"/"trialver"
+        // keys (2.0.4 and earlier arm only state=1) lands here on its first boot, so that single
+        // upgrade hop runs without boot-loop rollback. Unavoidable - the old image cannot write
+        // keys it does not know - and it fails open in the safe direction only.
+        clearTrialRecord(p);
+        p.end();
+        return;
+    }
     // m8: an ext0-wake boot (device toggled back on within the trial window) is NOT a failed
     // trial. deep sleep never disarmed the counter, so counting the wake boot would silently
     // roll back a user's update. only count non-ext0 boots (a genuinely wedged post-wake image
@@ -362,31 +421,44 @@ void otaBootCheck() {
         // The freshly-OTA'd image already booted once without confirming health -> revert to
         // the previous slot (the "next update" partition is the one we are NOT running).
         const esp_partition_t* prev = esp_ota_get_next_update_partition(NULL);
-        p.putUChar("state", 0); p.putUChar("tries", 0); p.end();
         if (prev && esp_ota_set_boot_partition(prev) == ESP_OK) {
+            clearTrialRecord(p);   // best effort; address mismatch also clears it on the old slot
+            p.end();
             esp_restart();   // does not return
         }
+        p.end();
         return;
     }
-    p.putUChar("tries", tries);
+    if (!putU8(p, "tries", tries)) {
+        // Keep the trial armed. A later health check cannot clear it unless NVS recovers, and a
+        // reboot retries this accounting instead of silently losing the rollback state.
+        p.end();
+        gOnTrial = true;
+        return;
+    }
     p.end();
     gOnTrial = true;   // first trial boot: run, but stay armed until marked healthy
 }
 
-void otaMarkHealthy() {
+bool otaMarkHealthy() {
     Preferences p;
     // If NVS is momentarily unavailable, LEAVE gOnTrial set and return: loop()'s otaOnTrial() gate
     // then retries this on the next tick. Clearing gOnTrial while the persisted "state" stayed 1
     // would strand a genuinely-healthy image one unlucky reboot away from otaBootCheck reverting it.
-    if (!p.begin("ota", false)) return;
-    if (p.getUChar("state", 0) == 1) { p.putUChar("state", 0); p.putUChar("tries", 0); }
+    if (!p.begin("ota", false)) return false;
+    const uint8_t state = p.getUChar("state", 0);
+    if (state == 1 && !otaHealthReady()) { p.end(); return false; }
+    bool ok = true;
+    if (state == 1) ok = clearTrialRecord(p);
 #ifdef ACAB_OTA_VERSION_FLOOR
     // SEC-2: a confirmed-healthy image raises the anti-rollback floor, so a later OTA can
     // never be talked back below the version we KNOW booted cleanly on this hardware. Gated
     // with the floor enforcement so the floor is only written when it will actually be honored.
-    uint32_t cur = verPack(ACAB_FW_VERSION);
-    if (p.getUInt("floor", 0) < cur) p.putUInt("floor", cur);
+    uint32_t cur = acabOtaVersionPack(ACAB_FW_VERSION);
+    if (p.getUInt("floor", 0) < cur) ok = putU32(p, "floor", cur) && ok;
 #endif
     p.end();
+    if (!ok) return false;
     gOnTrial = false;   // only after the persisted state clear is committed
+    return true;
 }

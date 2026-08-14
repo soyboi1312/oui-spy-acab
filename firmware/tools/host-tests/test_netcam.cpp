@@ -15,6 +15,7 @@
 // still asserted as-is, with the surprise written down next to it rather than "fixed" in the test.
 #include "netcam_detect.h"
 #include "netcam_signatures.h"
+#include <Preferences.h>   // wipeAll(): the stub stores for real now
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -442,6 +443,11 @@ int main() {
     // setEnabled(true) on an already-restored-true flag early-returns and never refreshes either, so
     // anything that restores true AFTER the scanner is up depends on that boot-time read having
     // happened. Only boot calls this today, so it holds.
+    // Preferences::wipeAll() is what MAKES "nothing saved" true. The host stub used to discard
+    // every write, so these restore cases exercised the default branch by accident; now that it
+    // really stores, the netcamSetEnabled(false) above persists and a bare restore would read
+    // THAT back instead of the default each case name promises.
+    Preferences::wipeAll();
     netcamRestoreEnabled(true);
     chkBool("restoreEnabled(true) sets the flag", netcamIsEnabled());
     chkBool("restoreEnabled() does NOT refresh the filter (by design)", gFilterRefreshes == 2);
@@ -450,6 +456,7 @@ int main() {
           d.detail, "Dahua on wifi"); }
     netcamSetEnabled(true);
     chkBool("setEnabled(true) after restore(true) is a no-op", gFilterRefreshes == 2);
+    Preferences::wipeAll();
     netcamRestoreEnabled(false);
     chkBool("restoreEnabled(false) restores the default-OFF state", !netcamIsEnabled());
     { std::vector<uint8_t> f = uplink(MAC_HIK);

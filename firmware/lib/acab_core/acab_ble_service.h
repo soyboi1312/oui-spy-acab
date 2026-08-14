@@ -122,9 +122,21 @@ bool acabBoardIsRevB() __attribute__((weak));
 bool acabNrfDfuActive();
 
 // One-shot: returns true (and clears the latch) if an {"nrfdfu":true} config write asked to kick
-// the companion nRF into BLE OTA DFU since the last call. The beacon-board loop() polls this and
+// the companion nRF into BLE OTA DFU from a secure link during the physical pairing window. The
+// beacon-board loop() polls this and
 // forwards the trigger over UART. Always safe to call; single-board builds never see the request.
 bool acabBleTakeNrfDfuRequest();
+
+// One-shot: returns true (and clears the latch) if a {"poweroff":true} config write asked the board
+// to shut down. The beacon-board loop() polls this and, on rev-B only, runs the deep-sleep power-off
+// (mirrors the nrfdfu deferral: the write callback cannot block on the multi-second nRF park + never-
+// returning deep sleep). Always safe to call; single-board builds never see the request.
+bool acabBleTakePowerOffRequest();
+
+// Notify a connected app that the board is powering off on purpose (button-hold or app request), so
+// it treats the imminent link drop as a clean shutdown. Called by the beacon-board power-off path
+// only when it is really about to deep-sleep; a no-op with no subscriber and on non-dual builds.
+void acabBleNotifyPoweringOff();
 
 // Init NimBLE, build the service, and start advertising as `deviceName`. `fwLabel`
 // is this build's name in the status "fw" string (e.g. "mesh-detect-ACAB").
@@ -150,7 +162,7 @@ void acabBleNotifyDetection(const AcabDetection& d, bool isNew);
 // firmware is fully compatible with every app shipped to date, so an app that sees no `proto` must
 // behave exactly as it does today. An app should refuse to interpret a board whose proto EXCEEDS
 // the version it was built against, and say so, rather than silently misparse.
-#define ACAB_BLE_PROTO_VERSION 1
+#define ACAB_BLE_PROTO_VERSION 2
 
 // ---------------------------------------------------------------------------
 // Pairing window
@@ -182,9 +194,12 @@ void acabBleNotifyDetection(const AcabDetection& d, bool isNew);
 void acabBlePairGateEnable();
 
 // Calling this ALSO opts the target into enforcement. A target that never calls it keeps the
-// pre-feature behaviour (any phone may pair, any time): mesh-detect deliberately does not opt in,
-// because inheriting the rejection without ever arming a window would make it permanently
-// unpairable, which is worse than not having the feature at all.
+// pre-feature behaviour (any phone may pair, any time). Every GATT-serving production target now
+// opts in: beacon-board arms the window from its power-gate signals, mesh-detect from the reset
+// reason with cellAbsent=true (USB power is its only "switch"), so unplug/replug is the recovery
+// on both. The old worry, inheriting the rejection without ever arming a window and becoming
+// permanently unpairable, is exactly why enabling the gate without a window-arming signal is
+// wrong; do not copy the enable call without the acabPhysicalStart call beside it.
 void acabBleOpenPairingWindow();
 // True while a new phone may bond. False before the window opens and after it expires.
 bool acabBlePairWindowOpen();
@@ -215,7 +230,7 @@ void acabBleSetBatteryPct(int pct);
 // the app shows a normal battery. No-op storage on other builds.
 void acabBleSetCharging(bool charging);
 
-// True once the app is connected.
+// True only after the app link is encrypted and bonded. A raw pre-auth GAP link returns false.
 bool acabBleClientConnected();
 
 // Drive the offline-buffer replay drain (a bounded burst of records per call, paced by the

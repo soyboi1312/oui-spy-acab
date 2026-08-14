@@ -294,6 +294,25 @@ int main() {
     const uint8_t macDesert[6] = {0x60, 0x60, 0x1f, 0x11, 0x22, 0x0d};
     const uint8_t macSkydio[6] = {0x38, 0x1d, 0x14, 0x01, 0x02, 0x03};
     const uint8_t macParrot[6] = {0x90, 0x3a, 0xe6, 0x01, 0x02, 0x03};
+    const uint8_t macParrotNew[6] = {0x00, 0x12, 0x1c, 0x01, 0x02, 0x03};
+    const uint8_t macDjiBaiwang1[6] = {0x9c, 0x5a, 0x8a, 0x01, 0x02, 0x03};
+    const uint8_t macDjiBaiwang2[6] = {0xec, 0x72, 0xf7, 0x01, 0x02, 0x03};
+    const uint8_t macDjiBaiwang3[6] = {0x34, 0x91, 0xf0, 0x01, 0x02, 0x03};
+    const uint8_t macAutelMam[6] = {0xec, 0x5b, 0xcd, 0xe1, 0x02, 0x03};
+    const uint8_t macAutelNeighbor[6] = {0xec, 0x5b, 0xcd, 0xd1, 0x02, 0x03};
+    const uint8_t macAutelAutomotive[6] = {0x18, 0xd7, 0x93, 0x61, 0x02, 0x03};
+    const uint8_t macYuneecMam[6] = {0xe0, 0xb6, 0xf5, 0x8f, 0x02, 0x03};
+    const uint8_t macYuneecNeighbor[6] = {0xe0, 0xb6, 0xf5, 0x7f, 0x02, 0x03};
+    const uint8_t macFreefly[6] = {0xec, 0x71, 0x5e, 0x01, 0x02, 0x03};
+    const uint8_t macTeal[6] = {0xb0, 0x30, 0xc8, 0x01, 0x02, 0x03};
+    const uint8_t macAeroMal[6] = {0x00, 0x1a, 0xf9, 0x01, 0x02, 0x03};
+    const uint8_t macAeroMas[6] = {0x8c, 0x1f, 0x64, 0xb0, 0x7a, 0x03};
+    const uint8_t macAeroMasNeighbor[6] = {0x8c, 0x1f, 0x64, 0xb0, 0x6a, 0x03};
+    const uint8_t macInspiredMam[6] = {0x34, 0xb5, 0xf3, 0x2a, 0x02, 0x03};
+    const uint8_t macInspiredNeighbor[6] = {0x34, 0xb5, 0xf3, 0x3a, 0x02, 0x03};
+    const uint8_t macShieldAi[6] = {0x14, 0xdd, 0x48, 0x01, 0x02, 0x03};
+    const uint8_t macAndurilMam[6] = {0xe8, 0xb4, 0x70, 0xc1, 0x02, 0x03};
+    const uint8_t macAndurilNeighbor[6] = {0xe8, 0xb4, 0x70, 0xb1, 0x02, 0x03};
     const uint8_t macNearMiss[6] = {0x60, 0x60, 0x1e, 0x01, 0x02, 0x03};  // one below DJI's block
     const uint8_t macRandom[6]   = {0x62, 0x60, 0x1f, 0x01, 0x02, 0x03};  // DJI block + LAA bit
     const uint8_t macPhone[6]    = {0xac, 0xde, 0x48, 0x01, 0x02, 0x03};  // nothing at all
@@ -314,8 +333,9 @@ int main() {
     ok("droneOuiRestoreEnabled(true) -> on", droneOuiIsEnabled());
     droneOuiRestoreEnabled(false);
     ok("droneOuiRestoreEnabled(false) -> off", !droneOuiIsEnabled());
-    // (The Preferences stub always returns the caller's default, so these prove the restore path
-    //  applies what NVS hands back. Real persistence is a board test, not a host test.)
+    // (The Preferences stub persists within a binary now, but nothing above wrote the droui key,
+    //  so these still assert the empty-NVS path: restore applies the default it is handed. The
+    //  persisted round-trip is covered by test_axon/test_desert against the same stub.)
 
     // -----------------------------------------------------------------------
     // BLE Remote ID: the primary path, confidence 99.
@@ -447,17 +467,16 @@ int main() {
       chk("latitude out of range -> hit, but no map pin", hit, true, d.confidence, 99, d.detail);
       ok("  ... bogus coordinates dropped, lat/lon left 0", d.lat == 0.0 && d.lon == 0.0); }
 
-    // The 60 s track TTL frees SLOTS; it does not expire a match. A track older than the TTL is
-    // still matched by MAC while its slot survives, so the stale ID is re-attached. Locked in
-    // deliberately: this is the behaviour today, and it is worth knowing if it ever changes.
+    // The 60 s track TTL expires the accumulated identity and position, including on a direct
+    // MAC match. Otherwise a location-only frame can inherit another flight's UAS ID and
+    // operator position indefinitely while the slot survives.
     { std::vector<uint8_t> a; mkBasicID(msg, "TTLDRONE000000000001"); addOdid(a, msg, sizeof(msg));
       hit = runBLE(macTtl, a, &d);
       ok("TTL: BasicID seen at t=0", hit && strcmp(d.id, "TTLDRONE000000000001") == 0);
       acabHostAdvanceMillis(61000);       // deterministic clock, no sleeping
       std::vector<uint8_t> b; mkLocation(msg2, 33.30, -117.40, true); addOdid(b, msg2, sizeof(msg2));
       hit = runBLE(macTtl, b, &d);
-      ok("TTL: 61 s later the MAC still resolves the old ID",
-         hit && strcmp(d.id, "TTLDRONE000000000001") == 0); }
+      ok("TTL: 61 s later the old identity is gone", hit && d.id[0] == 0 && nearly(d.lat, 33.30)); }
 
     // -----------------------------------------------------------------------
     // BLE adversarial input. A malformed advert is free to send and arrives unsolicited.
@@ -510,6 +529,24 @@ int main() {
 
     droneOuiSetEnabled(true);
     ok("droneOuiSetEnabled(true) sticks", droneOuiIsEnabled());
+    for (size_t i = 0; i < DRONE_VENDOR_OUI_COUNT; i++) {
+      const DroneOui& entry = DRONE_VENDOR_OUI[i];
+      uint8_t tableMac[6] = {entry.prefix[0], entry.prefix[1], entry.prefix[2],
+                             0x01, 0x02, static_cast<uint8_t>(i)};
+      if (entry.prefixBits == 28) tableMac[3] = static_cast<uint8_t>(entry.prefix[3] | 0x01);
+      if (entry.prefixBits == 36) {
+          tableMac[3] = entry.prefix[3];
+          tableMac[4] = static_cast<uint8_t>(entry.prefix[4] | 0x01);
+      }
+      ok("drone OUI table uses a supported IEEE prefix length",
+         entry.prefixBits == 24 || entry.prefixBits == 28 || entry.prefixBits == 36);
+      char expected[64];
+      snprintf(expected, sizeof(expected), "%s gear, no Remote ID", entry.vendor);
+      std::vector<uint8_t> flags; addFlags(flags);
+      hit = runBLE(tableMac, flags, &d);
+      chk("every drone-vendor table entry reaches the classifier", hit, true,
+          d.confidence, DRONE_OUI_CONFIDENCE, d.detail, expected);
+    }
     { std::vector<uint8_t> a; addFlags(a);
       hit = runBLE(macDji, a, &d);
       chk("DJI OUI with fallback ON", hit, true, d.confidence, DRONE_OUI_CONFIDENCE, d.detail,
@@ -525,6 +562,54 @@ int main() {
       hit = runBLE(macParrot, a, &d);
       chk("Parrot OUI (also the ODID beacon IE OUI)", hit, true, d.confidence, 60, d.detail,
           "Parrot gear, no Remote ID"); }
+    { std::vector<uint8_t> a; addFlags(a);
+      hit = runBLE(macParrotNew, a, &d);
+      chk("additional Parrot MA-L block", hit, true, d.confidence, 60, d.detail,
+          "Parrot gear, no Remote ID"); }
+    { std::vector<uint8_t> a; addFlags(a);
+      const uint8_t* baiwang[] = {macDjiBaiwang1, macDjiBaiwang2, macDjiBaiwang3};
+      for (const uint8_t* mac : baiwang) {
+          hit = runBLE(mac, a, &d);
+          chk("DJI Baiwang MA-L block", hit, true, d.confidence, 60, d.detail,
+              "DJI gear, no Remote ID");
+      }
+    }
+    { std::vector<uint8_t> a; addFlags(a);
+      hit = runBLE(macAutelMam, a, &d);
+      chk("Autel MA-M exact fourth nibble", hit, true, d.confidence, 60, d.detail,
+          "Autel gear, no Remote ID");
+      chk("Autel neighboring MA-M block is not widened",
+          runBLE(macAutelNeighbor, a, &d), false);
+      chk("Autel automotive-diagnostics MA-M is not attributed to a drone",
+          runBLE(macAutelAutomotive, a, &d), false); }
+    { std::vector<uint8_t> a; addFlags(a);
+      hit = runBLE(macYuneecMam, a, &d);
+      chk("Yuneec MA-M exact fourth nibble", hit, true, d.confidence, 60, d.detail,
+          "Yuneec gear, no Remote ID");
+      chk("Yuneec neighboring MA-M block is not widened",
+          runBLE(macYuneecNeighbor, a, &d), false); }
+    { std::vector<uint8_t> a; addFlags(a);
+      struct VendorCase { const uint8_t* mac; const char* detail; } cases[] = {
+          {macFreefly, "Freefly gear, no Remote ID"},
+          {macTeal, "Teal gear, no Remote ID"},
+          {macAeroMal, "AeroVironment gear, no Remote ID"},
+          {macAeroMas, "AeroVironment gear, no Remote ID"},
+          {macInspiredMam, "Inspired Flight gear, no Remote ID"},
+          {macShieldAi, "Shield AI gear, no Remote ID"},
+          {macAndurilMam, "Anduril gear, no Remote ID"},
+      };
+      for (const VendorCase& c : cases) {
+          hit = runBLE(c.mac, a, &d);
+          chk("additional narrow drone-vendor assignment", hit, true, d.confidence, 60,
+              d.detail, c.detail);
+      }
+      chk("AeroVironment neighboring MA-S block is not widened",
+          runBLE(macAeroMasNeighbor, a, &d), false);
+      chk("Inspired Flight neighboring MA-M block is not widened",
+          runBLE(macInspiredNeighbor, a, &d), false);
+      chk("Anduril neighboring MA-M block is not widened",
+          runBLE(macAndurilNeighbor, a, &d), false);
+    }
     // Remote ID is decoded FIRST, so a drone in a vendor block never degrades to the OUI guess.
     { std::vector<uint8_t> a; mkBasicID(msg, "LAYERINGDRONE0000001"); addOdid(a, msg, sizeof(msg));
       hit = runBLE(macDesert, a, &d);
@@ -653,7 +738,7 @@ int main() {
     // but long enough to hold addr2 (>= 16). Boundary worth pinning: 16 hits, 15 does not.
     droneOuiSetEnabled(true);
     { std::vector<uint8_t> f(16, 0); f[0] = 0x80;
-      const uint8_t addr2[6] = {0xec, 0x5b, 0xcd, 0x77, 0x88, 0x01};     // Autel
+      const uint8_t addr2[6] = {0xec, 0x5b, 0xcd, 0xe7, 0x88, 0x01};     // Autel MA-M
       memcpy(&f[10], addr2, 6);
       hit = runWiFi(f, &d);
       chk("16-byte frame -> OUI fallback on addr2 (Autel)", hit, true, d.confidence, 60, d.detail,
@@ -664,7 +749,7 @@ int main() {
       hit = runWiFi(f, &d);
       chk("15-byte frame -> too short even for addr2", hit, false); }
     { std::vector<uint8_t> f(24, 0); f[0] = 0x80;
-      const uint8_t addr2[6] = {0xe0, 0xb6, 0xf5, 0x77, 0x88, 0x03};     // Yuneec
+      const uint8_t addr2[6] = {0xe0, 0xb6, 0xf5, 0x87, 0x88, 0x03};     // Yuneec MA-M
       memcpy(&f[10], addr2, 6);
       hit = runWiFi(f, &d);
       chk("Yuneec addr2 -> \"Yuneec gear, no Remote ID\"", hit, true, d.confidence, 60, d.detail,

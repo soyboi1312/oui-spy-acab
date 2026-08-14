@@ -19,11 +19,12 @@ static void chk(const char* name, bool ok) {
 int main() {
     printf("\n=== live-notify field elision ===\n");
 
-    // THE DOCUMENTED ORDER, asserted as a sequence rather than field by field. Operator position is
+    // THE DOCUMENTED ORDER, asserted as a sequence rather than field by field. Company ID is first
+    // on purpose (diagnostics, not alert content); operator position is
     // last on purpose: on a drone record it is the most useful thing a person can act on.
     static const AcabElidableField kOrder[] = {
-        ACAB_FIELD_PALT, ACAB_FIELD_HGT, ACAB_FIELD_VSPD,
-        ACAB_FIELD_SPD,  ACAB_FIELD_HDG, ACAB_FIELD_STA, ACAB_FIELD_PILOT
+        ACAB_FIELD_CID,  ACAB_FIELD_PALT, ACAB_FIELD_HGT, ACAB_FIELD_VSPD,
+        ACAB_FIELD_SPD,  ACAB_FIELD_HDG,  ACAB_FIELD_STA, ACAB_FIELD_PILOT
     };
     const int n = (int)(sizeof(kOrder) / sizeof(kOrder[0]));
 
@@ -44,8 +45,13 @@ int main() {
     chk("every level drops exactly the first N fields of the documented order", orderOk);
 
     // Spot-checks that read as English, so a failure names the product decision it broke.
+    chk("full record keeps the company ID", acabElideKeeps(ACAB_FIELD_CID, ACAB_ELIDE_NONE));
     chk("full record keeps operator altitude", acabElideKeeps(ACAB_FIELD_PALT, ACAB_ELIDE_NONE));
-    chk("first squeeze gives up operator ALTITUDE, nothing else",
+    chk("first squeeze gives up the COMPANY ID, nothing else",
+        !acabElideKeeps(ACAB_FIELD_CID,  ACAB_ELIDE_CID) &&
+         acabElideKeeps(ACAB_FIELD_PALT, ACAB_ELIDE_CID) &&
+         acabElideKeeps(ACAB_FIELD_PILOT, ACAB_ELIDE_CID));
+    chk("second squeeze gives up operator ALTITUDE, keeping the rest",
         !acabElideKeeps(ACAB_FIELD_PALT, ACAB_ELIDE_PALT) &&
          acabElideKeeps(ACAB_FIELD_HGT,  ACAB_ELIDE_PALT) &&
          acabElideKeeps(ACAB_FIELD_PILOT, ACAB_ELIDE_PALT));

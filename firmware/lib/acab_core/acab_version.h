@@ -20,12 +20,38 @@
 // its own version via -DACAB_FW_VERSION so OTA's version-guard can compare builds); oui-spy
 // and mesh-detect leave it at the default. Keep it "a.b[.c]" so OTA can parse and compare.
 //
-// KEEP EVERY DOTTED FIELD UNDER 1024. ota_update.cpp verPack() packs the version into three
-// 10-BIT FIELDS and CLAMPS anything larger to 1023, so 2.0.1023, 2.0.1310 and 2.0.9999 are all
-// the SAME number to the OTA gate, which refuses an equal version. A four-digit patch field is
-// therefore un-shippable over the air: the apps compare unclamped, would keep offering the
-// update, and the board would refuse it forever. Bump the MINOR when the patch field runs out.
+// KEEP EVERY DOTTED FIELD UNDER 1024. acabOtaVersionPack (ota_policy.h) packs the version into
+// three 10-BIT FIELDS and REFUSES a field past 1023 as malformed (packs to 0, which every OTA
+// gate hard-rejects; it used to clamp, which aliased 2.0.1023 with 2.0.9999). A four-digit
+// field is therefore un-shippable over the air: the apps compare unclamped, would keep offering
+// the update, and the board would refuse it forever. Bump the MINOR when the patch field runs out.
 //
+// 2.0.5: the two-review hardening round. No new detection categories; the wire, the grading and
+//        the radio hot path got safer.
+//        WIRE: `cid` (BLE manufacturer company ID) is now actually emitted in every detection
+//        record - both apps had parsed, rendered and exported it while the firmware never sent
+//        it, so the glasses/tracker diagnosability story was fiction. First field elided on a
+//        tight-MTU live notify; replay records always carry it.
+//        GRADING: the "*-FALCON" SSID branch is gated on self-attestation like its "Flock-"
+//        sibling, so a probe REQUEST regrades to M_PROBE/72 instead of earning beacon-tier 85;
+//        both remaining raw-strncpy SSID copies clamp through acabSanitizeAscii; a Raven vendor
+//        UUID is recognized past the 16-slot svc16 cap (evidence displaces filler).
+//        HOT PATH: detLogBufferAll() no longer runs inside the dedup critical section (it takes
+//        the flash mutex; taking a semaphore with interrupts off panics assertion builds).
+//        PAIRING: mesh-detect now enables the connect-time pairing gate (USB replug arms the
+//        window, cellAbsent=true); previously any stranger in radio range could bond and reach
+//        clearlog/key/toggles.
+//        OTA: acabOtaVersionPack refuses a dotted field past 1023 as malformed instead of
+//        saturating (2.0.1023 no longer aliases 2.0.5000); both apps validate the running
+//        version as ASCII digits only (fullwidth/Arabic-Indic/Devanagari digits could spoof
+//        the >= compare and disarm rollback) with cross-platform leading-dash parity.
+//        Plus UBSan enum clamp on ODID status, uint32/int16 clamps at every app decode
+//        boundary, and the dev-OTA-key fingerprint pinned in the release verifier.
+//        ALSO IN THIS CUT (landed in the same tree before the hardening round): BLE proto 1->2
+//        (the nrfdfu physical-window re-gating is the breaking part), OTA project-identity
+//        binding + health-gated trial confirmation + durable trial records, Desert toggle NVS
+//        persistence, det_log fault latches/saturation + record-everything support, and the
+//        drone vendor-OUI table rework (MA-M/MA-S prefix narrowing, Autel 18:D7:93 dropped).
 // 2.0.4: Arlo, and the first SSID match in the netcam category.
 //        DETECTION: Arlo Technology netcam OUIs 59 -> 62 (A4:11:62, FC:9C:98, 48:62:64). Arlo had
 //        been named on netcam_signatures.h's "why not" line with NO reason while Nest and Blink
@@ -72,7 +98,7 @@
 // 2.0.0: the Colonel Panic builds pick up the full v2 detection set the beacon board ships
 // with (offline buffer, watchlist/custom category, ignore list, refreshed OUIs, glasses).
 #ifndef ACAB_FW_VERSION
-#define ACAB_FW_VERSION "2.0.4"
+#define ACAB_FW_VERSION "2.0.5"
 #endif
 
 #endif // ACAB_VERSION_H

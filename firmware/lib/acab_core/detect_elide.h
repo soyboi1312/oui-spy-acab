@@ -11,11 +11,18 @@
  * WHY ELISION AND NOT FRAGMENTATION. Fragmentation means a reassembly protocol on the live path,
  * with sequencing, retries and a partial-record state machine on both apps, to deliver telemetry
  * detail nobody reads in the moment. The live notify's job is the ALERT: something is here, what it
- * is, how sure we are, and where. The COMPLETE record still reaches the offline buffer, and the
- * drain path already has seq/resync, so nothing is permanently lost by trimming the notify. Sending
- * a shorter honest record beats sending nothing.
+ * is, how sure we are, and where. Sending a shorter honest record beats sending nothing.
  *
- * THE ORDER IS THE CONTRACT. Fields are dropped least-meaningful first, and operator position is
+ * AN ELIDED FIELD IS LOST, NOT DEFERRED. The offline buffer's fixed 64-byte StoredDet slot
+ * (det_log.h) persists none of the elidable fields - not cid, not the drone telemetry - so a
+ * replayed record cannot restore what the live notify gave up. An earlier version of this comment
+ * claimed the complete record reaches the buffer; it does not, and the doc row for `cid` in
+ * ble-protocol.md states the real contract. The trade still holds: what elision drops is
+ * enrichment, and the fields the alert and the evidence log depend on are never elidable.
+ *
+ * THE ORDER IS THE CONTRACT. Fields are dropped least-meaningful first: the BLE company ID goes
+ * first (it exists for after-the-fact diagnosability, not for the in-the-moment alert), and
+ * operator position is
  * dropped LAST of the optional set because on a drone record it is the single most useful field to
  * a person deciding what to do. Anything a user or a parser depends on is never elidable at all:
  * type, source, method, confidence, MAC, RSSI, name, detail, the UAS id, the subject lat/lon, the
@@ -33,6 +40,7 @@
 /// field above it, so the level is "how hard did we have to squeeze".
 enum AcabElideLevel : uint8_t {
     ACAB_ELIDE_NONE = 0,  ///< full record
+    ACAB_ELIDE_CID,       ///< BLE company ID: pure diagnostics, FIRST to go
     ACAB_ELIDE_PALT,      ///< operator altitude: least actionable number in the set
     ACAB_ELIDE_HGT,       ///< height above ground
     ACAB_ELIDE_VSPD,      ///< vertical speed
@@ -45,7 +53,8 @@ enum AcabElideLevel : uint8_t {
 
 /// The elidable fields, named for tests and for the serial warning.
 enum AcabElidableField : uint8_t {
-    ACAB_FIELD_PALT = 0,
+    ACAB_FIELD_CID = 0,
+    ACAB_FIELD_PALT,
     ACAB_FIELD_HGT,
     ACAB_FIELD_VSPD,
     ACAB_FIELD_SPD,
@@ -62,6 +71,7 @@ enum AcabElidableField : uint8_t {
 /// compiler noticing, and the order IS the contract.
 inline bool acabElideKeeps(AcabElidableField field, uint8_t level) {
     switch (field) {
+        case ACAB_FIELD_CID:   return level < ACAB_ELIDE_CID;
         case ACAB_FIELD_PALT:  return level < ACAB_ELIDE_PALT;
         case ACAB_FIELD_HGT:   return level < ACAB_ELIDE_HGT;
         case ACAB_FIELD_VSPD:  return level < ACAB_ELIDE_VSPD;
@@ -77,6 +87,7 @@ inline bool acabElideKeeps(AcabElidableField field, uint8_t level) {
 /// without reaching into the JSON builder.
 inline const char* acabElideKey(AcabElidableField field) {
     switch (field) {
+        case ACAB_FIELD_CID:   return "cid";
         case ACAB_FIELD_PALT:  return "palt";
         case ACAB_FIELD_HGT:   return "hgt";
         case ACAB_FIELD_VSPD:  return "vspd";
