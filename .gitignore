@@ -40,3 +40,4 @@ firmware/tools/ota_signing/*.pem
 # Python bytecode (firmware tooling)
 __pycache__/
 *.pyc
+firmware/tools/c5-sniff/

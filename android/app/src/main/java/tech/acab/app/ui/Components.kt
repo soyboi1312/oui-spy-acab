@@ -28,6 +28,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -42,17 +43,37 @@ import java.util.Locale
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
+/** True when the user has zeroed the system animator duration scale (the OS-level "remove
+ *  animations" accessibility setting). Looping ornaments (radar sweep, breathing dots) key off
+ *  this so a motion-sensitive user's screen holds still. Read FRESH on every call, no remember:
+ *  the old cache rested on "changing the setting recreates activities", which is false - it is
+ *  not a configuration change, so a cached read held the stale verdict until process death and
+ *  a user who just turned animations off kept getting them. Settings.Global.getFloat is one
+ *  cheap provider read, and this runs on composition of the ornament, not per frame. */
+@Composable
+fun rememberReduceMotion(): Boolean {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    return android.provider.Settings.Global.getFloat(
+        context.contentResolver,
+        android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f,
+    ) == 0f
+}
+
 /** Small uppercase mono label, for section headers and data captions.
  *  Deliberately NOT lowercased at the component: the caps + 1.6 tracking is what separates
  *  instrument chrome (labels) from content (device names, prose). 10.5/1.6 are the iOS
- *  Kicker metrics; the two platforms share the same JetBrains Mono face, so they match. */
+ *  Kicker metrics; the two platforms share the same JetBrains Mono face, so they match.
+ *  [pinned] divides the metrics by fontScale for the rare kicker that is an ORNAMENT beside a
+ *  number that already scales (iOS pins those with a fixed size): the information is in the
+ *  number, and letting both grow blows the composition apart at large font scales. */
 @Composable
-fun Kicker(text: String, color: androidx.compose.ui.graphics.Color = Acab.faint) {
+fun Kicker(text: String, color: androidx.compose.ui.graphics.Color = Acab.faint, pinned: Boolean = false) {
+    val fs = if (pinned) LocalDensity.current.fontScale else 1f
     Text(
         text,
         color = color,
-        fontSize = 10.5.sp,
-        letterSpacing = 1.6.sp,
+        fontSize = 10.5.sp / fs,
+        letterSpacing = 1.6.sp / fs,
         fontWeight = FontWeight.Medium,
         fontFamily = Acab.mono,
     )
@@ -201,7 +222,9 @@ fun CatGlyph(type: DeviceType, size: Int = 34, filled: Boolean = false) {
             .border(1.dp, Acab.line, RoundedCornerShape((size * 0.32f).dp)),
         contentAlignment = Alignment.Center,
     ) {
-        Icon(type.icon(), contentDescription = type.label, tint = type.tone(),
+        // Always decorative: every CatGlyph sits beside text that names the category/device.
+        // Announcing both produced duplicate TalkBack nodes ("Drone, Drone").
+        Icon(type.icon(), contentDescription = null, tint = type.tone(),
             modifier = Modifier.size((size * 0.5f).dp))
     }
 }

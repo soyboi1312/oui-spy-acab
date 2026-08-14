@@ -24,14 +24,14 @@ xcodegen generate          # creates Beacons.xcodeproj
 open Beacons.xcodeproj
 ```
 
-Then in Xcode, pick your signing team (the ACAB target, under Signing &
+Then in Xcode, pick your signing team (the Beacons target, under Signing &
 Capabilities), plug in your iPhone, and press Run. The first run on a new phone
 also needs Developer Mode turned on, under Settings → Privacy & Security →
 Developer Mode, and you'll need to unlock the phone so Xcode can finish setting
 it up.
 
-Not a fan of XcodeGen? You can start a fresh SwiftUI app (iOS 17 or newer), drop
-in everything under `ACAB/`, and add the Bluetooth and location usage
+Not a fan of XcodeGen? You can start a fresh SwiftUI app (iOS 18 or newer), drop
+in everything under `Beacons/`, and add the Bluetooth and location usage
 descriptions to Info.plist.
 
 ## What's inside
@@ -51,7 +51,7 @@ ios/Beacons/
     ├── MapTabView.swift      # everything located, on a map
     ├── DetectionsView.swift  # the logbook, with CSV export
     ├── DetectionDetailView.swift
-    └── SettingsView.swift    # the Device screen: radios, buzzer, firmware, about
+    └── SettingsView.swift    # the Beacon screen: radios, buzzer, firmware, about
 ```
 
 ## How it talks to the board
@@ -75,6 +75,4 @@ a map, browse and export a logbook, check the board's firmware version, and tune
 its radios and buzzer. Firmware updates are built in: the app checks a hosted
 manifest for the latest version (no App Store release needed when firmware ships)
 and, on OTA-capable boards, pushes the update over Bluetooth with progress and a
-safe rollback; older boards get pointed at the browser flasher. The over-the-wire
-path hasn't been exercised on real hardware yet. Still to come: push alerts when
-something new appears.
+safe rollback; older boards get pointed at the browser flasher.

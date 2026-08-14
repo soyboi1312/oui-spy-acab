@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>All Cameras Are Beacons Privacy Policy</title>
-<meta name="description" content="Privacy policy for the All Cameras Are Beacons app (iOS and Android). It collects nothing.">
+<meta name="description" content="Privacy policy for the All Cameras Are Beacons app on iOS and Android.">
 <style>
   :root{ --bg:#0a0809; --ink:#f2f2f3; --dim:#9a9498; --line:#241d20; --accent:#ec3b2e; --accent-dim:#5a201c; --panel:#120d0f; }
   *{box-sizing:border-box;margin:0;padding:0}
@@ -23,35 +23,39 @@
 <body>
 <div class="wrap">
   <h1>All Cameras Are Beacons Privacy Policy</h1>
-  <div class="sub">Last updated July 2026</div>
+  <div class="sub">Last updated August 2026</div>
 
   <div class="panel">
-    <p><b>Short version: All Cameras Are Beacons collects nothing.</b> No accounts, no analytics, no tracking. Your detections stay on your device. The app only uses the network to load map tiles, check for firmware updates, and (if you opt in) download the known-ALPR map layer. Nothing about where you are or what you detected is ever sent.</p>
+    <p><b>Short version: no accounts, analytics, tracking, or automatic detection uploads.</b> Your detections stay on your board and phone unless you deliberately export or contribute them. The app uses the network to load map tiles, check for firmware updates, and, if you opt in, download the known-ALPR map layer.</p>
   </div>
 
   <h2>What the app does</h2>
   <p>All Cameras Are Beacons is a companion app for the soyboi beacon board and the OUI-Spy detection boards. It connects to the board over Bluetooth and shows the public radio signals that nearby devices already broadcast.</p>
 
   <h2>Bluetooth</h2>
-  <p>Bluetooth is used only to connect to your own detection board and receive detections from it. The app does not connect to or control any other device.</p>
+  <p>Bluetooth is used only to connect to your own detection board. The app receives detections and status from it, sends settings you choose, and can send your current location fix over the encrypted local link so the board can geotag detections. The app does not connect to or control nearby detected devices.</p>
 
   <h2>Location</h2>
-  <p>If you grant location access, your approximate position is used to pin detections on the map and to fill in the location column when you choose to export a log. Your phone also sends its current fix to your own board over the encrypted local Bluetooth link, so hits the board records while your phone is away still land in the right place; that goes to your board and nowhere else. Your location is never sent to us or to anyone else.</p>
+  <p>If you grant location access, your approximate position is used to pin detections on the map and can appear in Log CSV and GPX exports. Your phone also sends its current fix to your own board over the encrypted local Bluetooth link, so hits the board records while your phone is away still land in the right place. The app does not automatically send those coordinates to us or an internet service. Apart from the encrypted local link to your board, they leave your phone only when you choose to export or contribute them.</p>
 
   <h2>Maps</h2>
-  <p>When you open the map, the map images are loaded from a map provider (OpenStreetMap on Android, Apple Maps on iOS). Like any web request, that provider can see your device's IP address and which area of the map you are viewing. No detections, identifiers, or other app data are ever attached to those requests.</p>
+  <p>When you open the map, the map images are loaded from a map provider (OpenStreetMap on Android, Apple Maps on iOS). Like any web request, that provider can see your device's IP address and which area of the map you are viewing. No detections, detection identifiers, or board data are attached to those requests.</p>
 
   <h2>Data you export</h2>
-  <p>You can export your detection log as a CSV file. That file is created on your device and shared only through your phone's standard share sheet, to wherever you choose to send it. The app does not upload it anywhere.</p>
+  <p>You can export your Log as CSV or GPX. Both formats can contain locations: where your phone heard a device and, for drones, the aircraft and operator positions broadcast over Remote ID. Ordinary Log exports do not have location-removal switches and are not passed through the Improve Detection redactor, so review the file and destination before sharing. Each file is created on your device and handed to your phone's standard sharing tools, which send or save it only to the app, recipient, or destination you choose. The app does not automatically upload it.</p>
+
+  <h2>Improve detection contributions</h2>
+  <p>The optional Improve Detection flow creates a CSV containing only observations from the capture window you start and stop. Its three location switches apply only to this contribution flow. Before sharing, you can separately choose whether to include your observation location, a drone's broadcast aircraft location, and its broadcast operator location. Your observation and operator locations are off by default; the aircraft location is on by default. If you add a photo, the app re-encodes it before attachment to remove GPS, date, camera, and software metadata.</p>
+  <p>When you choose Review &amp; Share, the app opens a mail composer or your system share flow with the CSV and optional photo. It fills in logs@soyboi.tech where the selected mail app supports a recipient field and otherwise identifies that address in the message for you to paste. Nothing is sent until you confirm it in the mail or sharing app. You can change the recipient or save the files instead.</p>
 
   <h2>Firmware updates</h2>
-  <p>The app fetches a small static version file from soyboi.tech to learn whether new firmware exists for your board, and downloads the firmware image if you choose to install it. These are plain file downloads from a static site: no identifiers, no account, and nothing about you or your detections is sent. The site host (GitHub Pages) sees the request the way any web server does.</p>
+  <p>The app fetches a small static version file from soyboi.tech to learn whether new firmware exists for your board, and downloads the firmware image if you choose to install it. These are plain file downloads from a static site: no account, location, or detection data is attached. The site host (GitHub Pages) sees the request, including your IP address, the way any web server does.</p>
 
   <h2>Known-ALPR map layer (opt-in)</h2>
-  <p>Off by default. If you turn on the "known cameras" layer, the app downloads one static dataset of community-mapped license-plate-reader locations from soyboi.tech and draws it on your map. It is a plain file download like the firmware check: your map viewport is never sent anywhere, there are no per-view lookups, and nothing about you leaves the device. The locations come from OpenStreetMap contributors (the registry the DeFlock project maintains), used under the ODbL.</p>
+  <p>Off by default. If you turn on the "known cameras" layer, the app downloads one static dataset of community-mapped license-plate-reader locations from soyboi.tech and draws it on your map. It is a plain file download like the firmware check: your map viewport and detections are not attached, there are no per-view lookups, and the site host sees the ordinary request and IP address. The locations come from OpenStreetMap contributors (the registry the DeFlock project maintains), used under the ODbL.</p>
 
   <h2>Third parties</h2>
-  <p>The app has no advertising, no analytics, and no tracking. The only outside services it uses are the map provider that supplies map tiles and the static soyboi.tech site (firmware + the opt-in ALPR dataset), both described above. It talks to no other server.</p>
+  <p>The app has no advertising, analytics, or tracking. Its automatic network use is limited to the map provider that supplies map tiles and the static soyboi.tech site for firmware and the opt-in ALPR dataset, both described above. A detection export or contribution reaches another service only when you explicitly hand it to a mail or sharing app and confirm the destination.</p>
 
   <h2>Contact</h2>
   <p>Questions? Open an issue at <a href="https://github.com/soyboi1312/all-cameras-are-beacons">github.com/soyboi1312/all-cameras-are-beacons</a>.</p>

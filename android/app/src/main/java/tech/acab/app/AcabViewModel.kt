@@ -1,12 +1,6 @@
 package tech.acab.app
 
-import android.annotation.SuppressLint
 import android.app.Application
-import android.content.Context
-import android.location.Location
-import android.location.LocationListener
-import android.location.LocationManager
-import android.os.Bundle
 import androidx.lifecycle.AndroidViewModel
 import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.net.FirmwareManifest
@@ -22,36 +16,19 @@ class AcabViewModel(app: Application) : AndroidViewModel(app) {
     // Kick a background refresh on launch; it's non-blocking and no-ops if the cache is fresh.
     val firmware = FirmwareManifest.getInstance(app).also { it.refresh() }
 
-    private val locationManager =
-        app.getSystemService(Context.LOCATION_SERVICE) as LocationManager
-
-    private val locListener = object : LocationListener {
-        override fun onLocationChanged(location: Location) {
-            ble.setLocation(location.latitude, location.longitude)
-        }
-        override fun onProviderEnabled(provider: String) {}
-        override fun onProviderDisabled(provider: String) {}
-        @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
-        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-    }
-
-    /** Start location updates once a location permission is granted. Uses both GPS
-     *  and network providers so a fix comes in fast, and works indoors too. Safe to
-     *  call more than once; re-registering the same listener just refreshes it. */
-    @SuppressLint("MissingPermission")
-    fun startLocation() {
-        for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
-            runCatching {
-                if (!locationManager.isProviderEnabled(provider)) return@runCatching
-                locationManager.getLastKnownLocation(provider)
-                    ?.let { ble.setLocation(it.latitude, it.longitude) }
-                locationManager.requestLocationUpdates(provider, 5000L, 10f, locListener)
-            }
-        }
+    /** Feed runtime permission changes into the process-wide manager. Location has to be owned
+     *  there, not by this Activity ViewModel: Drive mode deliberately keeps the manager and its
+     *  foreground service alive after the Activity task is dismissed. */
+    fun onPermissionsChanged(bluetoothGranted: Boolean, locationGranted: Boolean) {
+        ble.onPermissionsChanged(bluetoothGranted, locationGranted)
     }
 
     override fun onCleared() {
-        runCatching { locationManager.removeUpdates(locListener) }
+        // AcabBleManager is process-wide so Drive mode can keep the radio link alive after this
+        // Activity task is dismissed. A contribution capture is Activity-owned, though: leaving
+        // its ledger armed here would keep accumulating sightings invisibly and without a bound.
+        // onCleared is not called for configuration changes, so rotation still preserves capture.
+        ble.cancelContributionCapture()
         // Keep the link if Drive mode's foreground service is holding it; else disconnect.
         if (!ble.driveModeOn) ble.disconnect()
         super.onCleared()

@@ -11,16 +11,18 @@ captures all of it.
 
 | Date | OUI | Vendor | Matched on | What it really was | Action |
 |---|---|---|---|---|---|
-| 2026-06-15 | 08:3a:88 | USI | OUI | Molekule air purifier | candidate, not yet demoted |
-| 2026-06-16 | e0:4f:43 | USI | OUI | home security camera | demoted to extended |
+| 2026-06-15 | 08:3a:88 | USI | OUI | Molekule air purifier | removed from the tables (deliberately excluded; see signatures.md) |
+| 2026-06-16 | e0:4f:43 | USI | OUI | home security camera | removed from the tables (deliberately excluded) |
 
 ## Notes
 
 - USI (Universal Global Scientific) makes WiFi/BLE modules used across consumer
   gear; two confirmed false positives so far, so it is the clearest demotion
   candidate. Both `08:3a:88` and `e0:4f:43` are USI.
-- Of the 67 Flock OUIs, only `b41e52` is registered to Flock Safety itself; the
-  rest are commodity module makers and consumer brands, which is why OUI-only
-  matches need confirming.
+- The old ~67-OUI "superset" was dropped; of that set only `b41e52` was registered
+  to Flock Safety itself, and the rest (commodity module makers and consumer brands)
+  drove the field false positives. Today's tables ship one Flock OUI (`b41e52`) plus
+  four probe-request-gated Falcon (Liteon) OUIs, which is why OUI-only matches still
+  need confirming.
 - OUI and heuristic changes live in the firmware, so they take effect after a
   reflash from the web flasher, not instantly.

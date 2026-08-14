@@ -30,15 +30,12 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
     /// Key into `faq-content.json`'s `relatedHelp` map. Matches the Android enum's SCREAMING_CASE
     /// names, because the JSON is shared and Android keys off `name` directly.
     ///
-    /// TWO KINDS OF "NO PANEL" HERE, and they are not the same thing:
-    ///   - BODY_CAM and GLASSES return a REAL key that the JSON has no entry for. That is
-    ///     RESERVED, not dead: both categories already carry an experimental note on the dossier,
-    ///     and stacking a second hedge under it reads as doubt about the detection rather than a
-    ///     pointer to context. If those notes ever go away, add the entries and the panel appears
-    ///     with no code change. Do not "clean up" these keys.
-    ///   - nearbyDevice and unknown return "", which means NEVER. They are not categories a user
-    ///     can have a question about; nearbyDevice is Desert mode's firehose and unknown is a
-    ///     parse fallback.
+    /// Every real key now has a relatedHelp entry (BODY_CAM and GLASSES got theirs 2026-08-10;
+    /// the earlier reserved-on-purpose state is over), and check-signature-drift.py FAILS the
+    /// build if a real key ever loses its entry, so add the JSON row in the same commit as a new
+    /// category. nearbyDevice and unknown return "", which means NEVER a panel: neither is a
+    /// category a user can have a question about (nearbyDevice is Desert mode's firehose,
+    /// unknown is a parse fallback).
     var faqKey: String {
         switch self {
         case .flockCamera:       return "FLOCK_CAMERA"

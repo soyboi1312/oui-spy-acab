@@ -16,15 +16,18 @@ XIAO builds (OUI-Spy and Mesh-Detect).
 
 ```
 web/
-├── index.html               # the flasher page
-├── manifest-oui-spy.json     # tells the flasher about the app-scanner (beacon) firmware
-├── manifest-mesh-detect.json # ...and the Mesh-Detect firmware
-├── build-flasher.sh          # rebuilds the flashable firmware files
+├── index.html                    # the flasher page
+├── privacy.html                  # privacy note linked from the flasher
+├── manifest-oui-spy.json         # tells the flasher about the app-scanner (beacon) firmware
+├── manifest-mesh-detect.json     # ...and the public Mesh-Detect firmware
+├── manifest-mesh-detect-ch1.json # ...and the private-channel Mesh-Detect build
+├── build-flasher.sh              # rebuilds the flashable firmware files
 ├── vendor/
-│   └── esp-web-tools/        # self-hosted ESP Web Tools 10.2.1 (see below)
-└── firmware/
-    ├── acab-oui-spy.bin       # one ready-to-flash image each
-    └── acab-mesh-detect.bin
+│   └── esp-web-tools/            # self-hosted ESP Web Tools 10.2.1 (see below)
+└── firmware/                     # per-part images, one set of four per build
+    ├── acab-oui-spy-{bootloader,partitions,boot_app0,app}.bin
+    ├── acab-mesh-detect-{bootloader,partitions,boot_app0,app}.bin
+    └── acab-mesh-detect-ch1-{bootloader,partitions,boot_app0,app}.bin
 ```
 
 ## Self-hosted ESP Web Tools
@@ -42,7 +45,7 @@ To refresh it on an esp-web-tools bump:
 1. Resolve the new exact version: `curl -sI "https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"` and read the `location:` redirect.
 2. Recursively pull every `./chunk.js?module` reachable from `install-button.js` into `vendor/esp-web-tools/`, then strip the `?module` query from every import.
 3. Verify no `?module` and no bare (non-`./`) imports remain, and that every referenced chunk exists on disk, before committing. A half-vendored graph 404s at runtime.
-4. Keep [`soyboi.tech/flash.html`](https://soyboi.tech/flash.html) in lockstep (it currently pins the same exact version on unpkg).
+4. Keep [`soyboi.tech/flash.html`](https://soyboi.tech/flash.html) in lockstep (it self-hosts an identical vendored copy).
 
 ## Which browsers work
 
@@ -78,6 +81,14 @@ After you change the firmware, regenerate the flashable images:
 ./web/build-flasher.sh
 ```
 
-That rebuilds both firmware versions and bundles each one into a single file the
-flasher can install in one shot. Commit the updated files in `firmware/` and the
-hosted page refreshes itself.
+If you don't hold the OTA signing key, the script aborts rather than stage a
+manifest whose empty signature makes every in-app OTA fail in the field; pass
+`--unsigned-usb-only` to build an explicitly unsigned, USB-only cut instead. It
+also refuses to run unless `web/vendor/esp-web-tools/` is committed to HEAD, since
+Pages deploys from the pushed commit and a staged-only vendor graph would 404 the
+flash button at runtime.
+
+That rebuilds all three firmware variants (oui-spy, mesh-detect, mesh-detect-ch1)
+and stages each as four separate part files flashed at their own offsets, kept
+apart so a web flash preserves your pairing. Commit the updated files in
+`firmware/` and the hosted page refreshes itself.

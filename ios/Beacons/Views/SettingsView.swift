@@ -39,6 +39,7 @@ struct DeviceView: View {
     @State private var desertOn = false
     @State private var pendingDesert = false
     @State private var confirmEraseBuffer = false   // gate the destructive board-buffer erase
+    @State private var confirmPowerOff = false      // gate the rev-B app-driven power-off
     @State private var checkingForUpdate = false    // manual "check for updates" spinner
     @State private var justChecked = false          // brief "checked" confirmation state
     // Rename flow for a watched (starred) device.
@@ -49,6 +50,9 @@ struct DeviceView: View {
     @State private var renameIsIgnored = false
     // T5: regular width lays the cards out two-up; compact stays a single column.
     @Environment(\.horizontalSizeClass) private var hSize
+    // Accessibility text sizes stack the hero and stat rows vertically and pad the scroll
+    // bottom; the default layout is untouched.
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     // Any mode but the buzzer dims the volume sliders.
     private var muted: Bool { ble.alertMode != .buzzer }
@@ -75,11 +79,16 @@ struct DeviceView: View {
                                         statsGrid
                                         configPanel
                                         managedDevicesRow
+                                        // Present on iPad the same as compact: this row was
+                                        // simply missing from the regular-width split, so the
+                                        // whole contribute feature did not exist on iPad.
+                                        helpImproveRow
                                         helpSupportRow
                                     }
                                     .frame(maxWidth: .infinity, alignment: .top)
                                     VStack(alignment: .leading, spacing: 14) {
                                         disconnectButton
+                                        if showPowerOff { powerOffButton }
                                         aboutFooter
                                     }
                                     .frame(maxWidth: .infinity, alignment: .top)
@@ -100,6 +109,9 @@ struct DeviceView: View {
                     .padding(.horizontal, ACABTheme.pad)
                     .padding(.top, 8)
                 }
+                // Extra bottom margin only at accessibility sizes, so grown content never ends
+                // under the tab bar; zero at default sizes (layout untouched).
+                .contentMargins(.bottom, dynamicTypeSize.isAccessibilitySize ? 24 : 0, for: .scrollContent)
             }
             .navigationBarHidden(true)
             .confirmationDialog(
@@ -164,8 +176,10 @@ struct DeviceView: View {
         statsGrid                            // UPTIME + DETECTIONS (2-up)
         configPanel                          // scan radios / detectors / alerts / drive / desert+buffer / LED
         managedDevicesRow                    // -> watched + ignored sub-screen
+        helpImproveRow                       // -> contribute a field observation (manual export)
         helpSupportRow                       // -> bundled FAQ + support routes
         disconnectButton
+        if showPowerOff { powerOffButton }   // rev-B only: shut the board down over BLE
         aboutFooter                          // -> about sub-screen
     }
 
@@ -205,6 +219,7 @@ struct DeviceView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityValue(open ? "expanded" : "collapsed")
             if open { firmwareCard }   // today's card, unchanged
         }
     }
@@ -284,6 +299,9 @@ struct DeviceView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            // Spoken disclosure state: the flipped chevron is the only visual cue, which a
+            // screen reader cannot see.
+            .accessibilityValue(open ? "expanded" : "collapsed")
             if open { content().padding(.bottom, 14) }
         }
         .padding(.horizontal, 16)
@@ -313,6 +331,28 @@ struct DeviceView: View {
     /// Entry point for the bundled FAQ. Sits below Managed devices and above Disconnect on
     /// purpose: it is a reference surface, not a control, so it should not sit among the toggles
     /// that change what the board does.
+    // Field research: contribute a capture of a device the beacon did not identify. Manual export
+    // only (see ContributeView) - nothing leaves the phone without the user. Mirrors Android's
+    // "Help improve detection" row.
+    private var helpImproveRow: some View {
+        NavigationLink { ContributeView() } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "flask")
+                    .font(.system(size: 16, weight: .medium)).foregroundStyle(ACABTheme.dim).frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Improve detection").font(ACABTheme.display(15, weight: .medium)).foregroundStyle(ACABTheme.text)
+                    Kicker("CONTRIBUTE A FIELD OBSERVATION")
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(ACABTheme.faint)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .panel()
+    }
+
     private var helpSupportRow: some View {
         NavigationLink { HelpView() } label: {
             HStack(spacing: 12) {
@@ -426,7 +466,7 @@ struct DeviceView: View {
     }
 
     private var driveKicker: String {
-        "COUNTER \(ble.driveModeOn ? "ON" : "OFF") \u{00B7} LOCK SCREEN \(ble.redactLockScreen ? "HIDDEN" : "SHOWN")"
+        "COUNTER \(ble.driveModeWanted ? "ON" : "OFF") \u{00B7} LOCK SCREEN \(ble.redactLockScreen ? "HIDDEN" : "SHOWN")"
     }
 
     private var desertKicker: String {
@@ -448,7 +488,7 @@ struct DeviceView: View {
     private var header: some View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 3) {
-                Text("Device").font(ACABTheme.display(26, weight: .semibold)).foregroundStyle(ACABTheme.text)
+                Text("Beacon").font(ACABTheme.display(26, weight: .semibold)).foregroundStyle(ACABTheme.text)
                 Kicker(ble.demoMode ? "SAMPLE DATA" : "PAIRED OVER BLE")
             }
             Spacer()
@@ -460,7 +500,8 @@ struct DeviceView: View {
                     .frame(width: 38, height: 38)
                     .background(ACABTheme.bg2, in: Circle())
                     .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
-                    .contentShape(Circle())
+                    .frame(minWidth: 44, minHeight: 44)   // 44pt hit target; drawn circle unchanged
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Refresh device status")
@@ -468,37 +509,72 @@ struct DeviceView: View {
     }
 
     // MARK: device hero
+    /// At accessibility text sizes the one-line hero (badge · name · battery · dot) has no
+    /// room left for the name, so it stacks: badge + status glyphs on top, the text below.
+    /// Default sizes keep the original single row.
+    @ViewBuilder
     private var deviceHero: some View {
-        HStack(spacing: 14) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(ACABTheme.bg3).frame(width: 52, height: 38)
-                    .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(ACABTheme.line, lineWidth: 1))
-                Circle().fill(ACABTheme.accent).frame(width: 7, height: 7)
-                    .shadow(color: ACABTheme.accentGlow, radius: 4).offset(x: -14, y: -9)
-            }
-            VStack(alignment: .leading, spacing: 4) {
-                Text((ble.connectedName?.contains("ACAB") == true || ble.connectedName?.contains("beacon") == true)
-                     ? "All Cameras Are Beacons" : (ble.connectedName ?? "ESP32 board"))
-                    .font(ACABTheme.display(16, weight: .semibold)).foregroundStyle(ACABTheme.text)
-                    .lineLimit(2).minimumScaleFactor(0.8).fixedSize(horizontal: false, vertical: true)
-                Text(ble.demoMode ? "SAMPLE DATA · no live board"
-                                  : "CONNECTED · \(ble.status?.firmwareLabel ?? "beacons")\(boardRevSuffix)")
-                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
-            }
-            Spacer()
-            if let bat = ble.status?.battery {
-                let charging = ble.status?.charging == true
-                HStack(spacing: 4) {
-                    Image(systemName: charging ? "battery.100.bolt" : batterySymbol(bat))
-                    Text("\(bat)%")
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 14) {
+                        heroBadge
+                        Spacer()
+                        heroBattery
+                        heroDot
+                    }
+                    heroText
                 }
-                .font(ACABTheme.mono(11))
-                .foregroundStyle(charging ? ACABTheme.accent : (bat <= 15 ? ACABTheme.warn : ACABTheme.dim))
+            } else {
+                HStack(spacing: 14) {
+                    heroBadge
+                    heroText
+                    Spacer()
+                    heroBattery
+                    heroDot
+                }
             }
-            ScanDot(color: ble.connectionState == .connected ? ACABTheme.accent : ACABTheme.faint)
         }
         .panel(strong: true)
+    }
+
+    private var heroBadge: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(ACABTheme.bg3).frame(width: 52, height: 38)
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(ACABTheme.line, lineWidth: 1))
+            Circle().fill(ACABTheme.accent).frame(width: 7, height: 7)
+                .shadow(color: ACABTheme.accentGlow, radius: 4).offset(x: -14, y: -9)
+        }
+    }
+
+    private var heroText: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text((ble.connectedName?.contains("ACAB") == true || ble.connectedName?.contains("beacon") == true)
+                 ? "All Cameras Are Beacons" : (ble.connectedName ?? "ESP32 board"))
+                .font(ACABTheme.display(16, weight: .semibold)).foregroundStyle(ACABTheme.text)
+                .lineLimit(2).minimumScaleFactor(0.8).fixedSize(horizontal: false, vertical: true)
+            Text(ble.demoMode ? "SAMPLE DATA · no live board"
+                              : "CONNECTED · \(ble.status?.firmwareLabel ?? "beacons")\(boardRevSuffix)")
+                .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+        }
+    }
+
+    @ViewBuilder
+    private var heroBattery: some View {
+        if let bat = ble.status?.battery {
+            let charging = ble.status?.charging == true
+            HStack(spacing: 4) {
+                Image(systemName: charging ? "battery.100.bolt" : batterySymbol(bat))
+                Text("\(bat)%")
+            }
+            .font(ACABTheme.mono(11))
+            .foregroundStyle(charging ? ACABTheme.accent : (bat <= 15 ? ACABTheme.warn : ACABTheme.dim))
+        }
+    }
+
+    private var heroDot: some View {
+        ScanDot(color: ble.connectionState == .connected ? ACABTheme.accent : ACABTheme.faint)
     }
 
     private func batterySymbol(_ p: Int) -> String {
@@ -577,6 +653,10 @@ struct DeviceView: View {
     // an unlabelled board reads as "we were not told", not as rev-A.
     private var boardRevSuffix: String {
         guard let r = ble.status?.boardRev, r == "A" || r == "B" else { return "" }
+        // The rev-B fw label already ends in "rev-B", so appending the badge there prints
+        // "... rev-B · rev-B". Only add it when the label does not already name this rev
+        // (rev-A's label is just "beacon board", so it still gets the badge).
+        if (ble.status?.firmwareLabel ?? "").lowercased().contains("rev-\(r.lowercased())") { return "" }
         return " · rev-\(r)"
     }
     // Belt-and-braces OTA revision gate. The PRIMARY defence is that rev-B firmware reports a
@@ -699,13 +779,13 @@ struct DeviceView: View {
     /// USB-recovery only, so a false refusal is by far the cheaper error.
     private var combinedStale: Bool {
         guard let e = fwEntry, revisionMatchesManifest else { return false }
-        return ble.combinedUpdateStale(entry: e, latest: latestVersion)
+        return ble.combinedUpdateStale(entry: e, fwLabel: fwLabel, latest: latestVersion)
     }
     /// The BOARD leg specifically is behind. `combinedStale` is the OR of both radios, so this is
     /// what lets the offer copy tell "board is behind" from "only the co-processor is behind".
     private var s3Stale: Bool {
         guard let e = fwEntry, revisionMatchesManifest else { return false }
-        return ble.s3UpdateStale(entry: e, latest: latestVersion)
+        return ble.s3UpdateStale(entry: e, fwLabel: fwLabel, latest: latestVersion)
     }
     /// The combined flow is at a terminal point we keep on screen (done / failed / partial).
     private var combinedTerminal: Bool {
@@ -783,11 +863,17 @@ struct DeviceView: View {
     /// the card's own branch. This is the single biggest contributor to the nesting depth that
     /// overflowed the demangler's stack.
     private var combinedControlButtons: AnyView {
-        if ble.combinedState.isRunning {
+        if ble.combinedCanCancel {
             return AnyView(secondaryButton("Cancel", tone: ACABTheme.accent,
                                            border: ACABTheme.lineStrong, role: .destructive) {
                 ble.combinedCancel()
             })
+        }
+        if ble.combinedState.isRunning {
+            return AnyView(Text("The board has committed this update and is finishing safely.")
+                .font(ACABTheme.mono(10.5))
+                .foregroundStyle(ACABTheme.dim)
+                .fixedSize(horizontal: false, vertical: true))
         }
         if case .partial = ble.combinedState {
             // S3 took; the second radio didn't finish. The same primary button re-offers just the
@@ -960,8 +1046,12 @@ struct DeviceView: View {
                                     .frame(maxWidth: .infinity).padding(.vertical, 7)
                                     .background(wifiEco == v ? ACABTheme.accent : ACABTheme.bg2, in: Capsule())
                                     .overlay(Capsule().strokeBorder(wifiEco == v ? .clear : ACABTheme.line, lineWidth: 1))
+                                    // 44pt hit target; drawn pill unchanged.
+                                    .frame(minHeight: 44)
+                                    .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
+                            .accessibilityAddTraits(wifiEco == v ? .isSelected : [])
                         }
                     }
                     Text("stretches battery by sweeping Wi-Fi less often. you may miss a Wi-Fi-only camera between sweeps; Bluetooth detection is unaffected.")
@@ -976,7 +1066,7 @@ struct DeviceView: View {
     private var detectorsCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             Kicker("DETECTORS")
-            radioToggle("alpr (flock)", "Flock Safety \u{00B7} Raven ALPR cameras", isOn: Binding(
+            radioToggle("alpr radio signals", "flock, raven, when they broadcast over bluetooth or 2.4 GHz wifi \u{00B7} many installs now stay silent", isOn: Binding(
                 get: { flockOn }, set: { flockOn = $0; pendingFlock = true; ble.setFlockEnabled($0) }))
             Divider().overlay(ACABTheme.line)
             radioToggle("drones (remote ID)", "FAA remote ID \u{00B7} operator location", isOn: Binding(
@@ -1058,6 +1148,8 @@ struct DeviceView: View {
                                 .foregroundStyle(ACABTheme.accent)
                                 .padding(.horizontal, 8).padding(.vertical, 5)
                                 .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+                                .frame(minHeight: 44)   // 44pt hit target; drawn capsule unchanged
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                     }
@@ -1087,7 +1179,7 @@ struct DeviceView: View {
             Kicker("DRIVE MODE")
             radioToggle("live activity counter",
                         "lock screen + dynamic island \u{00B7} live count while you drive",
-                        isOn: Binding(get: { ble.driveModeOn },
+                        isOn: Binding(get: { ble.driveModeWanted },
                                       set: { on in if on { ble.startDriveMode() } else { ble.endDriveMode() } }))
             Divider().overlay(ACABTheme.line)
             radioToggle("hide counts on lock screen",
@@ -1135,6 +1227,27 @@ struct DeviceView: View {
             }
         }
         .tint(ACABTheme.accent)
+        .accessibilityLabel(spokenControlText(name))
+        .accessibilityHint((exp ? "Experimental. " : "") + spokenControlText(sub))
+    }
+
+    /// VoiceOver should speak the domain abbreviations as concepts, not guess at strings such as
+    /// ALPR, OUI, RID, and MAC. Visible copy stays compact; only the spoken surface expands it.
+    private func spokenControlText(_ text: String) -> String {
+        var spoken = text
+        let expansions = [
+            (#"(?i)\bALPR\b"#, "automatic license plate reader"),
+            (#"(?i)\bOUI\b"#, "vendor address prefix"),
+            (#"(?i)\bremote ID\b"#, "remote identification"),
+            (#"(?i)\bRID\b"#, "remote identification"),
+            (#"(?i)\bMAC\b"#, "hardware address"),
+            (#"(?i)\bBLE\b"#, "Bluetooth Low Energy"),
+        ]
+        for (pattern, replacement) in expansions {
+            spoken = spoken.replacingOccurrences(of: pattern, with: replacement,
+                                                  options: .regularExpression)
+        }
+        return spoken
     }
 
     // MARK: alerts
@@ -1251,7 +1364,11 @@ struct DeviceView: View {
             segmentDivider
             segment("Silent",  .silent)
         }
-        .frame(height: 36)
+        // minHeight 44, up from a fixed 36: each third of the capsule is its own tap target, and
+        // 36pt was under the minimum. minHeight (not height) because the segment labels scale
+        // with Dynamic Type; a pinned capsule clipped them at accessibility sizes. Same anatomy
+        // otherwise.
+        .frame(minHeight: 44)
         .background(ACABTheme.bg2)
         .clipShape(Capsule())
         .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
@@ -1272,6 +1389,7 @@ struct DeviceView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(active ? .isSelected : [])
     }
 
     /// "3 ON" / "OFF", so the collapsed row says whether anything will interrupt you.
@@ -1311,14 +1429,23 @@ struct DeviceView: View {
     // MARK: stats
     /// Glanceable stats that stay open: uptime + total detections (2-up). Alert/scanning
     /// state now lives in the fold-row kickers, so those tiles are gone.
-    /// DETECTIONS reads the board's session total (status "total"), not the phone-side log
-    /// count: this is the Device screen, and the phone's list starts empty per app launch
-    /// while the board has been counting since boot. Same source as Android's StatsGrid.
+    /// DETECTIONS is the PHONE-SIDE LOG count (`detections.count`), matching Android's StatsGrid.
+    ///
+    /// It used to read the board's since-boot session total (status "total"), and the comment even
+    /// claimed that was "the same source as Android" - it was not: Android has always shown the
+    /// phone log. The board total is a different number that Clear cannot lower (it only resets on a
+    /// power cycle) and that Desert mode inflates into the tens of thousands, so it read as a
+    /// runaway counter the user could not reconcile with a log they had just cleared. The phone log
+    /// responds to Clear, matches what the Log tab holds, and now agrees across both platforms.
     private var statsGrid: some View {
-        let cols = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
+        // One column at accessibility sizes: half-width tiles truncate their values once the
+        // type doubles. Two-up otherwise, unchanged.
+        let cols = dynamicTypeSize.isAccessibilitySize
+            ? [GridItem(.flexible(), spacing: 12)]
+            : [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
         return LazyVGrid(columns: cols, spacing: 12) {
             statTile("UPTIME", ble.status.map(uptimeText) ?? "-")
-            statTile("DETECTIONS", ble.status.map { "\($0.total)" } ?? "-")
+            statTile("DETECTIONS", "\(ble.detections.count)")
         }
     }
 
@@ -1352,6 +1479,41 @@ struct DeviceView: View {
         }
         .disabled(otaRunning)
         .opacity(otaRunning ? 0.5 : 1)
+    }
+
+    // Only offer the app power-off on rev-B: on a rev-A slide board the firmware would re-wake
+    // instantly (the slide holds the wake line low), so the drain no-ops there. Demo mode has no
+    // real board to shut down. Absent boardRev (older firmware without the poweroff handler) also
+    // hides it, so the button never appears where it would do nothing.
+    private var showPowerOff: Bool { !ble.demoMode && ble.status?.boardRev == "B" }
+
+    private var powerOffButton: some View {
+        // Same block as Disconnect, and blocked during an update for the same reason (a power-off
+        // mid-OTA would strand the flow). Tapping only opens the confirm; the actual shutdown is
+        // irreversible from the app, so it must be deliberate.
+        let otaRunning = !ble.demoMode && (ble.otaState.isRunning || ble.combinedState.isRunning)
+        return Button(role: .destructive) { confirmPowerOff = true } label: {
+            Text("Power off beacon")
+                .font(ACABTheme.display(15, weight: .semibold))
+                .frame(maxWidth: .infinity).padding(.vertical, 13)
+                .foregroundStyle(ACABTheme.accent)
+                .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: ACABTheme.radius).strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+        }
+        .disabled(otaRunning)
+        .opacity(otaRunning ? 0.5 : 1)
+        // Anchored to the BUTTON, not stacked on the NavigationStack next to the buffer-erase dialog:
+        // two .confirmationDialog modifiers on the same view fight over the presentation anchor, which
+        // is why the sheet pointed at the wrong (top) row. On its own trigger view it anchors here.
+        .confirmationDialog(
+            "Power off the beacon?",
+            isPresented: $confirmPowerOff, titleVisibility: .visible
+        ) {
+            Button("Power off", role: .destructive) { ble.powerOffBeacon() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The beacon shuts down and stops detecting. You'll turn it back on with the button on the device (hold about 2 seconds). It can't be powered back on from the app.")
+        }
     }
 
     // MARK: watched (starred) devices
@@ -1388,14 +1550,18 @@ struct DeviceView: View {
                     } label: {
                         Image(systemName: "pencil").font(.system(size: 13, weight: .semibold))
                             .foregroundStyle(ACABTheme.dim)
-                            .frame(width: 28, height: 28)
+                            .frame(width: 44, height: 44)   // 44pt hit target; glyph size unchanged
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("Rename")
                     Button { ble.unwatch(dev.mac) } label: {
                         Text("UNSTAR").font(ACABTheme.mono(10, weight: .bold)).tracking(1)
                             .foregroundStyle(ACABTheme.watchTone)
                             .padding(.horizontal, 8).padding(.vertical, 5)
                             .overlay(Capsule().strokeBorder(ACABTheme.watchTone.opacity(0.4), lineWidth: 1))
+                            .frame(minHeight: 44)   // 44pt hit target; drawn capsule unchanged
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                 }
@@ -1436,14 +1602,18 @@ struct DeviceView: View {
                     } label: {
                         Image(systemName: "pencil").font(.system(size: 13, weight: .semibold))
                             .foregroundStyle(ACABTheme.dim)
-                            .frame(width: 28, height: 28)
+                            .frame(width: 44, height: 44)   // 44pt hit target; glyph size unchanged
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("Rename")
                     Button { ble.unignore(dev.mac) } label: {
                         Text("UNMUTE").font(ACABTheme.mono(10, weight: .bold)).tracking(1)
                             .foregroundStyle(ACABTheme.accent)
                             .padding(.horizontal, 8).padding(.vertical, 5)
                             .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+                            .frame(minHeight: 44)   // 44pt hit target; drawn capsule unchanged
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                 }
@@ -1475,7 +1645,9 @@ struct DeviceView: View {
                         URL(string: "https://colonelpanic.tech")!)
             }
             Divider().overlay(ACABTheme.line)
-            linkRow("Privacy", "no data leaves your device",
+            // "no data leaves your device" stopped being true the day explicit export and the
+            // contribution flow shipped. The canonical claim is automatic-upload-shaped only.
+            linkRow("Privacy", "nothing is uploaded automatically",
                     URL(string: "https://soyboi.tech/privacy.html")!)
             Link(destination: URL(string: "https://github.com/soyboi1312")!) {
                 Text("made by soyboi")

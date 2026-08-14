@@ -6,10 +6,6 @@ struct DetectionRow: View {
     /// How honest the row's timestamp is. Defaults to .exact for the call sites that show live
     /// rows only (the map's cluster sheet), where the caveat would be noise.
     var timeBasis: TimeBasis = .exact
-    /// First heard after the "mark all seen" watermark: carries a small crimson dot so new rows
-    /// read inline on the ALL lens, matching Android's NewDot. Defaults off for the call sites
-    /// that have no watermark concept (the map's cluster sheet).
-    var isNew: Bool = false
     private var d: Detection { detection }
 
     var body: some View {
@@ -32,10 +28,9 @@ struct DetectionRow: View {
                     // OFFLINE says where the row came from; this says what its time is worth,
                     // which is the part a reader would otherwise assume.
                     TimeBasisTag(basis: timeBasis)
-                    // Small crimson dot marking a detection first heard after the seen watermark.
-                    if isNew {
-                        Circle().fill(ACABTheme.accent).frame(width: 7, height: 7)
-                    }
+                    // No per-row "new" dot: it marked everything until the seen-watermark was
+                    // fixed, and even corrected it duplicated the NEW scope chip. What is new
+                    // lives in that filter now.
                 }
                 HStack(spacing: 6) {
                     // When a name leads, keep the device class visible as the subtitle.

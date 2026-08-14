@@ -1,6 +1,6 @@
 {
   "name": "ACAB Mesh-Detect (private channel 1)",
-  "version": "2.0.4",
+  "version": "2.0.5",
   "funding_url": "",
   "new_install_prompt_erase": true,
   "builds": [

@@ -23,7 +23,7 @@ packages:
 
 settings:
   base:
-    MARKETING_VERSION: "2.0.4"
+    MARKETING_VERSION: "2.0.5"
     # The build number RESTARTS AT 0 for each new MARKETING_VERSION, and only climbs when a SECOND
     # build of the SAME version has to go up. App Store Connect requires the build to be unique
     # within a version string, NOT across the app, so 0 is always free on a version that has never
@@ -86,7 +86,7 @@ targets:
         # TestFlight/App Store Connect stops asking for export compliance each build.
         ITSAppUsesNonExemptEncryption: false
         NSBluetoothAlwaysUsageDescription: "This app connects to your beacon board over Bluetooth to receive detections."
-        NSLocationWhenInUseUsageDescription: "Used to map detections, including in the background during a Drive session so hits stay pinned while your screen is off, and to geotag them on your board over your encrypted local Bluetooth link. Never uploaded."
+        NSLocationWhenInUseUsageDescription: "Used to map detections, keep Drive session pins updated in the background, and geotag detections on your board over encrypted Bluetooth. Coordinates are not automatically uploaded; you choose whether to include them in an export or contribution."
         NSFocusStatusUsageDescription: "This app checks whether a Focus or Do Not Disturb is active so it can stay silent and skip the vibrate alert while you have one on."
         UIBackgroundModes:
           - bluetooth-central

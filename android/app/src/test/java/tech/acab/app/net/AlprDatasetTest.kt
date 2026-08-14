@@ -48,6 +48,113 @@ import kotlin.math.roundToInt
  */
 class AlprDatasetTest {
 
+    @Test
+    fun testDatasetUrlTrust_isExactHostHttpsAndDefaultPortOnly() {
+        assertTrue(isTrustedAlprUrl("https://soyboi.tech/data/alpr-v3.bin"))
+        assertTrue(isTrustedAlprUrl("https://SOYBOI.TECH:443/data/alpr-v3.bin"))
+        for (url in listOf(
+                "http://soyboi.tech/data/alpr-v3.bin",
+                "https://soyboi.tech.evil.example/data/alpr-v3.bin",
+                "https://evil.example/data/alpr-v3.bin",
+                "https://soyboi.tech:444/data/alpr-v3.bin",
+                "https://user@soyboi.tech/data/alpr-v3.bin",
+            )) assertTrue(url, !isTrustedAlprUrl(url))
+    }
+
+    @Test
+    fun testDatasetRedirect_resolvesRelativeAndRejectsHostEscape() {
+        val current = "https://soyboi.tech/data/alpr-v3-latest.json"
+        assertEquals(
+            "https://soyboi.tech/files/alpr-v3.bin",
+            trustedAlprRedirect(current, "../files/alpr-v3.bin"),
+        )
+        assertNull(trustedAlprRedirect(current, "https://cdn.example/alpr-v3.bin"))
+        assertNull(trustedAlprRedirect(current, "//soyboi.tech.evil.example/alpr-v3.bin"))
+    }
+
+    @Test
+    fun testCacheFreshnessRequiresDigestAndParsedFormatAsWellAsDisplayDate() {
+        assertTrue(alprCacheIsCurrent(
+            "2026-08-10", "same-sha", "ALP4", "ALP4",
+            "2026-08-10", "same-sha", "ALP4", true))
+        assertTrue(!alprCacheIsCurrent(
+            "2026-08-10", "same-sha", "ALP4", "ALP4",
+            "2026-08-10", "same-sha", "ALP3", true))
+        assertTrue(!alprCacheIsCurrent(
+            "2026-08-10", "same-sha", "ALP4", null,
+            "2026-08-10", "same-sha", "ALP3", true))
+        assertTrue(!alprCacheIsCurrent(
+            "2026-08-10", "same-sha", "ALP4", "ALP3",
+            "2026-08-10", "same-sha", "ALP3", true))
+        assertTrue(!alprCacheIsCurrent(
+            "2026-08-10", "v4sha", "ALP4", "ALP4",
+            "2026-08-10", "v3sha", "ALP4", true))
+        assertTrue(!alprCacheIsCurrent(
+            "2026-08-10", "v4sha", "ALP4", "ALP4",
+            "2026-08-10", null, "ALP4", true))
+        assertTrue(!alprCacheIsCurrent(
+            "2026-08-10", "v4sha", "ALP4", "ALP4",
+            "2026-08-10", "v4sha", "ALP4", false))
+        assertTrue(alprCacheIsCurrent(
+            "2026-08-10", "v3sha", "ALP3", " alp3 ",
+            "2026-08-10", "v3sha", "ALP3", true))
+        assertTrue(alprCacheIsCurrent(
+            "2026-08-10", "v3sha", "ALP3", null,
+            "2026-08-10", "v3sha", "ALP3", true))
+        assertTrue(alprFormatMatches("ALP4", " alp4 ", "ALP4"))
+        assertTrue(!alprFormatMatches("ALP4", null, "ALP4"))
+        assertTrue(!alprFormatMatches("ALP4", "ALP3", "ALP3"))
+        assertTrue(alprFormatMatches("ALP3", null, "ALP3"))
+        assertTrue(!alprFormatMatches("ALP3", "ALP4", "ALP3"))
+    }
+
+    @Test
+    fun testRestartableFetchGateCannotLoseBusyRequestAtHandoff() {
+        val gate = RestartableFetchGate()
+        assertTrue(gate.tryStart(rememberRestartIfBusy = true))
+        assertTrue(!gate.tryStart(rememberRestartIfBusy = true))
+        assertTrue(gate.finish(restartAllowed = true))
+
+        // finish() reserved the next run before releasing its monitor. A request at the handoff
+        // therefore sees an active run and becomes a subsequent restart instead of disappearing.
+        assertTrue(!gate.tryStart(rememberRestartIfBusy = true))
+        assertTrue(gate.finish(restartAllowed = true))
+        assertTrue(!gate.finish(restartAllowed = false))
+        assertTrue(gate.tryStart(rememberRestartIfBusy = false))
+        assertTrue(!gate.finish(restartAllowed = false))
+    }
+
+    @Test
+    fun testManifestCountIsIntegralAndBounded() {
+        assertEquals(0, parseAlprManifestCount(0))
+        assertEquals(42, parseAlprManifestCount(42L))
+        assertEquals(42, parseAlprManifestCount(42.0))
+        assertNull(parseAlprManifestCount(42.5))
+        assertNull(parseAlprManifestCount(-1))
+        assertNull(parseAlprManifestCount(5_000_000))
+        assertNull(parseAlprManifestCount("42"))
+    }
+
+    @Test
+    fun testV4ManifestFallsBackToV3On404Only() {
+        assertTrue(shouldFallbackToAlprV3(404))
+        for (status in listOf(0, 200, 301, 403, 410, 500, 503)) {
+            assertTrue(status.toString(), !shouldFallbackToAlprV3(status))
+        }
+    }
+
+    @Test
+    fun testManifestDataRequiresTrustedHostDigestAndBoundedBinary() {
+        val sha = "ab".repeat(32)
+        assertTrue(isValidAlprManifestData(
+            "https://soyboi.tech/data/alpr-v4.bin", sha, ALPR_MAX_DATASET_BYTES))
+        assertTrue(!isValidAlprManifestData("https://cdn.example/alpr-v4.bin", sha, 1))
+        assertTrue(!isValidAlprManifestData("https://soyboi.tech/data/alpr-v4.bin", "xyz", 1))
+        assertTrue(!isValidAlprManifestData("https://soyboi.tech/data/alpr-v4.bin", sha, 0))
+        assertTrue(!isValidAlprManifestData(
+            "https://soyboi.tech/data/alpr-v4.bin", sha, ALPR_MAX_DATASET_BYTES + 1))
+    }
+
     // ---- The builder ----
     //
     // Assembles a file the way soyboi.tech/tools/build_alpr_dataset.py assembles one:
@@ -57,7 +164,17 @@ class AlprDatasetTest {
 
     /** One node as the generator emits it. [maker] indexes the file's own table, [tier] is 1 when
      *  the OSM mapper picked the manufacturer from an editor preset. */
-    private class Node(val lat: Double, val lon: Double, val maker: Int = 0, val tier: Int = 1)
+    private class Node(
+        val lat: Double,
+        val lon: Double,
+        val maker: Int = 0,
+        val tier: Int = 1,
+        val osmType: Int = 0,
+        val osmId: ULong = 1uL,
+        val sourceEpoch: Long = 0,
+        val directionCdeg: Int? = null,
+        val checkDateDay: Long? = null,
+    )
 
     /** The table every fixture uses unless it says otherwise. Index 0 is "" (unknown) because the
      *  generator always emits it there; a node with no manufacturer recorded points at 0. */
@@ -87,7 +204,14 @@ class AlprDatasetTest {
         }
         for (n in nodes) { out.le32(e7(n.lat)); out.le32(e7(n.lon)) }
         if (hasMakers) for (n in nodes) out.write(n.maker)
-        if (magic == "ALP3") for (n in nodes) out.write(n.tier)
+        if (magic == "ALP3" || magic == "ALP4") for (n in nodes) out.write(n.tier)
+        if (magic == "ALP4") for (n in nodes) {
+            out.write(n.osmType)
+            out.le64(n.osmId)
+            out.le32(n.sourceEpoch.toInt())
+            out.le16(n.directionCdeg ?: 0xFFFF)
+            out.le32((n.checkDateDay ?: 0L).toInt())
+        }
         return out.toByteArray()
     }
 
@@ -99,6 +223,14 @@ class AlprDatasetTest {
     private fun ByteArrayOutputStream.le32(v: Int) {
         write(v and 0xFF); write((v ushr 8) and 0xFF)
         write((v ushr 16) and 0xFF); write((v ushr 24) and 0xFF)
+    }
+
+    private fun ByteArrayOutputStream.le16(v: Int) {
+        write(v and 0xFF); write((v ushr 8) and 0xFF)
+    }
+
+    private fun ByteArrayOutputStream.le64(v: ULong) {
+        for (shift in 0 until 64 step 8) write(((v shr shift) and 0xFFu).toInt())
     }
 
     /** Three real San Diego-ish coordinates, reused so a fixture that differs from another differs
@@ -130,11 +262,60 @@ class AlprDatasetTest {
         assertEquals(lon, coords[i * 2 + 1] / 1e7, 5e-8)
     }
 
-    // ---- The three magics ----
+    // ---- The four magics ----
+
+    @Test
+    fun testValidALP4RetainsTierAndSourceMetadata() {
+        val nodes = listOf(
+            Node(32.7157, -117.1611, maker = 1, tier = 1, osmType = 0,
+                osmId = 9_223_372_036_854_775_808uL, sourceEpoch = 1_786_320_000,
+                directionCdeg = 27_050, checkDateDay = 20_310),
+            Node(32.7200, -117.1700, maker = 2, tier = 2, osmType = 2,
+                osmId = 42uL, sourceEpoch = 0, directionCdeg = null, checkDateDay = null),
+        )
+        val p = parsed(alp("ALP4", nodes = nodes), "a well-formed ALP4 file was rejected")
+        assertEquals("ALP4", p.wireFormat)
+        assertEquals(2, p.rawCount)
+        assertEquals(listOf(1, 2), p.rawTier.toList())
+        assertEquals(listOf(true, false), p.confirmed.toList())
+        val first = requireNotNull(p.metadata[0])
+        assertEquals(0, first.osmType)
+        assertEquals(9_223_372_036_854_775_808uL, first.osmId)
+        assertEquals(1_786_320_000L, first.sourceEpoch)
+        assertEquals(27_050, first.directionCdeg)
+        assertEquals(20_310L, first.checkDateDay)
+        val second = requireNotNull(p.metadata[1])
+        assertEquals(2, second.osmType)
+        assertEquals(42uL, second.osmId)
+        assertEquals(null, second.sourceEpoch)
+        assertEquals(null, second.directionCdeg)
+        assertEquals(null, second.checkDateDay)
+    }
+
+    @Test
+    fun testALP4RejectsInvalidMetadata() {
+        assertNull(AlprStore.parse(alp("ALP4", nodes = listOf(Node(1.0, 1.0, osmType = 3)))))
+        assertNull(AlprStore.parse(alp("ALP4", nodes = listOf(Node(1.0, 1.0, osmId = 0uL)))))
+        assertNull(AlprStore.parse(alp("ALP4", nodes = listOf(Node(1.0, 1.0, directionCdeg = 36_000)))))
+        assertNull(AlprStore.parse(alp("ALP4", nodes = listOf(Node(1.0, 1.0, tier = 3)))))
+    }
+
+    @Test
+    fun testALP4CoordinateDropKeepsEveryParallelBlockAligned() {
+        val p = parsed(alp("ALP4", nodes = listOf(
+            Node(91.0, 1.0, maker = 1, tier = 1, osmId = 11uL),
+            Node(32.0, -117.0, maker = 2, tier = 2, osmType = 1, osmId = 22uL),
+        )), "one invalid coordinate should not reject valid ALP4 siblings")
+        assertEquals(1, p.coords.size / 2)
+        assertEquals(listOf(2), p.makerIdx.toList())
+        assertEquals(listOf(2), p.rawTier.toList())
+        assertEquals(22uL, p.metadata.single()!!.osmId)
+    }
 
     @Test
     fun testValidALP3RoundTrip() {
         val p = parsed(alp("ALP3", nodes = threeNodes), "a well-formed ALP3 file was rejected")
+        assertEquals("ALP3", p.wireFormat)
         assertEquals(3, p.coords.size / 2)
         assertCoord(p.coords, 0, 32.7157, -117.1611)
         assertCoord(p.coords, 1, 32.7200, -117.1700)
@@ -153,10 +334,12 @@ class AlprDatasetTest {
         // tier is an accusation. Defaulting the other way would paint a whole stale map amber
         // purely because the file is old.
         val p = parsed(alp("ALP2", nodes = threeNodes), "a well-formed ALP2 file was rejected")
+        assertEquals("ALP2", p.wireFormat)
         assertEquals(3, p.coords.size / 2)
         assertCoord(p.coords, 1, 32.7200, -117.1700)
         assertEquals(listOf("Flock Safety", "Genetec", ""), makers(p.makerIdx, p.table))
         assertEquals(listOf(true, true, true), p.confirmed.toList())
+        assertEquals(listOf(3, 3, 3), p.rawTier.toList())
     }
 
     @Test
@@ -164,11 +347,13 @@ class AlprDatasetTest {
         // The coord block is byte-identical across all three versions, which is the whole reason a
         // cache written by a 2024 build still draws today.
         val p = parsed(alp("ALP1", nodes = threeNodes), "a well-formed ALP1 file was rejected")
+        assertEquals("ALP1", p.wireFormat)
         assertEquals(3, p.coords.size / 2)
         assertCoord(p.coords, 0, 32.7157, -117.1611)
         assertCoord(p.coords, 2, 32.7300, -117.1800)
         assertEquals(listOf("", "", ""), makers(p.makerIdx, p.table))
         assertEquals(listOf(true, true, true), p.confirmed.toList())
+        assertEquals(listOf(3, 3, 3), p.rawTier.toList())
     }
 
     @Test
@@ -191,7 +376,7 @@ class AlprDatasetTest {
         // A zero-node file is legal, not a malformation. It has to stay distinguishable from a
         // reject: a reject returns before KEY_VERSION is stamped and re-downloads forever, whereas
         // an empty dataset is simply a region with nothing mapped in it.
-        for (magic in listOf("ALP1", "ALP2", "ALP3")) {
+        for (magic in listOf("ALP1", "ALP2", "ALP3", "ALP4")) {
             val p = parsed(alp(magic, nodes = emptyList()), "$magic with count 0 was rejected")
             assertTrue(magic, p.coords.isEmpty())
             assertTrue(magic, p.makerIdx.isEmpty())
@@ -203,10 +388,10 @@ class AlprDatasetTest {
 
     @Test
     fun testBadMagicIsRejected() {
-        // ALP4 is the one that matters: it is what a future format looks like arriving at today's
+        // ALP5 is the one that matters: it is what a future format looks like arriving at today's
         // build, and rejecting it is correct. The lowercase and empty cases pin that the check is
         // on bytes, not on a case-insensitive string compare someone might "tidy" it into.
-        for (magic in listOf("ALP4", "ALP0", "alp3", "XXXX", "APL3")) {
+        for (magic in listOf("ALP5", "ALP0", "alp3", "XXXX", "APL3")) {
             assertNull(magic, AlprStore.parse(alp(magic, nodes = threeNodes)))
         }
         assertNull(AlprStore.parse(ByteArray(0)))
@@ -249,6 +434,15 @@ class AlprDatasetTest {
         val tooManyEntries = alp("ALP2", nodes = threeNodes)
         tooManyEntries[12] = 200.toByte()
         assertNull(AlprStore.parse(tooManyEntries))
+    }
+
+    @Test
+    fun testInvalidUtf8MakerIsRejected() {
+        val invalid = alp("ALP4", nodes = threeNodes)
+        // First byte of "Flock Safety" becomes a two-byte prefix, followed by ASCII "l" rather
+        // than a continuation byte. Length and every other field remain valid.
+        invalid[15] = 0xC3.toByte()
+        assertNull(AlprStore.parse(invalid))
     }
 
     @Test
@@ -316,6 +510,9 @@ class AlprDatasetTest {
         // reader never quietly ignores a tail it does not understand.
         val padded = alp("ALP3", nodes = threeNodes) + byteArrayOf(0xFF.toByte())
         assertNull(AlprStore.parse(padded))
+        val v4 = alp("ALP4", nodes = threeNodes)
+        assertNull(AlprStore.parse(v4.copyOf(v4.size - 1)))
+        assertNull(AlprStore.parse(v4 + byteArrayOf(0)))
         // The incident from the installed base's side: an ALP3 file arriving at an ALP2 reader
         // reads as a valid payload with an unexplained count-byte tail. Pinned so nobody "fixes"
         // the equality into a >= without understanding that the strictness is the reason the two

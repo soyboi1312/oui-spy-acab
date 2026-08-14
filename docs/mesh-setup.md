@@ -9,9 +9,9 @@ The XIAO sends labelled detections to the Heltec over a wired UART, and the Helt
 puts them on your mesh. Each alert names the unit:
 
 ```
-ALPR camera detected  | WiFi | rssi -67 | 70:c9:4e:11:22:33 | 34.05012,-118.24001
+ALPR camera detected  | WiFi | rssi -67 | 70:c9:4e:11:22:33 | https://maps.google.com/?q=34.05012,-118.24001
 Flock Raven detected  | BLE  | rssi -72 | 58:8e:81:aa:bb:cc
-Drone detected        | RID  | rssi -61 | RID 1581F4F... | 34.05,-118.24 | alt 120m
+Drone detected        | RID  | rssi -61 | RID 1581F4F... | https://maps.google.com/?q=34.05,-118.24 | alt 120m
 Body camera detected  | BLE  | rssi -55 | <mac>
 ```
 
@@ -48,7 +48,7 @@ the XIAO. Get them matched or detections won't come through.
 |---|---|---|
 | Detections go to | the primary/public channel (anyone on LongFast sees them) | an encrypted secondary channel only your nodes can read |
 | Heltec Serial Module mode | `TEXTMSG` | `PROTO` |
-| XIAO firmware | default build (web flasher works) | built with `-DACAB_MESH_CHANNEL=<index>` |
+| XIAO firmware | web flasher **Flash Mesh-Detect (Public)** | channel 1: web flasher **Flash Mesh-Detect (Private)**; other indexes: `-DACAB_MESH_CHANNEL=<index>` |
 | Your node still sees the mesh? | yes | yes (channel 0 is untouched) |
 
 Either way your node stays on the public LongFast mesh and keeps seeing other
@@ -181,26 +181,36 @@ never sees your detections, which is exactly the point.
 
 **Public channel** (default firmware):
 
-- Web flasher: **https://soyboi1312.github.io/all-cameras-are-beacons/** → **Flash Mesh-Detect**, or
+- Web flasher: **https://soyboi1312.github.io/all-cameras-are-beacons/** → **Flash Mesh-Detect (Public)**, or
 - ```bash
   pio run -e mesh-detect -t upload --upload-port /dev/cu.usbmodemXXXX
   ```
 
 **Private channel** (index must match the Heltec's `acab` channel):
 
-```bash
-PLATFORMIO_BUILD_FLAGS="-DACAB_MESH_CHANNEL=1" \
-  pio run -e mesh-detect -t upload --upload-port /dev/cu.usbmodemXXXX
-```
+- **Channel 1** (the usual index): web flasher → **Flash Mesh-Detect (Private)**. That
+  build is pinned to channel 1, so no PlatformIO needed.
+- **Any other index:** build it locally with the channel baked in:
+  ```bash
+  PLATFORMIO_BUILD_FLAGS="-DACAB_MESH_CHANNEL=<index>" \
+    pio run -e mesh-detect -t upload --upload-port /dev/cu.usbmodemXXXX
+  ```
 
 A non-zero `ACAB_MESH_CHANNEL` makes the firmware send over PROTO automatically,
 matching the Heltec's PROTO mode. Then wire the two boards per the table above and
 power both.
 
+> **Pair the beacons app (2.0.5+).** The XIAO also serves the beacons app over BLE,
+> but a phone it has never bonded with can only pair during a ~2-minute window right
+> after a physical power-on. Connect the app within two minutes of plugging the XIAO
+> in. If that window has lapsed, unplug and replug the XIAO, then connect within two
+> minutes. Already-paired phones reconnect anytime; a warm restart (OTA, panic,
+> watchdog) does not reopen the window.
+
 ## 3. Test it
 
 **Quickest check: the boot self-test ping.** On power-up the firmware sends
-`ACAB mesh-detect online` over the configured channel about **10 s after boot**,
+`mesh-detect ACAB online` over the configured channel about **10 s after boot**,
 before any detection. The fastest end-to-end test is to power the unit, wait ~15 s,
 and look for that message on a node listening to your channel. If it lands, the
 whole path (XIAO to Heltec to mesh to channel) works. Tap the XIAO's reset button to
@@ -210,8 +220,10 @@ re-fire it. (Its `usbmodem` port number can change after a reset; re-run
 **Trigger a real detection** to see the full flow. You need something the XIAO
 recognises in range. The most controllable trigger is
 a fake Flock BLE signature: on an **Android** phone, **nRF Connect → Advertiser →
-Complete Local Name = `Flock`** and start advertising. (The firmware matches the
-name substrings `Flock`, `FS Ext Battery`, `Penguin`, `Pigvision`.) A drone with
+Complete Local Name = `Flock`** and start advertising. (The firmware matches these
+anchored names: the literal `FS Ext Battery`, `Penguin-` followed by digits, `FS-`
+followed by hex, and any name that starts with `Flock`. The `Flock` name above is a
+prefix hit, so it fires.) A drone with
 Remote ID, or a real Flock camera, work too.
 
 Watch the XIAO's USB serial while you trigger it:
@@ -223,13 +235,13 @@ pio device monitor -b 115200 --port /dev/cu.usbmodemXXXX
 A fresh detection prints two lines:
 
 ```
-[ACAB] Flock camera   BLE  aa:bb:cc:dd:ee:ff rssi=-58 conf=80
-[ACAB-mesh] -> Flock camera detected | BLE | rssi -58 | aa:bb:cc:dd:ee:ff
+[ACAB] ALPR camera    BLE  aa:bb:cc:dd:ee:ff rssi=-58 conf=70
+[ACAB-mesh] -> ALPR camera detected | BLE | rssi -58 | aa:bb:cc:dd:ee:ff
 ```
 
 The first line means the detector fired; the second means it pushed the alert to
 the Heltec. Then check a node on the target channel for the incoming
-`Flock camera detected ...` message.
+`ALPR camera detected ...` message.
 
 > Detections are **deduped per device for 60 s** (plus a 3 s floor between sends),
 > so you get one message per device, not a stream. To fire again, restart the

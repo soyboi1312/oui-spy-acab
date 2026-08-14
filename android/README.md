@@ -5,9 +5,10 @@ counterpart to the iOS app in `../ios`. It talks to the same firmware over the
 same encrypted BLE GATT service (`../docs/ble-protocol.md`).
 
 The app is the free, open-source companion to the beacon (the sold hardware), and
-still works with DIY XIAO builds. It surfaces what the beacon detects: Axon body
-cameras on by default, opt-in BLE item trackers, and encrypted offline-buffer
-replay of hits logged while your phone was away.
+still works with DIY XIAO builds. It surfaces what the beacon detects: body cams
+on by default, mapped ALPR awareness, drones, recording glasses, opt-in BLE item
+trackers and network cameras, and encrypted offline-buffer replay of hits logged
+while your phone was away.
 
 ## Status
 
@@ -29,17 +30,17 @@ Working end to end. Done:
 - Firmware updates: the app checks a hosted version manifest (no Play release
   needed when firmware ships) and, on OTA-capable boards, pushes the update over
   Bluetooth with progress and safe rollback; older boards get pointed at the
-  browser flasher. Not yet exercised on real hardware.
+  browser flasher. Proven on real hardware.
 
 Still TODO:
-- Log export, and getting onto the Play Store / F-Droid (see below).
+- Getting onto the Play Store / F-Droid (see below).
 
 ## Build & run
 
 You need **Android Studio** (it bundles the SDK, a JDK, and Gradle):
 
 1. Android Studio, **Open**, select this `android/` folder.
-2. Let it run Gradle sync (first sync downloads Gradle 8.11.1 + the SDK).
+2. Let it run Gradle sync (first sync downloads Gradle 8.13 + the SDK).
 3. **Run on a physical phone.** The emulator has no Bluetooth, so BLE needs a real
    device with USB debugging on.
 4. On first connect the phone prompts to pair ("just works", no passkey). Accept
@@ -56,7 +57,7 @@ and the SDK on `ANDROID_HOME`:
 The installable APK lands at `app/build/outputs/apk/debug/app-debug.apk`; push it
 to a plugged-in phone with `adb install -r app/build/outputs/apk/debug/app-debug.apk`.
 
-`applicationId` = `tech.acab.app`, `minSdk` 26, `targetSdk` 35.
+`applicationId` = `tech.soyboi.beacons`, `minSdk` 26, `targetSdk` 36.
 
 ## Shipping a real APK
 

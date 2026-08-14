@@ -4,6 +4,9 @@ import SwiftUI
 /// Built around the radar scope, fed by live BLE detections.
 struct DashboardView: View {
     @EnvironmentObject var ble: BLEManager
+    // Accessibility text sizes reflow the six-across tile strip into a grid and pad the scroll
+    // bottom; read once here so every consumer keys off the same threshold.
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     // Staleness moves with the clock, not with @Published state, so nothing would invalidate
     // this screen as rows go quiet: without the tick the count freezes at its last-publish
@@ -149,11 +152,21 @@ struct DashboardView: View {
                             .frame(maxWidth: .infinity)   // center the capped radar in the (leading) column, matters on iPad
                             .padding(.top, 4)
 
-                        Text("rings = signal strength · position around the dial means nothing")
-                            .font(ACABTheme.mono(9))
-                            .foregroundStyle(ACABTheme.faint)
-                            .frame(maxWidth: .infinity)
+                        // Promoted from a 9pt afterthought to a standing element of the radar
+                        // presentation: a dial reads as bearing to everyone who has ever seen one,
+                        // and here the angle is a MAC hash. The one line that corrects that mental
+                        // model has to be legible and always on screen, not a caption you squint at.
+                        // Scales with Dynamic Type (it is content, not chrome).
+                        Text("SIGNAL STRENGTH ONLY \u{00B7} NO DIRECTION")
+                            .font(ACABTheme.mono(10.5, weight: .semibold))
+                            .tracking(1.2)
+                            .foregroundStyle(ACABTheme.dim)
                             .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 14).padding(.vertical, 7)
+                            .background(ACABTheme.bg2, in: Capsule())
+                            .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
+                            .frame(maxWidth: .infinity)
 
                         HStack { Spacer(); PunkLine(); Spacer() }
                             .padding(.vertical, 2)
@@ -168,6 +181,10 @@ struct DashboardView: View {
                     .frame(maxWidth: 640)
                     .frame(maxWidth: .infinity)
                 }
+                // Extra bottom margin ONLY at accessibility sizes, where the grown content can
+                // otherwise end flush against (or under) the tab bar. Zero at default sizes so
+                // the standard layout is untouched.
+                .contentMargins(.bottom, dynamicTypeSize.isAccessibilitySize ? 24 : 0, for: .scrollContent)
             }
             .navigationBarHidden(true)
         }
@@ -175,12 +192,12 @@ struct DashboardView: View {
     }
 
     /// The nRF fault is a whole half of the detection surface going dark, so it can't live
-    /// only on the Device tab. Short form here, Device carries the full what-to-try.
+    /// only on the Beacon tab. Short form here, Beacon carries the full what-to-try.
     private var coprocFaultPill: some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.system(size: 12)).foregroundStyle(ACABTheme.warn)
-            Text("nRF radio fault - bluetooth detection offline. trackers, glasses and other bluetooth gear won't be picked up. see Device.")
+            Text("nRF radio fault - bluetooth detection offline. trackers, glasses and other bluetooth gear won't be picked up. see Beacon.")
                 .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.warn)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
@@ -200,7 +217,7 @@ struct DashboardView: View {
                 .progressViewStyle(.circular)
                 .scaleEffect(0.6)
                 .tint(ACABTheme.dim)
-            Text("updating co-processor - bluetooth detection paused. trackers, glasses and other bluetooth gear won't be picked up until it comes back. see Device.")
+            Text("updating co-processor - bluetooth detection paused. trackers, glasses and other bluetooth gear won't be picked up until it comes back. see Beacon.")
                 .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
@@ -256,49 +273,82 @@ struct DashboardView: View {
             }
         }
         .allowsHitTesting(false)
+        // Decorative instrument chrome: VoiceOver otherwise reads NEAR/MID/FAR as three stray
+        // elements. The scope's own summary label already carries the meaning.
+        .accessibilityHidden(true)
     }
 
     private func ringLabel(_ text: String, opacity: Double) -> some View {
+        // Fixed size on purpose - decorative instrument chrome positioned absolutely on the
+        // scope's fixed geometry. On the Dynamic Type caption curve these roughly quadruple at
+        // accessibility sizes and overlapped each other and the count. The scope's real content
+        // (the count) still scales, and RadarScope speaks a full summary for VoiceOver.
         Text(text)
-            .font(ACABTheme.mono(7.5, weight: .medium))
+            .font(Font.custom("JetBrainsMono-Medium", fixedSize: 7.5))
             .tracking(1)
             .foregroundStyle(ACABTheme.text.opacity(opacity))
     }
 
-    /// One 6-across strip of compact per-category counts, matching the Log tiles and Map chips
+    /// One strip of compact per-category counts, matching the Log tiles and Map chips
     /// (ALPR, DRONE, BODY, TRACKER, GLASSES, plus Network camera). Six compact tiles share the
     /// row width evenly, so Status surfaces the netcam count the same way Log and Map already do.
+    /// At accessibility text sizes six-across leaves each tile ~55pt while its label quadruples,
+    /// so the strip reflows into a 3x2 grid; the default layout is untouched.
+    @ViewBuilder
     private func categoryTiles(_ counts: [DeviceType: Int]) -> some View {
-        HStack(spacing: 6) {
-            tile(.flockCamera, "ALPR",  (counts[.flockCamera] ?? 0) + (counts[.flockRaven] ?? 0))
-            tile(.drone,       "DRONE", counts[.drone] ?? 0)
-            tile(.axonBodyCam, "BODY",  counts[.axonBodyCam] ?? 0)
-            tile(.tracker,     "TRKR",  counts[.tracker] ?? 0)
-            tile(.recordingGlasses, "GLAS", counts[.recordingGlasses] ?? 0)
-            tile(.networkCamera,    "NETCAM", counts[.networkCamera] ?? 0)
+        if dynamicTypeSize.isAccessibilitySize {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3),
+                      spacing: 6) { tileSet(counts) }
+        } else {
+            HStack(spacing: 6) { tileSet(counts) }
         }
     }
 
-    private func tile(_ type: DeviceType, _ label: String, _ n: Int) -> some View {
-        VStack(spacing: 5) {
-            Image(systemName: type.symbol)
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(n == 0 ? ACABTheme.faint : type.tint)
-            Text("\(n)")
-                .font(ACABTheme.display(18, weight: .bold))
-                .foregroundStyle(n == 0 ? ACABTheme.faint : ACABTheme.text)
-                .monospacedDigit()
-            Text(label)
-                .font(ACABTheme.mono(8, weight: .semibold))
-                .tracking(0.8)
-                .foregroundStyle(n == 0 ? ACABTheme.faint : type.tint)
+    /// The six tiles themselves, shared by both containers above. `spoken` is what VoiceOver
+    /// says: the drawn label is a width-budget abbreviation ("TRKR", "GLAS") that a screen
+    /// reader would speak as gibberish, so each tile carries its full-word name too.
+    @ViewBuilder
+    private func tileSet(_ counts: [DeviceType: Int]) -> some View {
+        tile(.flockCamera, "ALPR",  spoken: "ALPR cameras",  (counts[.flockCamera] ?? 0) + (counts[.flockRaven] ?? 0))
+        tile(.drone,       "DRONE", spoken: "Drones",        counts[.drone] ?? 0)
+        tile(.axonBodyCam, "BODY",  spoken: "Body cameras",  counts[.axonBodyCam] ?? 0)
+        tile(.tracker,     "TRKR",  spoken: "Trackers",      counts[.tracker] ?? 0)
+        tile(.recordingGlasses, "GLAS", spoken: "Glasses",   counts[.recordingGlasses] ?? 0)
+        tile(.networkCamera,    "NETCAM", spoken: "Network cameras", counts[.networkCamera] ?? 0)
+    }
+
+    /// Each tile deep-links to the Log tab with its category filter armed (LogFocus is the
+    /// same one-shot static-slot pattern MapFocus uses, session-only on purpose), so the
+    /// at-a-glance count answers "show me those" in one tap instead of being a dead number.
+    private func tile(_ type: DeviceType, _ label: String, spoken: String, _ n: Int) -> some View {
+        Button {
+            LogFocus.pendingCategory = type.category
+            NotificationCenter.default.post(name: LogFocus.notification, object: nil)
+        } label: {
+            VStack(spacing: 5) {
+                Image(systemName: type.symbol)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(n == 0 ? ACABTheme.faint : type.tint)
+                Text("\(n)")
+                    .font(ACABTheme.display(18, weight: .bold))
+                    .foregroundStyle(n == 0 ? ACABTheme.faint : ACABTheme.text)
+                    .monospacedDigit()
+                Text(label)
+                    .font(ACABTheme.mono(8, weight: .semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(n == 0 ? ACABTheme.faint : type.tint)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(ACABTheme.bg2,
+                        in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
+                .strokeBorder(ACABTheme.line, lineWidth: 1))
+            .contentShape(Rectangle())
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 10)
-        .background(ACABTheme.bg2,
-                    in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
-            .strokeBorder(ACABTheme.line, lineWidth: 1))
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(spoken), \(n) active")
+        .accessibilityHint("Opens the log filtered to this category")
     }
 
     /// Tappable card for the closest device (highest RSSI).

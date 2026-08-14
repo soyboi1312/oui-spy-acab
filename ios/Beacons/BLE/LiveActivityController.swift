@@ -10,6 +10,10 @@ final class LiveActivityController {
     private var lastPushed = Date.distantPast
     private var pending: DispatchWorkItem?
     private var latest = DetectionActivityAttributes.DetectionState.empty
+    /// ActivityKit ends asynchronously. Keep an activity that this controller is retiring out of
+    /// the adoption pool until its dismissal has actually settled, or a quick reconnect can adopt
+    /// the old handle and let its delayed terminal event tear down the replacement session.
+    private var retiringIDs: Set<String> = []
 
     private let stale: TimeInterval = 8 * 60   // -> "stale" if no update in 8 min (drive dropout)
     private let minGap: TimeInterval = 1.5     // coalesce routine updates to ~1 / 1.5 s
@@ -72,6 +76,7 @@ final class LiveActivityController {
         guard activity == nil else { return isActive }
         var adopted: Activity<DetectionActivityAttributes>?
         for a in Activity<DetectionActivityAttributes>.activities {
+            if retiringIDs.contains(a.id) { continue }
             switch a.activityState {
             case .active, .stale:
                 if adopted == nil { adopted = a }
@@ -138,9 +143,14 @@ final class LiveActivityController {
 
     func end() {
         pending?.cancel(); pending = nil
-        let a = activity
+        guard let a = activity else { return }
+        let id = a.id
+        retiringIDs.insert(id)
         activity = nil
-        Task { await a?.end(nil, dismissalPolicy: .immediate) }
+        Task { @MainActor [weak self] in
+            await a.end(nil, dismissalPolicy: .immediate)
+            self?.retiringIDs.remove(id)
+        }
     }
 
     /// End and block (up to `timeout`) until ActivityKit has taken the dismissal, for use

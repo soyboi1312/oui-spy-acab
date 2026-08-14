@@ -1,6 +1,10 @@
 package tech.acab.app.ui
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
+import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -9,6 +13,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -40,9 +45,12 @@ import androidx.compose.material.icons.outlined.FilterAlt
 import androidx.compose.material.icons.outlined.Inbox
 import androidx.compose.material.icons.outlined.RadioButtonChecked
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -50,10 +58,12 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -67,12 +77,19 @@ import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
+import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import tech.acab.app.ble.AcabBleManager
@@ -102,7 +119,26 @@ sealed interface LogFilter {
 /** The scope axis of the log lens: everything, only-new (after the seen watermark), or
  *  only offline-buffered records. Composes with the nullable category filter, matching
  *  iOS StatusScope, so ALPR+NEW is one lens rather than two mutually exclusive ones. */
-private enum class LogScope { All, New, Offline }
+internal enum class LogScope { All, New, Offline }
+
+internal fun filterLogRows(
+    feed: List<Detection>,
+    category: String?,
+    scope: LogScope,
+    newIds: Set<String>,
+): List<Detection> = feed.filter { d ->
+    (category == null || d.type.category == category) && when (scope) {
+        LogScope.All -> true
+        LogScope.New -> d.id in newIds
+        LogScope.Offline -> d.offline
+    }
+}
+
+private tailrec fun Context.hostActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.hostActivity()
+    else -> null
+}
 
 /** One entry in the ordered category set for the tile strip. [type] supplies the tone +
  *  glyph, [key] is the DeviceType.category the filter matches on, [label] is the short tile
@@ -137,17 +173,27 @@ private class LogTallies(
  *  row gets a subtle highlight. null (the phone default) means no row is highlighted. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter: LogFilter? = null, selectedId: String? = null) {
+fun LogScreen(
+    ble: AcabBleManager,
+    onSelect: (Detection) -> Unit,
+    initialFilter: LogFilter? = null,
+    selectedId: String? = null,
+    pauseStateKey: String = "main",
+) {
     val detections by ble.detections.collectAsState()
     val watermark by ble.seenWatermark.collectAsState()   // recomposes "New only" when it moves
     val status by ble.status.collectAsState()
     val demo by ble.demoMode.collectAsState()
     val context = LocalContext.current
     val coScope = rememberCoroutineScope()   // for the CSV export; `scope` below is the log lens
+    var exportMenuOpen by remember { mutableStateOf(false) }   // EXPORT chip dropdown (CSV / GPX)
     // Two independent lens axes, ANDed together like iOS: a nullable category filter and a
     // three-way scope. A seed only positions the axis it names; the other stays at default.
-    var catFilter by remember { mutableStateOf((initialFilter as? LogFilter.Category)?.key) }
-    var scope by remember {
+    // rememberSaveable (under MainScreen's per-tab SaveableStateProvider): a tab switch or a
+    // rotation must not reset a lens the user set. Deep-link re-seeding still works because
+    // the key(logScreenKey) wrapper discards this state when a fresh seed arrives.
+    var catFilter by rememberSaveable { mutableStateOf((initialFilter as? LogFilter.Category)?.key) }
+    var scope by rememberSaveable {
         mutableStateOf(
             when (initialFilter) {
                 LogFilter.NewOnly -> LogScope.New
@@ -155,6 +201,14 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
                 else -> LogScope.All
             }
         )
+    }
+
+    // First ordinary open of the log baselines the New dots to what is already here, so a fresh
+    // install / first offline backlog is not a wall of red dots. Once-only (persisted flag inside).
+    // Skipped when we arrived via a NEW deep-link, or the baseline would mark the very rows the
+    // deep-link exists to show. From here on the watermark advances on Log-tab leave (MainScreen).
+    LaunchedEffect(Unit) {
+        if (initialFilter != LogFilter.NewOnly) ble.seedSeenWatermarkOnce()
     }
 
     // Select mode: a set of selected detection ids (empty set = not in select mode).
@@ -166,8 +220,12 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
     // FREEZES a snapshot of the feed so it holds still. New sightings keep landing in the store
     // (ble.detections advances underneath, nothing is dropped) - we just don't show them until
     // resume, which snaps back to live. `feed` is what the whole screen renders from.
-    var paused by remember { mutableStateOf(false) }
-    var frozen by remember { mutableStateOf<List<Detection>>(emptyList()) }
+    // A Boolean in rememberSaveable was not enough: after a tab switch or rotation the actual
+    // frozen rows were gone and the screen silently re-froze at a newer feed. The activity-scoped
+    // ViewModel owns both pieces. Separate keys keep the connected and saved-log surfaces apart.
+    val pauseVm: LogViewModel = viewModel(key = "log-pause:$pauseStateKey")
+    val paused = pauseVm.paused
+    val frozen = pauseVm.frozen
     val feed = if (paused) frozen else detections
     // Ids in the frozen snapshot, so we can count how many NEW sightings have piled up since the
     // pause (by id: the capped feed also sheds old rows, so a size delta would undercount).
@@ -177,7 +235,8 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
         if (paused) detections.count { it.id !in frozenIds } else 0
     }
     fun togglePause() {
-        if (paused) { paused = false } else { frozen = detections; paused = true }
+        if (pauseVm.paused) pauseVm.resume()
+        else pauseVm.pause(ble.freezeFeedExport())
     }
 
     // one traversal per (detections, watermark) change; category counts via groupingBy, with
@@ -198,12 +257,22 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
     // store has since evicted, so their ids get their own watermark check (one extra lock take,
     // and only while paused). Live, this is exactly tallies.newIds.
     val rowNewIds = if (!paused) tallies.newIds
-                    else remember(frozen, watermark) { ble.newIdSet(frozen) }
+                    else remember(pauseVm.frozenExport, watermark) {
+                        pauseVm.frozenExport?.let(ble::newIdSet) ?: emptySet()
+                    }
     // Time quality per row, one locked read for the whole feed rather than one per visible row.
     // Keyed on the revision as well as the feed: bracketing lands at the END of a drain, long
     // after the rows themselves were published, and the feed alone wouldn't notice.
     val timeRev by ble.timeBasisRev.collectAsState()
-    val timeBases = remember(feed, timeRev) { ble.timeBasisMap(feed) }
+    val timeBases = remember(feed, timeRev, paused, pauseVm.frozenExport) {
+        if (paused) {
+            pauseVm.frozenExport?.rows
+                ?.associate { it.detection.id to it.timeBasis }
+                ?: emptyMap()
+        } else {
+            ble.timeBasisMap(feed)
+        }
+    }
     fun count(cat: String) = tallies.byCategory[cat] ?: 0
     val newCount = tallies.newIds.size
     val offlineCount = tallies.offlineCount
@@ -212,13 +281,7 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
     // unrelated recomposition (select-mode taps, pause chip, sheet state). Both axes AND
     // together, so ALPR+NEW is a real lens (iOS parity).
     val shown = remember(feed, catFilter, scope, rowNewIds) {
-        feed.filter { d ->
-            (catFilter == null || d.type.category == catFilter) && when (scope) {
-                LogScope.All -> true
-                LogScope.New -> d.id in rowNewIds
-                LogScope.Offline -> d.offline
-            }
-        }
+        filterLogRows(feed, catFilter, scope, rowNewIds)
     }
 
     fun exitSelect() { selectMode = false; selected = emptySet() }
@@ -233,22 +296,83 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
     fun exportLog(gpx: Boolean = false, wholeLog: Boolean = false) {
         // The file write goes to IO (a Desert-mode log can be thousands of rows, which
         // would jank the main thread); the share sheet fires back on Main once it's done.
-        val cat = if (wholeLog) null else catFilter
-        coScope.launch(Dispatchers.IO) {
-            val slug = cat?.let { "-" + it.lowercase().replace(' ', '-') } ?: ""
-            val ext = if (gpx) "gpx" else "csv"
-            val file = File(context.cacheDir, "acab-detections$slug.$ext")
-            file.writeText(if (gpx) ble.detectionsGpx(cat) else ble.detectionsCsv(cat))
-            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-            val send = Intent(Intent.ACTION_SEND).apply {
-                // application/gpx+xml is the registered type; mapping apps key their share-sheet
-                // filters off it, and text/xml would hide beacons from Gaia's importer.
-                type = if (gpx) "application/gpx+xml" else "text/csv"
-                putExtra(Intent.EXTRA_STREAM, uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        // Freeze before launching IO. For a routine export this is EXACTLY the currently shown
+        // live/paused + category + NEW/OFFLINE lens. The Clear-sheet escape hatch is the sole
+        // whole-store path because it is about to delete the whole store.
+        val exportSnapshot = when {
+            wholeLog -> ble.freezeWholeLogExport()
+            paused -> pauseVm.exportSnapshot(shown)
+                // This invariant should be unreachable because pause publishes metadata before
+                // paused=true. Fail closed instead of ever re-reading mutable/evictable maps.
+                ?: run {
+                    Toast.makeText(context.applicationContext,
+                        "Couldn't export the paused snapshot; resume and try again.",
+                        Toast.LENGTH_LONG).show()
+                    return
+                }
+            else -> ble.freezeLogExport(shown.toList())
+        }
+        val slugParts = if (wholeLog) emptyList() else buildList {
+            catFilter?.let { add(it.lowercase().replace(' ', '-')) }
+            when (scope) {
+                LogScope.All -> Unit
+                LogScope.New -> add("new")
+                LogScope.Offline -> add("offline")
             }
-            withContext(Dispatchers.Main) {
-                context.startActivity(Intent.createChooser(send, "Export detections"))
+            if (paused) add("paused")
+        }
+        val appContext = context.applicationContext
+        coScope.launch {
+            var packageDir: File? = null
+            try {
+                val send = withContext(Dispatchers.IO) {
+                    val slug = slugParts.takeIf { it.isNotEmpty() }
+                        ?.joinToString(prefix = "-", separator = "-") ?: ""
+                    val ext = if (gpx) "gpx" else "csv"
+                    val dir = createExportPackage(appContext.cacheDir, "log-exports")
+                    packageDir = dir
+                    try {
+                        // Preserve the readable leaf while the UUID parent makes the bytes
+                        // immutable for receivers that read after a later export starts.
+                        val file = File(dir, "acab-detections$slug.$ext")
+                        file.writeText(if (gpx) ble.renderDetectionsGpx(exportSnapshot)
+                            else ble.renderDetectionsCsv(exportSnapshot))
+                        val uri = FileProvider.getUriForFile(
+                            appContext, "${appContext.packageName}.fileprovider", file)
+                        Intent(Intent.ACTION_SEND).apply {
+                            // application/gpx+xml is the registered type; mapping apps key their
+                            // share-sheet filters off it, and text/xml hides the Gaia importer.
+                            type = if (gpx) "application/gpx+xml" else "text/csv"
+                            putExtra(Intent.EXTRA_STREAM, uri)
+                            clipData = android.content.ClipData.newUri(
+                                appContext.contentResolver, file.name, uri)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                    } catch (e: Throwable) {
+                        runCatching { dir.deleteRecursively() }
+                        packageDir = null
+                        throw e
+                    }
+                }
+                // The composition scope is cancelled on rotation, but check the host explicitly
+                // too: no stale Activity captured before IO may receive the chooser.
+                val activity = context.hostActivity()?.takeUnless {
+                    it.isFinishing || it.isDestroyed
+                } ?: throw IllegalStateException("this screen is no longer available; try again")
+                activity.startActivity(Intent.createChooser(send, "Export detections"))
+                // A receiving app can keep reading after the chooser closes. Once launch succeeds,
+                // age-pruning owns cleanup; never delete this package in our finally path.
+                packageDir = null
+            } catch (e: CancellationException) {
+                packageDir?.let { runCatching { it.deleteRecursively() } }
+                throw e
+            } catch (e: Throwable) {
+                packageDir?.let { runCatching { it.deleteRecursively() } }
+                Toast.makeText(
+                    context.applicationContext,
+                    "Couldn't export detections: ${e.message ?: "write failed"}",
+                    Toast.LENGTH_LONG,
+                ).show()
             }
         }
     }
@@ -288,16 +412,28 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
                         modifier = Modifier.horizontalScroll(rememberScrollState())) {
                         ActionChip(Icons.AutoMirrored.Filled.PlaylistAddCheck, "SELECT") {
                             // resume first: bulk-ignore acts on live rows (iOS parity)
-                            paused = false; frozen = emptyList()
+                            pauseVm.resume()
                             selectMode = true; selected = emptySet()
                         }
-                        // Labels name the SCOPE when a category tile is lit, so the button says
-                        // what it will actually hand over ("EXPORT DRONE CSV") instead of
-                        // implying the whole log.
-                        ActionChip(Icons.Filled.IosShare,
-                            catFilter?.let { "$it CSV" } ?: "EXPORT CSV") { exportLog(false) }
-                        ActionChip(Icons.Filled.Place,
-                            catFilter?.let { "$it GPX" } ?: "EXPORT GPX") { exportLog(true) }
+                        // CSV and GPX used to be two chips. That spent two of the four slots in a
+                        // row that already has to scroll on a phone on two variants of one action,
+                        // so they fold into a single EXPORT chip with a menu (iOS parity). The
+                        // chip still names the SCOPE when a category tile is lit ("EXPORT DRONE"),
+                        // so a partial export can't be mistaken for the whole log.
+                        Box {
+                            ActionChip(Icons.Filled.IosShare,
+                                catFilter?.let { "EXPORT $it" } ?: "EXPORT") { exportMenuOpen = true }
+                            DropdownMenu(expanded = exportMenuOpen, onDismissRequest = { exportMenuOpen = false }) {
+                                DropdownMenuItem(
+                                    text = { Text("CSV, shown rows") },
+                                    leadingIcon = { Icon(Icons.Filled.IosShare, contentDescription = null) },
+                                    onClick = { exportMenuOpen = false; exportLog(false) })
+                                DropdownMenuItem(
+                                    text = { Text("GPX, shown rows") },
+                                    leadingIcon = { Icon(Icons.Filled.Place, contentDescription = null) },
+                                    onClick = { exportMenuOpen = false; exportLog(true) })
+                            }
+                        }
                         // scope resets to ALL so the user is never stranded on an empty NEW lens
                         ActionChip(Icons.Filled.DoneAll, "MARK SEEN") {
                             ble.markAllSeen(); scope = LogScope.All
@@ -331,6 +467,7 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
                     // worded chip is what made "CLEAR" wrap mid-word on a 411dp-wide screen.
                     Row(
                         Modifier
+                            .minimumInteractiveComponentSize()
                             .clip(RoundedCornerShape(50))
                             .border(1.dp, Acab.line, RoundedCornerShape(50))
                             .clickable { confirmClear = true }
@@ -355,12 +492,19 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
             // no tile left to tap to clear it.
             val visibleCats = LOG_CATEGORIES.filter { count(it.key) > 0 || it.key == catFilter }
             if (visibleCats.isNotEmpty()) {
-                Row(
-                    Modifier.padding(bottom = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    visibleCats.forEach { c ->
-                        CategoryTile(c.type, c.key, c.label, count(c.key), catFilter, Modifier.weight(1f)) { catFilter = it }
+                // At large font scales a six-across strip squeezes each label into a sliver;
+                // wrap to rows of three so the numbers stay legible instead of truncating.
+                BoxWithConstraints(Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
+                    val perRow = if (maxWidth < 360.dp || LocalDensity.current.fontScale >= 1.5f)
+                        3 else visibleCats.size
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        visibleCats.chunked(perRow.coerceAtLeast(1)).forEach { rowCats ->
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                rowCats.forEach { c ->
+                                    CategoryTile(c.type, c.key, c.label, count(c.key), catFilter, Modifier.weight(1f)) { catFilter = it }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -376,7 +520,7 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
                         "No board linked.",
                         "connect your beacon, it does the listening",
                     )
-                    radiosOff -> EmptyState("Radios are off, flip them on in Device.", null)
+                    radiosOff -> EmptyState("Radios are off, flip them on in Beacon.", null)
                     else -> EmptyState(
                         "Scanning…",
                         "Detections log here as beacons spots surveillance gear nearby.",
@@ -387,7 +531,7 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
             // Rows exist but the active lens hides them all (NEW with everything seen,
             // OFFLINE with no buffered rows, a pinned category tile at count 0): explain
             // instead of a kicker over a blank void. Mirrors iOS noMatchState.
-            item { NoMatchState(scope) }
+            item { NoMatchState(scope, catFilter) }
         } else {
             item {
                 // Both axes read in one heading, like iOS: "ALL DETECTIONS" when no
@@ -422,7 +566,6 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
                     DetectionRow(
                         d = d,
                         timeBasis = timeBases[d.id],
-                        isNew = d.id in rowNewIds,
                         selectMode = selectMode,
                         checked = d.id in selected,
                         onClick = {
@@ -489,7 +632,7 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
                 Button(
                     // Drop the frozen snapshot too, or a paused screen would keep showing rows
                     // the user just cleared from the store.
-                    onClick = { ble.clearLog(); paused = false; confirmClear = false },
+                    onClick = { ble.clearLog(); pauseVm.resume(); confirmClear = false },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Acab.accent, contentColor = Acab.onAccent),
@@ -506,11 +649,13 @@ fun LogScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit, initialFilter:
     }
 }
 
-/** Labeled header action chip: capsule, small glyph, mono label. */
+/** Labeled header action chip: capsule, small glyph, mono label. minimumInteractiveComponentSize
+ *  keeps the capsule's look while growing the touch target to the 48dp accessibility floor. */
 @Composable
 private fun ActionChip(icon: ImageVector, label: String, onClick: () -> Unit) {
     Row(
         Modifier
+            .minimumInteractiveComponentSize()
             .clip(CircleShape)
             .background(Acab.bg2, CircleShape)
             .border(1.dp, Acab.line, CircleShape)
@@ -534,9 +679,11 @@ private fun PauseChip(paused: Boolean, onToggle: () -> Unit) {
     val shape = RoundedCornerShape(50)
     Row(
         Modifier
+            .minimumInteractiveComponentSize()
             .clip(shape)
             .then(if (paused) Modifier.background(Acab.accent, shape) else Modifier.border(1.dp, Acab.line, shape))
             .clickable(onClick = onToggle)
+            .semantics { stateDescription = if (paused) "Paused" else "Live" }
             .padding(horizontal = 10.dp, vertical = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(5.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -614,9 +761,11 @@ private fun SegChip(label: String, n: Int, active: Boolean, activeTone: Color = 
     val shape = RoundedCornerShape(50)
     Row(
         Modifier
+            .minimumInteractiveComponentSize()
             .background(if (active) activeTone else Acab.bg2, shape)
             .border(1.dp, if (active) Color.Transparent else Acab.line, shape)
             .clickable(onClick = onClick)
+            .semantics { selected = active }
             .padding(horizontal = 13.dp, vertical = 7.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(5.dp),
@@ -638,16 +787,28 @@ private fun CategoryTile(
     modifier: Modifier = Modifier, onFilter: (String?) -> Unit,
 ) {
     val active = activeKey == key
+    val spokenLabel = when (label) {
+        "TRKR" -> "Tracker"
+        "GLAS" -> "Glasses"
+        "NETCAM" -> "Network camera"
+        "BODY" -> "Body camera"
+        else -> label
+    }
     val shape = RoundedCornerShape(Acab.radiusSm)
     Column(
         modifier
+            .minimumInteractiveComponentSize()
             .background(if (active) type.tone().copy(alpha = 0.12f) else Acab.bg2, shape)
             .border(1.dp, if (active) type.tone().copy(alpha = 0.4f) else Acab.line, shape)
             .clickable { onFilter(if (active) null else key) }
+            .semantics(mergeDescendants = true) {
+                selected = active
+                contentDescription = "$spokenLabel, $n detection${if (n == 1) "" else "s"}"
+            }
             .padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(5.dp),
     ) {
-        Icon(type.icon(), contentDescription = key,
+        Icon(type.icon(), contentDescription = null,
             tint = if (n == 0 && !active) Acab.faint else type.tone(), modifier = Modifier.size(14.dp))
         Text("$n", color = if (n == 0) Acab.faint else Acab.text,
             fontSize = 18.sp, fontWeight = FontWeight.Bold)
@@ -663,7 +824,6 @@ private fun CategoryTile(
 private fun DetectionRow(
     d: Detection,
     timeBasis: TimeBasis?,
-    isNew: Boolean,
     selectMode: Boolean,
     checked: Boolean,
     onClick: () -> Unit,
@@ -690,7 +850,7 @@ private fun DetectionRow(
                 // weight(fill = false) makes the TITLE the flexible child, so Compose measures
                 // the fixed-width siblings first. Without it a long title (a user rename has no
                 // length cap) eats the whole Row and every chip after it is measured at 0dp and
-                // clipped away: no NODE, no EXP, no OFFLINE, no time-basis tag, no new-dot. Those
+                // clipped away: no NODE, no EXP, no OFFLINE, no time-basis tag. Those
                 // chips are exactly what stops a reader trusting a reconstructed timestamp or
                 // mistaking a buffer replay for a live sighting, so losing them is not cosmetic.
                 // This is how SwiftUI's HStack already behaves on the iOS row; Android needed to
@@ -718,7 +878,6 @@ private fun DetectionRow(
                     is TimeBasis.Unknown -> NoTimeTag()
                     else -> Unit
                 }
-                if (isNew) NewDot()
             }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 // how it was seen, like the iOS row: "BLE · OUI match". When the title leads with
@@ -726,9 +885,17 @@ private fun DetectionRow(
                 // maker), the category moves here so it is never absent from the row entirely.
                 // This branch is why the iOS row can afford a maker-led title; Android printed
                 // source·method unconditionally and would have lost the category outright.
+                // weight(fill = false) + maxLines=1, same fix the TITLE row above carries: make
+                // THIS text the flexible child so Compose measures the fixed-size chips (confidence,
+                // the amber GPS-age pill) first and lets the source/method label ellipsize instead.
+                // Without it, a narrow or large-font screen (a Pixel 2 with display size bumped)
+                // overflowed this row: the label wrapped to two lines and the GPS-age pill was
+                // shoved against the RSSI column. The subtitle never got the treatment the title did.
                 Text(if (d.hasName) "${d.type.label} · ${d.methodLabel}"
                      else "${d.sourceLabel} · ${d.methodLabel}",
-                    color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
+                    color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false))
                 // Confidence, so the list answers "definitely something, or just suspected?"
                 // without opening the dossier. Bands match the dossier's verdict copy exactly
                 // (<50 weak / <80 partial / >=80 strong) and iOS DetectionRow.confidenceTint.
@@ -739,9 +906,12 @@ private fun DetectionRow(
                 d.locationAgeText?.let { GpsAgeBadge(it) }
             }
         }
+        // Guaranteed gutter so the middle column's rightmost chip can never kiss the RSSI, even
+        // if its content still runs to the column edge on some future locale/font combination.
+        Spacer(Modifier.size(10.dp))
         Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
             Text("${d.rssi}", color = d.type.tone(), fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold, fontFamily = Acab.mono)
+                fontWeight = FontWeight.SemiBold, fontFamily = Acab.mono, maxLines = 1)
             SignalBars(rssiBars(d.rssi), tint = d.type.tone())
         }
         Spacer(Modifier.size(8.dp))
@@ -750,11 +920,6 @@ private fun DetectionRow(
     }
 }
 
-/** Small crimson dot marking a detection first heard after the "mark all seen" watermark. */
-@Composable
-private fun NewDot() {
-    Box(Modifier.size(7.dp).background(Acab.accent, CircleShape))
-}
 
 /** Sibling of [ReconTag]/[RangeTag] for a record nothing bounds at all: the board logged
  *  only the order of the sighting. Same neutral provenance anatomy; the dossier explains. */
@@ -844,7 +1009,8 @@ private fun SelectBar(count: Int, onCancel: () -> Unit, onSelectAll: () -> Unit,
                 .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(Modifier.size(32.dp).clickable(onClick = onCancel), contentAlignment = Alignment.Center) {
+            Box(Modifier.minimumInteractiveComponentSize().size(32.dp)
+                .clickable(onClick = onCancel), contentAlignment = Alignment.Center) {
                 Icon(Icons.Filled.Close, contentDescription = "Cancel selection",
                     tint = Acab.dim, modifier = Modifier.size(18.dp))
             }
@@ -856,6 +1022,7 @@ private fun SelectBar(count: Int, onCancel: () -> Unit, onSelectAll: () -> Unit,
             // batch-ignoring a filtered pile, not tapping hundreds of rows one by one.
             Row(
                 Modifier
+                    .minimumInteractiveComponentSize()
                     .clip(RoundedCornerShape(50))
                     .border(1.dp, Acab.line, RoundedCornerShape(50))
                     .clickable(onClick = onSelectAll)
@@ -869,6 +1036,7 @@ private fun SelectBar(count: Int, onCancel: () -> Unit, onSelectAll: () -> Unit,
             val enabled = count > 0
             Row(
                 Modifier
+                    .minimumInteractiveComponentSize()
                     .background(if (enabled) Acab.accent else Acab.bg3, RoundedCornerShape(50))
                     .clickable(enabled = enabled, onClick = onIgnore)
                     .padding(horizontal = 14.dp, vertical = 9.dp),
@@ -891,7 +1059,7 @@ private fun SelectBar(count: Int, onCancel: () -> Unit, onSelectAll: () -> Unit,
  *  iOS noMatchState copy so a filtered-to-empty list explains itself; the seg chips and
  *  tiles stay right above it, so clearing the lens is one tap away. */
 @Composable
-private fun NoMatchState(scope: LogScope) {
+private fun NoMatchState(scope: LogScope, catFilter: String? = null) {
     val shape = RoundedCornerShape(Acab.radius)
     val (icon, title, body) = when (scope) {
         LogScope.New -> Triple(
@@ -902,7 +1070,15 @@ private fun NoMatchState(scope: LogScope) {
             Icons.Outlined.Inbox, "Nothing offline",
             "No offline-recorded detections yet. The board buffers these while your phone is away.",
         )
-        LogScope.All -> Triple(
+        // ALPR gets a specific line: a quiet result there means something different, most current
+        // installs are RF-silent (see the site + faq), so absence is expected and the map is the
+        // primary ALPR surface. Mirrors iOS noMatchBody.
+        LogScope.All -> if (catFilter == "ALPR") Triple(
+            Icons.Outlined.FilterAlt, "No ALPR radio signal",
+            "No compatible ALPR radio signal was observed. Some cameras do not broadcast a detectable " +
+                "signal, many backhaul over cellular and stay silent. Check the map for known " +
+                "installations, or export a diagnostic capture to contribute if you can visually confirm one nearby.",
+        ) else Triple(
             Icons.Outlined.FilterAlt, "No matches",
             "No detections in this category yet.",
         )

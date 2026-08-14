@@ -7,7 +7,8 @@
      the detections file (MACs, capture GPS, timestamps), the ALPR dataset cache, the osmdroid tile
      cache, and SharedPreferences, which include the key material the app pushes to boards for the
      offline buffer. None of it should ever ride Google's cloud backup or a device-to-device
-     transfer: the whole product promise is that the log lives on the phone and nowhere else.
+     transfer. This is a backup boundary, not a claim about BLE board traffic, provider requests,
+     or exports the user explicitly starts.
 
      android:allowBackup="false" in the manifest already blocks this, but release lint wants the
      rule files present, and a future allowBackup flip must not silently start exporting data. -->

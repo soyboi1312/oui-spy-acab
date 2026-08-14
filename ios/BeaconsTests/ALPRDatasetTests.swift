@@ -44,7 +44,9 @@ final class ALPRDatasetTests: XCTestCase {
     // Assembles a file the way soyboi.tech/tools/build_alpr_dataset.py assembles one:
     // magic | epochDay:u32 | count:u32 | [nMakers:u8 | nMakers*(len:u8, utf8)]
     //   | count*(latE7:i32, lonE7:i32) | [count*(makerIdx:u8)] | [count*(tier:u8)]
-    // all little-endian. ALP1 omits both bracketed blocks, ALP2 omits the tier block.
+    //   | [count*(osmType:u8, osmID:u64, sourceEpoch:u32, directionCdeg:u16, checkDay:u32)]
+    // all little-endian. ALP1 omits all bracketed blocks, ALP2 omits tier and metadata,
+    // and ALP3 omits metadata.
 
     /// One node as the generator emits it. `maker` indexes the file's own table, `tier` is 1 when
     /// the OSM mapper picked the manufacturer from an editor preset.
@@ -53,6 +55,11 @@ final class ALPRDatasetTests: XCTestCase {
         var lon: Double
         var maker: UInt8 = 0
         var tier: UInt8 = 1
+        var osmType: UInt8 = 0
+        var osmID: UInt64 = 1
+        var sourceEpoch: UInt32 = 0
+        var directionCdeg: UInt16 = .max
+        var checkDateDay: UInt32 = 0
     }
 
     /// The table every fixture uses unless it says otherwise. Index 0 is "" (unknown) because the
@@ -64,10 +71,11 @@ final class ALPRDatasetTests: XCTestCase {
     /// ten-millionth of a degree south of where it reads here.
     private func e7(_ d: Double) -> Int32 { Int32((d * 1e7).rounded()) }
 
-    private func alp(_ magic: String, makers: [String] = ALPRDatasetTests.table, nodes: [Node]) -> Data {
+    private func alp(_ magic: String, makers suppliedMakers: [String]? = nil, nodes: [Node]) -> Data {
         // The builder keys off the magic string exactly as the parser does, so a fixture that
         // relabels the magic gets a body that no longer matches it. Several tests below depend on
         // that: it is how the original incident is reproduced.
+        let makers = suppliedMakers ?? Self.table
         let hasMakers = magic != "ALP1"
         var d = Data(magic.utf8)
         d.append(u32: 20_285)                  // epochDay, read by nothing, present in every file
@@ -82,7 +90,16 @@ final class ALPRDatasetTests: XCTestCase {
         }
         for n in nodes { d.append(i32: e7(n.lat)); d.append(i32: e7(n.lon)) }
         if hasMakers { for n in nodes { d.append(n.maker) } }
-        if magic == "ALP3" { for n in nodes { d.append(n.tier) } }
+        if magic == "ALP3" || magic == "ALP4" { for n in nodes { d.append(n.tier) } }
+        if magic == "ALP4" {
+            for n in nodes {
+                d.append(n.osmType)
+                d.append(u64: n.osmID)
+                d.append(u32: n.sourceEpoch)
+                d.append(u16: n.directionCdeg)
+                d.append(u32: n.checkDateDay)
+            }
+        }
         return d
     }
 
@@ -102,7 +119,99 @@ final class ALPRDatasetTests: XCTestCase {
         XCTAssertEqual(c.longitude, lon, accuracy: 5e-8, file: file, line: line)
     }
 
-    // MARK: The three magics
+    // MARK: The four magics
+
+    func testValidALP4RoundTripAndMetadata() {
+        let nodes = [
+            Node(lat: 32.7157, lon: -117.1611, maker: 1, tier: 1,
+                 osmType: 0, osmID: 123, sourceEpoch: 1_754_352_000,
+                 directionCdeg: 27_050, checkDateDay: 20_305),
+            Node(lat: 32.7200, lon: -117.1700, maker: 2, tier: 2,
+                 osmType: 1, osmID: 456, sourceEpoch: 0,
+                 directionCdeg: .max, checkDateDay: 0),
+        ]
+        guard let p = ALPRStore.parseDetailed(alp("ALP4", nodes: nodes)) else {
+            return XCTFail("a well-formed ALP4 file was rejected")
+        }
+        XCTAssertEqual(p.rawCount, 2)
+        XCTAssertEqual(p.wireFormat, "ALP4")
+        XCTAssertEqual(p.makers, ["Flock Safety", "Genetec"])
+        XCTAssertEqual(p.confirmed, [true, false])
+        XCTAssertEqual(p.metadata[0].osmType, 0)
+        XCTAssertEqual(p.metadata[0].osmID, 123)
+        XCTAssertEqual(p.metadata[0].sourceEpoch, 1_754_352_000)
+        XCTAssertEqual(p.metadata[0].directionCdeg, 27_050)
+        XCTAssertEqual(p.metadata[0].checkDateDay, 20_305)
+        XCTAssertEqual(p.metadata[0].attributionTier, 1)
+        XCTAssertEqual(p.metadata[1].osmType, 1)
+        XCTAssertEqual(p.metadata[1].osmID, 456)
+        XCTAssertNil(p.metadata[1].sourceEpoch)
+        XCTAssertNil(p.metadata[1].directionCdeg)
+        XCTAssertNil(p.metadata[1].checkDateDay)
+        XCTAssertEqual(p.metadata[1].attributionTier, 2)
+    }
+
+    func testSameDateCannotMakeAnALP3CacheSatisfyAnALP4Manifest() {
+        XCTAssertFalse(ALPRStore.cacheFormatMatches(manifestFormat: "ALP4", loadedFormat: "ALP3"))
+        XCTAssertTrue(ALPRStore.cacheFormatMatches(manifestFormat: "ALP4", loadedFormat: "alp4"))
+        XCTAssertTrue(ALPRStore.cacheFormatMatches(manifestFormat: nil, loadedFormat: "ALP3"))
+
+        let old = String(repeating: "a", count: 64)
+        let new = String(repeating: "b", count: 64)
+        XCTAssertFalse(ALPRStore.cacheIdentityMatches(
+            manifestUpdated: "2026-08-10", manifestSHA: new, manifestFormat: "ALP4",
+            storedUpdated: "2026-08-10", storedSHA: old, loadedSHA: old, loadedFormat: "ALP4"))
+        XCTAssertTrue(ALPRStore.cacheIdentityMatches(
+            manifestUpdated: "2026-08-10", manifestSHA: new, manifestFormat: "ALP4",
+            storedUpdated: "2026-08-10", storedSHA: new, loadedSHA: new, loadedFormat: "ALP4"))
+    }
+
+    func testManifestChannelsRequireTheirOwnWireFormat() {
+        XCTAssertTrue(ALPRStore.channelFormatMatches(
+            declaredFormat: "ALP4", expectedFormat: "ALP4",
+            allowsMissingDeclaredFormat: false, loadedFormat: "ALP4"))
+        XCTAssertFalse(ALPRStore.channelFormatMatches(
+            declaredFormat: nil, expectedFormat: "ALP4",
+            allowsMissingDeclaredFormat: false, loadedFormat: "ALP4"))
+        XCTAssertFalse(ALPRStore.channelFormatMatches(
+            declaredFormat: "ALP4", expectedFormat: "ALP4",
+            allowsMissingDeclaredFormat: false, loadedFormat: "ALP3"))
+
+        // The old V3 publisher omitted data.format, but its bytes must still be ALP3.
+        XCTAssertTrue(ALPRStore.channelFormatMatches(
+            declaredFormat: nil, expectedFormat: "ALP3",
+            allowsMissingDeclaredFormat: true, loadedFormat: "ALP3"))
+        XCTAssertFalse(ALPRStore.channelFormatMatches(
+            declaredFormat: nil, expectedFormat: "ALP3",
+            allowsMissingDeclaredFormat: true, loadedFormat: "ALP2"))
+    }
+
+    func testAttributionCopyDistinguishesCanonicalAndLegacyMakerStates() {
+        XCTAssertEqual(ALPRAttribution.detail(tier: 0, maker: ""),
+                       "canonical ALPR tag, but no structured manufacturer is recorded")
+        XCTAssertEqual(ALPRAttribution.detail(tier: 2, maker: "Flock Safety"),
+                       "legacy or alternate tagging; the maker attribution is not confirmed")
+        XCTAssertFalse(ALPRAttribution.detail(tier: 2, maker: "Flock Safety")
+            .contains("no manufacturer"))
+        XCTAssertTrue(ALPRAttribution.accessibilityLabel(tier: 2, maker: "Flock Safety")
+            .contains("legacy-tag"))
+    }
+
+    func testStableOSMIdentityKeepsColocatedCamerasDistinct() {
+        let coordinate = CLLocationCoordinate2D(latitude: 32.7157, longitude: -117.1611)
+        let first = ALPRStore.NodeMetadata(
+            osmType: 0, osmID: 42, sourceEpoch: nil, directionCdeg: nil,
+            checkDateDay: nil, attributionTier: 1)
+        let second = ALPRStore.NodeMetadata(
+            osmType: 1, osmID: 42, sourceEpoch: nil, directionCdeg: nil,
+            checkDateDay: nil, attributionTier: 1)
+        XCTAssertNotEqual(
+            ALPRStore.stableNodeID(index: 0, coordinate: coordinate, metadata: first),
+            ALPRStore.stableNodeID(index: 0, coordinate: coordinate, metadata: second))
+        XCTAssertNotEqual(
+            ALPRStore.stableNodeID(index: 0, coordinate: coordinate, metadata: nil),
+            ALPRStore.stableNodeID(index: 1, coordinate: coordinate, metadata: nil))
+    }
 
     func testValidALP3RoundTrip() {
         guard let p = ALPRStore.parse(alp("ALP3", nodes: Self.threeNodes)) else {
@@ -161,7 +270,7 @@ final class ALPRDatasetTests: XCTestCase {
         // A zero-node file is legal, not a malformation. It has to stay distinguishable from a
         // reject: a reject returns before the version key is stamped and re-downloads forever,
         // whereas an empty dataset is simply a region with nothing mapped in it.
-        for magic in ["ALP1", "ALP2", "ALP3"] {
+        for magic in ["ALP1", "ALP2", "ALP3", "ALP4"] {
             guard let p = ALPRStore.parse(alp(magic, nodes: [])) else {
                 return XCTFail("\(magic) with count 0 was rejected")
             }
@@ -174,10 +283,10 @@ final class ALPRDatasetTests: XCTestCase {
     // MARK: The header
 
     func testBadMagicIsRejected() {
-        // ALP4 is the one that matters: it is what a future format looks like arriving at today's
+        // ALP5 is the one that matters: it is what a future format looks like arriving at today's
         // build, and rejecting it is correct. The lowercase and empty cases pin that the check is
         // on bytes, not on a case-insensitive string compare someone might "tidy" it into.
-        for magic in ["ALP4", "ALP0", "alp3", "XXXX", "APL3"] {
+        for magic in ["ALP5", "ALP0", "alp3", "XXXX", "APL3"] {
             XCTAssertNil(ALPRStore.parse(alp(magic, nodes: Self.threeNodes)), magic)
         }
         XCTAssertNil(ALPRStore.parse(Data()))
@@ -288,6 +397,26 @@ final class ALPRDatasetTests: XCTestCase {
         XCTAssertNil(ALPRStore.parse(v3BodyAsV2))
     }
 
+    func testALP4RejectsInvalidMetadataAndTruncation() {
+        let base = Node(lat: 32.7157, lon: -117.1611, maker: 1, tier: 1,
+                        osmType: 0, osmID: 12, sourceEpoch: 100,
+                        directionCdeg: 900, checkDateDay: 20_000)
+        var invalidType = base
+        invalidType.osmType = 3
+        XCTAssertNil(ALPRStore.parseDetailed(alp("ALP4", nodes: [invalidType])))
+        var zeroID = base
+        zeroID.osmID = 0
+        XCTAssertNil(ALPRStore.parseDetailed(alp("ALP4", nodes: [zeroID])))
+        var invalidDirection = base
+        invalidDirection.directionCdeg = 36_000
+        XCTAssertNil(ALPRStore.parseDetailed(alp("ALP4", nodes: [invalidDirection])))
+        var invalidTier = base
+        invalidTier.tier = 3
+        XCTAssertNil(ALPRStore.parseDetailed(alp("ALP4", nodes: [invalidTier])))
+        let valid = alp("ALP4", nodes: [base])
+        XCTAssertNil(ALPRStore.parseDetailed(valid.prefix(valid.count - 1)))
+    }
+
     // MARK: Coordinates
 
     func testOutOfRangeCoordIsDroppedWithItsMakerAndTier() {
@@ -332,15 +461,44 @@ final class ALPRDatasetTests: XCTestCase {
         let justPast = [Node(lat: 90.0000001, lon: 180.0), Node(lat: -90.0, lon: -180.0000001)]
         XCTAssertEqual(ALPRStore.parse(alp("ALP3", nodes: justPast))?.coords.count, 0)
     }
+
+    func testALP4DropsInvalidCoordinateAndItsMetadataTogether() {
+        let good = Node(lat: 32.7157, lon: -117.1611, maker: 1, tier: 1,
+                        osmType: 0, osmID: 10)
+        let invalid = Node(lat: 91, lon: -117, maker: 2, tier: 2,
+                           osmType: 2, osmID: 20)
+        let last = Node(lat: 32.73, lon: -117.18, maker: 3, tier: 0,
+                        osmType: 1, osmID: 30)
+        let parsed = ALPRStore.parseDetailed(alp("ALP4", nodes: [good, invalid, last]))
+        XCTAssertEqual(parsed?.coords.count, 2)
+        XCTAssertEqual(parsed?.makers, ["Flock Safety", "Neology"])
+        XCTAssertEqual(parsed?.metadata.map(\.osmID), [10, 30])
+    }
+
+    func testDatasetURLAllowlistRejectsRedirectAndCredentialEscapes() {
+        XCTAssertTrue(ALPRStore.isAllowedDatasetURL(URL(string: "https://soyboi.tech/data/alpr.bin")))
+        XCTAssertTrue(ALPRStore.isAllowedDatasetURL(URL(string: "https://soyboi.tech:443/data/alpr.bin")))
+        XCTAssertFalse(ALPRStore.isAllowedDatasetURL(URL(string: "http://soyboi.tech/data/alpr.bin")))
+        XCTAssertFalse(ALPRStore.isAllowedDatasetURL(URL(string: "https://www.soyboi.tech/data/alpr.bin")))
+        XCTAssertFalse(ALPRStore.isAllowedDatasetURL(URL(string: "https://soyboi.tech.evil.test/alpr.bin")))
+        XCTAssertFalse(ALPRStore.isAllowedDatasetURL(URL(string: "https://user@soyboi.tech/alpr.bin")))
+        XCTAssertFalse(ALPRStore.isAllowedDatasetURL(URL(string: "https://soyboi.tech:444/alpr.bin")))
+    }
 }
 
 // Little-endian writers for the fixture builder. Deliberately hand-rolled rather than reached for
 // via withUnsafeBytes: the file format is defined as bytes on a wire, and a test that inherited the
 // host's endianness would agree with a parser that had done the same thing wrong.
 private extension Data {
+    mutating func append(u16 v: UInt16) {
+        append(contentsOf: [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF)])
+    }
     mutating func append(u32 v: UInt32) {
         append(contentsOf: [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF),
                             UInt8((v >> 16) & 0xFF), UInt8((v >> 24) & 0xFF)])
+    }
+    mutating func append(u64 v: UInt64) {
+        append(contentsOf: (0..<8).map { UInt8((v >> UInt64($0 * 8)) & 0xFF) })
     }
     mutating func append(i32 v: Int32) { append(u32: UInt32(bitPattern: v)) }
 }

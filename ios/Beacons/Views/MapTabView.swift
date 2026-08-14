@@ -33,12 +33,16 @@ struct MapTabView: View {
     @State private var cluster: Cluster?         // tapped multi-member bubble (drives the picker sheet)
     @State private var showALPRInfo = false      // tapped a known-ALPR dot: show the shared credit callout (one overlay, never a per-dot popover)
     @State private var tappedALPRMaker = ""      // the maker of the last-tapped dot ("" = unknown), shown in that callout
-    @State private var tappedALPRConfirmed = true  // tier of the last-tapped dot; drives the callout's wording + tone
+    @State private var tappedALPRTier: UInt8 = 1  // raw ALP tier; drives the callout's wording + tone
     @State private var span: MKCoordinateSpan = .init(latitudeDelta: 0.02, longitudeDelta: 0.02)
     @State private var region = MKCoordinateRegion(center: .init(latitude: 0, longitude: 0),
                                                    span: .init(latitudeDelta: 0.02, longitudeDelta: 0.02))
     @State private var emptyDismissed = false
     @State private var legendExpanded = false     // F18: legend rests as a small info chip
+    @State private var showLayersPanel = false    // the LAYERS popover (known-ALPR dataset layer)
+    // One-shot camera fit to the located detections' bounding region (see fitToDetections).
+    // Also set when a dossier handoff places the camera, so the fit never yanks it away.
+    @State private var didFitToDetections = false
     @AppStorage("map.showBreadcrumbs") private var showBreadcrumbs = true    // tracker trails on the map (persisted)
     @AppStorage("map.showLabels") private var showLabels = false             // pin captions, off for a cleaner map (persisted)
     @State private var mapSettingsOpen = false    // the on-map settings dropdown
@@ -65,7 +69,7 @@ struct MapTabView: View {
             return
         }
         let next = alpr.nodes(in: region, cap: 500).map {
-            ALPRPoint(coord: $0.coord, maker: $0.maker, confirmed: $0.confirmed)
+            ALPRPoint(id: $0.id, coord: $0.coord, maker: $0.maker, tier: $0.tier)
         }
         // ALPRPoint is Equatable: an unchanged viewport costs zero @State writes / zero invalidations.
         if next != alprVisible { alprVisible = next }
@@ -275,9 +279,9 @@ struct MapTabView: View {
                 if showALPRInfo {
                     Button { withAnimation(.easeOut(duration: 0.15)) { showALPRInfo = false } } label: {
                         HStack(spacing: 6) {
-                            Circle().strokeBorder((tappedALPRConfirmed ? ACABTheme.flockTone : ACABTheme.warn).opacity(0.95),
+                            Circle().strokeBorder((tappedALPRTier == 1 ? ACABTheme.flockTone : ACABTheme.warn).opacity(0.95),
                                                   style: StrokeStyle(lineWidth: 2,
-                                                                     dash: tappedALPRConfirmed ? [] : [2, 1.8]))
+                                                                     dash: tappedALPRTier == 1 ? [] : [2, 1.8]))
                                 .frame(width: 9, height: 9)
                             // The line the journalist needed: a pin is a MAPPED LOCATION, not a
                             // live detection, and most fixed ALPRs backhaul over cellular so they
@@ -289,23 +293,19 @@ struct MapTabView: View {
                                 // ALPR" for a hand-typed name, contradicting the second line
                                 // directly beneath it. The maker is still shown when we have one:
                                 // an unverified node's NAME is the doubtful part, not its presence.
-                                Text(!tappedALPRConfirmed
-                                     ? (tappedALPRMaker.isEmpty
-                                        ? "unverified ALPR · community mapped"
-                                        : "\(tappedALPRMaker)? · unverified, community mapped")
-                                     : (tappedALPRMaker.isEmpty
-                                        ? "known ALPR · sourced from DeFlock"
-                                        : "\(tappedALPRMaker) · known ALPR, via DeFlock"))
+                                Text(ALPRAttribution.headline(
+                                    tier: tappedALPRTier, maker: tappedALPRMaker))
                                     .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
-                                Text(tappedALPRConfirmed
-                                     ? "a mapped location, not a live detection"
-                                     : "no manufacturer recorded, so it may be misidentified or gone")
+                                Text(ALPRAttribution.detail(
+                                    tier: tappedALPRTier, maker: tappedALPRMaker))
                                     .font(ACABTheme.mono(9)).foregroundStyle(ACABTheme.faint)
                             }
                         }
                         .padding(.horizontal, 12).padding(.vertical, 7)
                         .background(.ultraThinMaterial, in: Capsule())
                         .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .padding(.bottom, 60)
@@ -331,11 +331,69 @@ struct MapTabView: View {
             // our own presented dossier so it isn't in the way, then fly. The sheet
             // dismisses itself, but the regular-width inspector has no dismiss of its
             // own, so the clear here is what closes it.
-            .onAppear { consumePendingFocus() }
+            // Focus is consumed BEFORE the detections fit so an explicit handoff always wins.
+            .onAppear {
+                consumePendingFocus()
+                fitToDetections()
+            }
+            // Late first fix: the tab opened before anything was locatable. One-shot, so it
+            // can never fight a user pan after it has fired once.
+            .onChange(of: ble.detections.count) { _, _ in fitToDetections() }
+            // Demo seeds re-place around the user when the first GPS fix arrives - same COUNT,
+            // new coordinates - so the hook above never fires and a one-shot fit taken on the
+            // authored-city coords would strand the camera over six invisible pins (the exact
+            // "5 sightings, no pins" bug). Demo only: live detections never teleport, and the
+            // demo store is six rows, so re-arming the fit there is cheap and safe.
+            .onChange(of: ble.detections) { _, _ in
+                guard ble.demoMode else { return }
+                didFitToDetections = false
+                fitToDetections()
+            }
             .onReceive(NotificationCenter.default.publisher(for: MapFocus.notification)) { _ in
                 selected = nil
                 consumePendingFocus()
             }
+        }
+    }
+
+    /// Frame the camera to the located detections' bounding region, exactly once per tab life.
+    /// This runs BEFORE the hard-coded city fallback can matter, which is the fix for the demo
+    /// bug where the header said "5 sightings" over an empty viewport: the seeds sat in one city
+    /// while .userLocation's fallback framed another, and nothing ever reconciled them. The 40%
+    /// margin plus a 0.01-degree floor keeps a tight clump (the demo seeds span ~0.005 degrees)
+    /// comfortably inside the frame, single points get a neighborhood-scale view. A history that
+    /// spans more than 1 degree on either axis (a road trip, weeks of driving) gets the OPPOSITE
+    /// treatment: a full-bbox fit would open on a useless continent-scale wash of pins, so frame
+    /// the MOST RECENT located detection at street scale instead - the newest sighting is what
+    /// the user opened the tab to see.
+    private func fitToDetections() {
+        guard !didFitToDetections, MapFocus.pending == nil else { return }
+        let coords = ble.detections.compactMap { mapCoord(for: $0) }
+        guard let first = coords.first else { return }
+        didFitToDetections = true
+        var minLat = first.latitude,  maxLat = first.latitude
+        var minLon = first.longitude, maxLon = first.longitude
+        for c in coords.dropFirst() {
+            minLat = min(minLat, c.latitude);  maxLat = max(maxLat, c.latitude)
+            minLon = min(minLon, c.longitude); maxLon = max(maxLon, c.longitude)
+        }
+        // Continent-wide history: `first` IS the most recent located detection (detections is
+        // sorted newest-first and compactMap preserves order), so center on it at 0.02 degrees
+        // (~2 km, a recognizable neighborhood) rather than fitting the whole bbox.
+        if maxLat - minLat > 1.0 || maxLon - minLon > 1.0 {
+            withAnimation(.easeInOut(duration: 0.5)) {
+                camera = .region(MKCoordinateRegion(
+                    center: first,
+                    span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)))
+            }
+            return
+        }
+        let center = CLLocationCoordinate2D(latitude: (minLat + maxLat) / 2,
+                                            longitude: (minLon + maxLon) / 2)
+        let span = MKCoordinateSpan(latitudeDelta: max((maxLat - minLat) * 1.4, 0.01),
+                                    longitudeDelta: max((maxLon - minLon) * 1.4, 0.01))
+        withAnimation(.easeInOut(duration: 0.5)) {
+            camera = .region(MKCoordinateRegion(center: center, span: span))
         }
     }
 
@@ -344,10 +402,12 @@ struct MapTabView: View {
 
     /// Consume the one-shot dossier handoff, if any: fly the camera to the stashed
     /// coordinate at city-block zoom. Called from onAppear (cold tab) and the MapFocus
-    /// notification (warm tab); the nil-out makes it exactly-once.
+    /// notification (warm tab); the nil-out makes it exactly-once. Also retires the
+    /// detections fit: an explicit handoff placed the camera deliberately.
     private func consumePendingFocus() {
         guard let coord = MapFocus.pending else { return }
         MapFocus.pending = nil
+        didFitToDetections = true
         withAnimation(.easeInOut(duration: 0.6)) {
             camera = .region(MKCoordinateRegion(center: coord, span: Self.focusSpan))
         }
@@ -364,10 +424,14 @@ struct MapTabView: View {
                 Annotation("", coordinate: p.coord) {
                     Button {
                         tappedALPRMaker = p.maker
-                        tappedALPRConfirmed = p.confirmed
+                        tappedALPRTier = p.tier
                         withAnimation(.easeOut(duration: 0.15)) { showALPRInfo = true }
                     } label: { ALPRDot(confirmed: p.confirmed) }
                         .buttonStyle(.plain)
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle())
+                        .accessibilityLabel(alprAccessibilityLabel(p))
+                        .accessibilityHint("Shows information about this mapped camera")
                 }
             }
             // Tracker breadcrumb trails: the phone's path while a separated tracker stayed with
@@ -386,6 +450,10 @@ struct MapTabView: View {
                     Annotation(showLabels ? d.type.shortTag : "", coordinate: coord) {
                         Button { selected = d } label: { MapPin(type: d.type, animated: snap.pinsAnimated) }
                             .buttonStyle(.plain)
+                            .frame(minWidth: 44, minHeight: 44)
+                            .contentShape(Rectangle())
+                            .accessibilityLabel(pinAccessibilityLabel(d))
+                            .accessibilityHint("Opens detection details")
                     }
                 }
                 if let pilot = d.pilotCoordinate {
@@ -399,6 +467,10 @@ struct MapTabView: View {
                         MapPin(type: p.detection.type, animated: snap.pinsAnimated)
                     }
                     .buttonStyle(.plain)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+                    .accessibilityLabel(pinAccessibilityLabel(p.detection))
+                    .accessibilityHint("Opens detection details")
                 }
             }
             // Clusterable hits: grid-clustered bubbles. A lone member renders as a normal
@@ -408,9 +480,17 @@ struct MapTabView: View {
                     if let only = c.single {
                         Button { selected = only } label: { MapPin(type: only.type, animated: snap.pinsAnimated) }
                             .buttonStyle(.plain)
+                            .frame(minWidth: 44, minHeight: 44)
+                            .contentShape(Rectangle())
+                            .accessibilityLabel(pinAccessibilityLabel(only))
+                            .accessibilityHint("Opens detection details")
                     } else {
                         Button { cluster = c } label: { ClusterBubble(cluster: c) }
                             .buttonStyle(.plain)
+                            .frame(minWidth: 44, minHeight: 44)
+                            .contentShape(Rectangle())
+                            .accessibilityLabel(clusterAccessibilityLabel(c))
+                            .accessibilityHint("Opens the detections in this area")
                     }
                 }
             }
@@ -444,7 +524,59 @@ struct MapTabView: View {
         .onChange(of: alpr.showUnverified) { _, _ in refreshALPRVisible() }
         .onChange(of: alpr.nodes.count) { _, _ in refreshALPRVisible() }
         .onAppear { refreshALPRVisible() }
+        // VoiceOver summary of what the pins carry: a silent map reads as an empty one.
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(mapAccessibilityLabel(snap))
         .ignoresSafeArea()
+    }
+
+    /// One spoken sentence carrying the map's actual state: the pin content for VoiceOver
+    /// users, or which of the two empty stories (permission vs nothing located) applies.
+    private func mapAccessibilityLabel(_ snap: MapSnapshot) -> String {
+        if snap.totalLocated == 0 {
+            if ble.locationDenied && !ble.demoMode {
+                return "Map. Your phone cannot add observer locations while Location is off. Drones that broadcast Remote ID coordinates can still appear."
+            }
+            return "Map. No located detections yet."
+        }
+        let shown = displayedLocatedCount(snap)
+        let filtered = filter.map { " filtered to \($0.lowercased())" } ?? ""
+        return "Map showing \(shown) located detection\(shown == 1 ? "" : "s")\(filtered)."
+    }
+
+    private func pinAccessibilityLabel(_ d: Detection) -> String {
+        let type = spokenType(d.type)
+        let name = d.displayName == d.type.label ? type : "\(d.displayName), \(type)"
+        return "\(name). Signal strength \(d.rssi) decibels relative to one milliwatt."
+    }
+
+    private func spokenType(_ type: DeviceType) -> String {
+        switch type {
+        case .flockCamera:      return "automatic license plate reader camera"
+        case .flockRaven:       return "Flock Raven audio sensor"
+        case .axonBodyCam:      return "body camera"
+        case .drone:            return "drone with remote identification"
+        case .tracker:          return "item tracker"
+        case .nearbyDevice:     return "nearby device"
+        case .watched:          return "watched device"
+        case .recordingGlasses: return "recording glasses"
+        case .networkCamera:    return "network camera"
+        case .unknown:          return "unknown device"
+        }
+    }
+
+    private func alprAccessibilityLabel(_ point: ALPRPoint) -> String {
+        ALPRAttribution.accessibilityLabel(tier: point.tier, maker: point.maker)
+    }
+
+    private func clusterAccessibilityLabel(_ cluster: Cluster) -> String {
+        let groups = Dictionary(grouping: cluster.members, by: { spokenType($0.type) })
+            .map { type, rows in
+                rows.count == 1 ? "one \(type)" : "\(rows.count) detections of type \(type)"
+            }
+            .sorted()
+            .joined(separator: ", ")
+        return "\(cluster.members.count) detections in this area: \(groups)"
     }
 
     /// Drone-only overlays: the flight-path line, a launch marker at the first fix,
@@ -496,25 +628,33 @@ struct MapTabView: View {
     }
 
     private func header(_ snap: MapSnapshot) -> some View {
-        HStack(alignment: .firstTextBaseline) {
+        let shown = displayedLocatedCount(snap)
+        return HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Map").font(ACABTheme.display(26, weight: .semibold)).foregroundStyle(ACABTheme.text)
-                Kicker("\(snap.totalLocated) SIGHTING\(snap.totalLocated == 1 ? "" : "S")")
+                Kicker("\(shown) SIGHTING\(shown == 1 ? "" : "S")")
             }
             Spacer()
             LinkChip(version: ble.status?.version, connected: ble.connectionState == .connected, demo: ble.demoMode)
         }
     }
 
-    /// Scrolling category chips; tap one to narrow the pins. The ALL chip, the known-ALPR
-    /// layer toggle, and their divider are ALWAYS present; the category chips after them are
-    /// dynamic (see `shownCategories`).
+    /// The header and spoken map summary describe the active filter, not the all-category total
+    /// hidden behind it. Filter chips retain unfiltered counts so switching remains informative.
+    private func displayedLocatedCount(_ snap: MapSnapshot) -> Int {
+        guard let filter else { return snap.totalLocated }
+        return snap.counts[filter] ?? 0
+    }
+
+    /// Scrolling category chips; tap one to narrow the pins. The ALL chip, the LAYERS control,
+    /// and their divider are ALWAYS present; the category chips after them are dynamic (see
+    /// `shownCategories`).
     private func filterBar(_ snap: MapSnapshot) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 chip(nil, "ALL", snap.totalLocated)
-                cameraLayerChip   // known-camera layer sits up front (after ALL) so it is found without scrolling
-                Rectangle().fill(ACABTheme.line).frame(width: 1, height: 18).padding(.horizontal, 2)   // divider: layer toggle vs category filters
+                layersChip   // reference layers sit up front (after ALL) so they are found without scrolling
+                Rectangle().fill(ACABTheme.line).frame(width: 1, height: 18).padding(.horizontal, 2)   // divider: layers vs category filters
                 ForEach(shownCategories(snap)) { c in
                     chip(c.key, c.chipLabel, snap.counts[c.key] ?? 0)
                 }
@@ -551,6 +691,9 @@ struct MapTabView: View {
                 .frame(width: 38, height: 38)
                 .background(.ultraThinMaterial, in: Circle())
                 .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+                // 44pt hit target around the 38pt chip.
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
         }
         .accessibilityLabel("Center on my location")
     }
@@ -567,9 +710,13 @@ struct MapTabView: View {
                 .frame(width: 34, height: 34)
                 .background(.ultraThinMaterial, in: Circle())
                 .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+                // 44pt hit target around the 34pt chip.
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Map settings")
+        .accessibilityValue(mapSettingsOpen ? "expanded" : "collapsed")
     }
 
     /// The map settings dropdown: persisted toggles plus the known-ALPR layer row, styled like
@@ -607,7 +754,7 @@ struct MapTabView: View {
                     if alpr.unverifiedCount > 0 {
                         Toggle(isOn: Binding(get: { alpr.showUnverified },
                                              set: { alpr.setShowUnverified($0) })) {
-                            Text("unconfirmed pins").font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.faint)
+                            Text("lower-confidence pins").font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.faint)
                         }
                         Text(alprUnverifiedLine)
                             .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
@@ -645,8 +792,8 @@ struct MapTabView: View {
     private var alprUnverifiedLine: String {
         let n = alpr.unverifiedCount.formatted()
         return alpr.showUnverified
-            ? "showing \(n) pin\(alpr.unverifiedCount == 1 ? "" : "s") with no manufacturer recorded, drawn hollow. some are not cameras."
-            : "\(n) pin\(alpr.unverifiedCount == 1 ? "" : "s") name no manufacturer and are hidden. some of those are not cameras."
+            ? "showing \(n) pin\(alpr.unverifiedCount == 1 ? "" : "s") without structured manufacturer attribution or from legacy aliases, drawn hollow. some are not cameras."
+            : "\(n) lower-confidence pin\(alpr.unverifiedCount == 1 ? "" : "s") are hidden. some are not cameras."
     }
 
     /// Manual dataset refresh, mirroring the firmware "check for updates" row in Settings at
@@ -677,7 +824,10 @@ struct MapTabView: View {
             .foregroundStyle(alprCheckSucceeded ? ACABTheme.accent : ACABTheme.dim)
         }
         .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .contentShape(Rectangle())
         .disabled(alprChecking || alpr.loading)
+        .accessibilityLabel("Check automatic license plate reader map data for updates")
     }
 
     /// True in the brief post-check window when the check actually completed (fresh data or
@@ -701,7 +851,8 @@ struct MapTabView: View {
 
     /// Short "checked X ago" tail, same buckets the detail screen's relativeAgo speaks in.
     private func checkedAgo(_ date: Date) -> String {
-        let secs = max(0, Int(Date().timeIntervalSince(date)))
+        // Non-trapping, same as relativeAgo: a bad persisted Date degrades, never crashes.
+        let secs = max(0, Int(exactly: Date().timeIntervalSince(date).rounded(.down)) ?? Int.max)
         switch secs {
         case ..<60:       return "just now"
         case ..<3600:     return "\(secs / 60)m ago"
@@ -723,25 +874,62 @@ struct MapTabView: View {
         return out.string(from: d)
     }
 
-    /// Toggle for the known-ALPR reference layer. Distinct from the category filters (it adds a
-    /// layer rather than narrowing pins). First tap opts in and downloads the dataset.
-    private var cameraLayerChip: some View {
-        Button { alpr.setEnabled(!alpr.enabled); if alpr.enabled { alpr.refresh() } } label: {
+    /// Entry to the map's reference LAYERS. This replaced the old "ALPR MAP" chip, which sat in
+    /// the filter row and looked like a seventh filter while actually opting into a dataset
+    /// download - a category of action the row's other chips never take. Same capsule anatomy,
+    /// but named for what it holds, and the toggle inside the popover says what enabling costs
+    /// (an offline download) before anything is fetched. Fill tracks the layer being on so the
+    /// collapsed chip still shows the state at a glance.
+    private var layersChip: some View {
+        Button { showLayersPanel = true } label: {
             HStack(spacing: 5) {
                 if alpr.loading {
                     ProgressView().controlSize(.mini).tint(alpr.enabled ? ACABTheme.onAccent : ACABTheme.dim)
                 } else {
-                    Image(systemName: alpr.enabled ? "mappin.circle.fill" : "mappin.circle")
+                    Image(systemName: "square.3.layers.3d")
                         .font(.system(size: 11, weight: .bold))
                 }
-                Text("ALPR MAP").font(ACABTheme.mono(10.5, weight: .bold)).tracking(0.5)
+                Text("LAYERS").font(ACABTheme.mono(10.5, weight: .bold)).tracking(0.5)
             }
             .foregroundStyle(alpr.enabled ? ACABTheme.onAccent : ACABTheme.dim)
             .padding(.horizontal, 11).padding(.vertical, 7)
             .background(alpr.enabled ? ACABTheme.flockTone : ACABTheme.bg2, in: Capsule())
             .overlay(Capsule().strokeBorder(alpr.enabled ? .clear : ACABTheme.line, lineWidth: 1))
+            // 44pt hit target; drawn capsule unchanged.
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel("Map layers")
+        .accessibilityValue(alpr.enabled ? "known automatic license plate reader cameras layer on" : "no layers on")
+        .popover(isPresented: $showLayersPanel) {
+            layersPanel.presentationCompactAdaptation(.popover)
+        }
+    }
+
+    /// The LAYERS popover: the known-ALPR toggle plus the one line explaining that turning it
+    /// on downloads an offline dataset. The map-settings panel keeps its own toggle; both
+    /// drive the same store, so they can never disagree.
+    private var layersPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Kicker("LAYERS")
+            Toggle(isOn: Binding(get: { alpr.enabled },
+                                 set: { alpr.setEnabled($0); if $0 { alpr.refresh() } })) {
+                Text("known ALPR cameras").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.text)
+            }
+            .tint(ACABTheme.accent)
+            Text("Draws mapped camera locations on the map. Turning it on downloads an offline dataset once; pins are mapped locations, not live detections.")
+                .font(ACABTheme.mono(9.5)).foregroundStyle(ACABTheme.dim)
+                .fixedSize(horizontal: false, vertical: true)
+            if alpr.enabled {
+                Text(alprStatusLine)
+                    .font(ACABTheme.mono(8.5)).foregroundStyle(ACABTheme.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(14)
+        .frame(width: 250)
+        .presentationBackground(ACABTheme.bg2)
     }
 
     private func chip(_ cat: String?, _ label: String, _ n: Int) -> some View {
@@ -757,8 +945,13 @@ struct MapTabView: View {
             .padding(.horizontal, 11).padding(.vertical, 7)
             .background(active ? tint : ACABTheme.bg2, in: Capsule())
             .overlay(Capsule().strokeBorder(active ? .clear : ACABTheme.line, lineWidth: 1))
+            // 44pt hit target; drawn capsule unchanged.
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel("\(spokenCategory(label)), \(n) located")
+        .accessibilityAddTraits(active ? .isSelected : [])
     }
 
     private func catTint(_ cat: String?) -> Color {
@@ -770,6 +963,18 @@ struct MapTabView: View {
         case "GLASSES":  return ACABTheme.glassesTone
         case "CAMERA":   return ACABTheme.netcamTone
         default:         return ACABTheme.accent
+        }
+    }
+
+    private func spokenCategory(_ label: String) -> String {
+        switch label {
+        case "ALPR": return "automatic license plate readers"
+        case "BODY CAM": return "body cameras"
+        case "CAMERA", "NETCAM", "NETWORK CAM": return "network cameras"
+        case "TRKR", "TRACKER": return "item trackers"
+        case "GLAS", "GLASSES": return "recording glasses"
+        case "ALL": return "all categories"
+        default: return label.lowercased()
         }
     }
 
@@ -800,9 +1005,13 @@ struct MapTabView: View {
                         .frame(width: 34, height: 34)
                         .background(.ultraThinMaterial, in: Circle())
                         .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+                        // 44pt hit target around the 34pt chip.
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Map legend")
+                .accessibilityValue("collapsed")
             }
         }
         .animation(.easeOut(duration: 0.2), value: legendOpen)
@@ -841,7 +1050,7 @@ struct MapTabView: View {
                         Circle().strokeBorder(ACABTheme.warn.opacity(0.95),
                                               style: StrokeStyle(lineWidth: 2, dash: [2, 1.8]))
                             .frame(width: 9, height: 9)
-                        Text("ALPR (unverified)").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
+                        Text("ALPR (lower confidence)").font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.dim)
                     }
                     .padding(.top, 6)
                     .overlay(alignment: .top) {
@@ -871,21 +1080,59 @@ struct MapTabView: View {
         }
     }
 
+    /// True when the "empty" story is a permission problem, not a data one. Demo mode exempts
+    /// itself: its seeds carry coordinates regardless of the phone's location permission.
+    private var emptyBecausePermission: Bool { ble.locationDenied && !ble.demoMode }
+
+    /// Two distinct empty stories over the same slot. Permission off gets the actionable one
+    /// (Open Settings); otherwise it is the honest "nothing located yet". Detections existing
+    /// is the third state: the banner never mounts (see body) and the camera fits to them.
     private var emptyBanner: some View {
         VStack(spacing: 9) {
-            Image(systemName: "mappin.slash").font(.system(size: 28)).foregroundStyle(ACABTheme.faint)
-            Text("No located detections yet")
-                .font(ACABTheme.display(14, weight: .medium)).foregroundStyle(ACABTheme.dim)
-            Text("ALPR, body cam, glasses, network camera and tracker hits use your phone's position; drones report their own.")
-                .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.faint)
-                .multilineTextAlignment(.center).frame(maxWidth: 250)
+            Image(systemName: emptyBecausePermission ? "location.slash" : "mappin.slash")
+                .font(.system(size: 28)).foregroundStyle(ACABTheme.faint)
+            if emptyBecausePermission {
+                Text("Location is off, so beacons can't add your phone's observer position. Drones that broadcast Remote ID coordinates can still appear on the map.")
+                    .font(ACABTheme.display(14, weight: .medium)).foregroundStyle(ACABTheme.dim)
+                    .multilineTextAlignment(.center).frame(maxWidth: 260)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                } label: {
+                    Text("OPEN SETTINGS")
+                        .font(ACABTheme.mono(11, weight: .bold)).tracking(1)
+                        .foregroundStyle(ACABTheme.accent)
+                        .padding(.horizontal, 14)
+                        .frame(minHeight: 44)   // 44pt target
+                        .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            } else {
+                Text("No located detections yet")
+                    .font(ACABTheme.display(14, weight: .medium)).foregroundStyle(ACABTheme.dim)
+                Text("Detections appear here once they're heard with location available.")
+                    .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.faint)
+                    .multilineTextAlignment(.center).frame(maxWidth: 250)
+                Text("ALPR, body cam, glasses, network camera and tracker hits use your phone's position; drones report their own.")
+                    .font(ACABTheme.mono(9.5)).foregroundStyle(ACABTheme.faint)
+                    .multilineTextAlignment(.center).frame(maxWidth: 250)
+            }
         }
         .padding(20)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous)
             .strokeBorder(ACABTheme.line, lineWidth: 1))
-        .allowsHitTesting(false)        // let touches fall through so you can still pan the map behind it
+        // Hit-testing stays ON when the Open Settings button is present (it has to be tappable);
+        // the informational variant lets touches fall through so the map still pans behind it.
+        .allowsHitTesting(emptyBecausePermission)
         .overlay(alignment: .topTrailing) {
+            // Dismiss (x) on BOTH variants (the informational one used to have none). It lives in
+            // this overlay, layered OVER the card AFTER the .allowsHitTesting above, so it stays
+            // tappable even on the informational variant whose card passes gestures through to the
+            // map: only the small x region intercepts touches, the rest still pans the map behind.
             Button {
                 withAnimation(.easeOut(duration: 0.2)) { emptyDismissed = true }
             } label: {
@@ -894,9 +1141,12 @@ struct MapTabView: View {
                     .frame(width: 26, height: 26)
                     .background(ACABTheme.bg2, in: Circle())
                     .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+                    // 44pt hit target around the 26pt chip.
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(6)
+            .accessibilityLabel("Dismiss")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -936,9 +1186,11 @@ private struct MapPin: View {
     let type: DeviceType
     var animated = true
     @State private var ping = false
+    // Reduce Motion drops the looping ping ring entirely, same as the dense-map cap does.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         ZStack {
-            if animated {
+            if animated && !reduceMotion {
                 Circle().stroke(type.tint, lineWidth: 2).frame(width: 28, height: 28)
                     .scaleEffect(ping ? 1.9 : 0.9).opacity(ping ? 0 : 0.7)
             }
@@ -948,10 +1200,17 @@ private struct MapPin: View {
             Image(systemName: type.symbol).font(.system(size: 12, weight: .bold))
                 .foregroundStyle(ACABTheme.bg)
         }
-        .onAppear {
-            guard animated else { return }
-            withAnimation(.easeOut(duration: 2).repeatForever(autoreverses: false)) { ping = true }
-        }
+        .onAppear(perform: updateAnimation)
+        .onChange(of: reduceMotion) { _, _ in updateAnimation() }
+        .onChange(of: animated) { _, _ in updateAnimation() }
+    }
+
+    private func updateAnimation() {
+        var parked = Transaction(animation: nil)
+        parked.disablesAnimations = true
+        withTransaction(parked) { ping = false }
+        guard animated, !reduceMotion else { return }
+        withAnimation(.easeOut(duration: 2).repeatForever(autoreverses: false)) { ping = true }
     }
 }
 
@@ -968,7 +1227,10 @@ private struct OperatorPin: View {
                 .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
         }
         .buttonStyle(.plain)
+        .frame(minWidth: 44, minHeight: 44)
+        .contentShape(Rectangle())
         .accessibilityLabel("Drone operator")
+        .accessibilityHint("Explains this Remote ID operator position")
         .popover(isPresented: $showInfo) {
             Text("operator. this drone broadcasts its pilot's location in its remote ID, so this pin is roughly where it's being flown from.")
                 .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.text)
@@ -979,8 +1241,8 @@ private struct OperatorPin: View {
     }
 }
 
-/// A known-ALPR camera point (opt-in reference layer). Identity is the coordinate so panning
-/// the map doesn't rebuild markers that didn't change.
+/// A known-ALPR camera point (opt-in reference layer). ALP4 identity is stable OSM type + ID, so
+/// two cameras mapped at the same coordinate remain distinct; legacy caches add their row index.
 /// Equatable so refreshALPRVisible can early-out when the culled set is unchanged: without it every
 /// camera callback rewrites @State and invalidates body even when nothing moved. `id` is stored, not
 /// computed - it's read per-row by ForEach, and interpolating a String there is the same trap that
@@ -988,19 +1250,22 @@ private struct OperatorPin: View {
 private struct ALPRPoint: Identifiable, Equatable {
     let coord: CLLocationCoordinate2D
     let maker: String
-    /// False when the mapper typed the manufacturer freehand or left it blank. Drives the dot
-    /// colour and the callout wording; see ALPRStore.nodeConfirmed for what earns a true.
-    let confirmed: Bool
+    /// Raw attribution tier from ALP3/ALP4. Tier 1 gets the stronger solid treatment; tier 0 and
+    /// tier 2 remain distinguishable in copy even though both use the lower-confidence ring.
+    let tier: UInt8
+    var confirmed: Bool { tier == 1 }
     let id: String
-    init(coord: CLLocationCoordinate2D, maker: String, confirmed: Bool) {
+    init(id: String, coord: CLLocationCoordinate2D, maker: String, tier: UInt8) {
+        self.id = id
         self.coord = coord
         self.maker = maker
-        self.confirmed = confirmed
-        self.id = "\(coord.latitude),\(coord.longitude)"
+        self.tier = tier
     }
-    // id is coord-derived, so a viewport that hasn't moved still costs zero @State churn; two dots
-    // never share a location, so folding maker out of == is safe (it can't differ at equal id).
-    static func == (a: ALPRPoint, b: ALPRPoint) -> Bool { a.id == b.id }
+    // Stable identity plus every display field keeps an unchanged viewport at zero @State churn.
+    static func == (a: ALPRPoint, b: ALPRPoint) -> Bool {
+        a.id == b.id && a.coord.latitude == b.coord.latitude
+            && a.coord.longitude == b.coord.longitude && a.maker == b.maker && a.tier == b.tier
+    }
 }
 
 /// Quiet hollow ring for a known/mapped ALPR camera (opt-in reference layer). Deliberately
@@ -1025,8 +1290,8 @@ private struct ALPRDot: View {
             .overlay(Circle().strokeBorder(tone.opacity(0.95),
                                            style: StrokeStyle(lineWidth: 2.2,
                                                               dash: confirmed ? [] : [2.6, 2.2])))
-            .accessibilityLabel(confirmed ? "Known ALPR camera"
-                                          : "Known ALPR camera, community mapped and unverified")
+            .accessibilityLabel(confirmed ? "Known ALPR camera, manufacturer attributed"
+                                          : "Community ALPR candidate, attribution not structured")
         // Bolder 2026-07-29 (user: rings washed out on the map). Still a HOLLOW STATIC ring -
         // the "never reads as a live detection" rule holds because detections are filled +
         // animated, not because this was faint. Keep in lockstep with Android rememberAlprMarker
@@ -1116,8 +1381,11 @@ private struct ClusterListSheet: View {
                                 .frame(width: 32, height: 32)
                                 .background(ACABTheme.bg2, in: Circle())
                                 .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+                                .frame(minWidth: 44, minHeight: 44)
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel("Close cluster")
                     }
                     .padding(.bottom, 12)
                     VStack(spacing: 0) {

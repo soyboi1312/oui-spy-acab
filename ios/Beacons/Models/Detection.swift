@@ -205,7 +205,10 @@ extension Detection: Codable {
         method     = DetectionMethod(rawValue: (try? k.decode(Int.self, forKey: .meth)) ?? 0) ?? .none
         confidence = (try? k.decode(Int.self, forKey: .c)) ?? 0
         mac        = (try? k.decode(String.self, forKey: .mac)) ?? "??:??:??:??:??:??"
-        rssi       = (try? k.decode(Int.self, forKey: .rssi)) ?? 0
+        // Clamped to the int16 wire type (firmware sends an int16 dBm). Unclamped, a hostile
+        // rssi = Int.max reaches smoothedRssi's average (Double(2^63) -> Int traps), overflows
+        // the window sum, and arms the best + 4 comparison in the closest-approach update.
+        rssi       = min(32_767, max(-32_768, (try? k.decode(Int.self, forKey: .rssi)) ?? 0))
         name       = try? k.decodeIfPresent(String.self, forKey: .name)
         uasID      = try? k.decodeIfPresent(String.self, forKey: .id)
         // Stored identity, computed exactly once (see `id`). Same rule as the old computed property:
@@ -231,7 +234,14 @@ extension Detection: Codable {
         randomAddr = (try? k.decode(Bool.self, forKey: .rnd)) ?? false
         isHistory  = (try? k.decode(Bool.self, forKey: .hist)) ?? false
         seq        = try? k.decodeIfPresent(UInt32.self, forKey: .seq)
-        capturedAt = (try? k.decodeIfPresent(TimeInterval.self, forKey: .at) ?? nil).map(Date.init(timeIntervalSince1970:))
+        // Clamp at the decode boundary. The wire type is a uint32 (firmware det_log.h atUnix), so
+        // a legitimate board can only send 0...4294967295; anything else (NaN, infinities, huge or
+        // negative doubles from an impostor peripheral) is dropped rather than converted, because
+        // a poisoned Date reaches trapping Int conversions downstream AND gets checkpointed, which
+        // made the crash persistent across relaunch.
+        capturedAt = (try? k.decodeIfPresent(TimeInterval.self, forKey: .at) ?? nil)
+            .flatMap { $0.isFinite && (0...4_294_967_295).contains($0)
+                       ? Date(timeIntervalSince1970: $0) : nil }
         approx     = (try? k.decode(Bool.self, forKey: .approx)) ?? false
         whenMs     = try? k.decodeIfPresent(UInt32.self, forKey: .ms)
         bootCount  = try? k.decodeIfPresent(UInt32.self, forKey: .boot)

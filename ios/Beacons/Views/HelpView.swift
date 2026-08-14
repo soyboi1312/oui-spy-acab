@@ -87,13 +87,15 @@ struct HelpView: View {
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 13)).foregroundStyle(ACABTheme.faint)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Clear search")
             }
         }
         .padding(.horizontal, 12)
-        .frame(height: 42)
+        .frame(minHeight: 44)
         .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
             .strokeBorder(searchFocused ? ACABTheme.lineStrong : ACABTheme.line, lineWidth: 1))
@@ -207,6 +209,14 @@ struct HelpView: View {
         if row.external, let s = row.url, let url = URL(string: s) {
             Link(destination: url) { supportRowBody(row, glyph: "arrow.up.right", tint: ACABTheme.accent) }
                 .buttonStyle(.plain)
+        } else if row.action == "improveDetection" {
+            // Opens the contribution composer by pushing it onto the same navigation stack HelpView
+            // sits in (whether reached from the Beacon screen or a dossier's related help). Mirrors
+            // Android's onImproveDetection handler.
+            NavigationLink { ContributeView() } label: {
+                supportRowBody(row, glyph: "chevron.right", tint: ACABTheme.faint)
+            }
+            .buttonStyle(.plain)
         } else {
             Button {
                 if row.action == "firstRunTour" { showTour = true }

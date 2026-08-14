@@ -61,8 +61,12 @@ class AcabLinkService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         isRunning = true
         createChannel()
-        startForegroundCompat(
+        val foreground = startForegroundCompat(
             build(ble.state.value, ble.detections.value, ble.redactLockScreen.value, ble.driveModeOn))
+        if (!foreground) return START_NOT_STICKY
+        // The process-wide manager, not MainActivity, owns Drive fixes. Start only after the FGS
+        // promotion succeeds so Android's while-in-use location rules see a real location service.
+        ble.onLinkServiceStarted()
         // onStartCommand can run again on a repeat start; cancel the previous collector
         // so re-renders never stack up.
         renderJob?.cancel()
@@ -169,6 +173,7 @@ class AcabLinkService : Service() {
 
     override fun onDestroy() {
         isRunning = false
+        ble.onLinkServiceStopped()
         scope.cancel()
         super.onDestroy()
     }
@@ -296,20 +301,27 @@ class AcabLinkService : Service() {
         nm()?.createNotificationChannel(ch)
     }
 
-    private fun startForegroundCompat(n: Notification) {
-        try {
+    private fun startForegroundCompat(n: Notification): Boolean {
+        return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 // The location type is what keeps fixes flowing once the activity is gone, so drive
                 // mode stops pinning every hit on wherever we last had one. OR it in ONLY when the
-                // permission is actually held: location is optional here (MainActivity gates
-                // startLocation), and Android 14+ throws SecurityException on a declared type the app
+                // permission is actually held: location is optional here (the manager owns the
+                // process-wide location listener via syncLocationOwnership, gated on permission),
+                // and Android 14+ throws SecurityException on a declared type the app
                 // has no permission for, which would kill drive mode outright for a user who declined.
                 var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-                if (hasLocationPermission()) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+                // An OTA-only hold never owns location. Adding the location type merely because
+                // permission exists would make a valid background connected-device OTA fail the
+                // Android 14 while-in-use location gate.
+                if (ble.driveModeOn && hasLocationPermission()) {
+                    types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+                }
                 startForeground(NOTIF_ID, n, types)
             } else {
                 startForeground(NOTIF_ID, n)
             }
+            true
         } catch (e: Exception) {
             // Never let a foreground-service start crash the process. Android 14+ throws
             // SecurityException if we assert the connectedDevice type without BLUETOOTH_CONNECT (a
@@ -326,6 +338,7 @@ class AcabLinkService : Service() {
             holders.clear()
             runCatching { if (ble.driveModeOn) ble.endDriveMode() }
             stopSelf()
+            false
         }
     }
 
@@ -381,14 +394,24 @@ class AcabLinkService : Service() {
         var isRunning: Boolean = false
             private set
 
-        fun start(context: Context, holder: String = HOLD_DRIVE) {
+        @Synchronized
+        fun start(context: Context, holder: String = HOLD_DRIVE): Boolean {
             holders.add(holder)
-            ContextCompat.startForegroundService(context, Intent(context, AcabLinkService::class.java))
+            return runCatching {
+                ContextCompat.startForegroundService(context, Intent(context, AcabLinkService::class.java))
+            }.onFailure {
+                // A rejected background/permission start never creates a Service callback to clean
+                // this holder up. Roll it back here so a later valid start is not pinned forever.
+                holders.remove(holder)
+            }.isSuccess
         }
 
+        @Synchronized
         fun stop(context: Context, holder: String = HOLD_DRIVE) {
             holders.remove(holder)
-            if (holders.isEmpty()) context.stopService(Intent(context, AcabLinkService::class.java))
+            if (holders.isEmpty()) runCatching {
+                context.stopService(Intent(context, AcabLinkService::class.java))
+            }
         }
     }
 }

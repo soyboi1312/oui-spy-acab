@@ -34,7 +34,11 @@ object Acab {
 
     val text = Color(0xFFF4EEF0)
     val dim = Color(0x99F0E0E2)         // @ 60%
-    val faint = Color(0x54F0E0E2)       // @ 33%
+    // faint @ 54%, up from 33%. At 33% it measured ~2.5:1 against bg and this token carries
+    // real instructions and privacy copy, not just ornament; 54% lands 5.0:1 on bg, 4.96:1 on
+    // bg2, 4.82:1 on bg3 (WCAG AA for body text on every surface it sits on) while staying a
+    // visible step quieter than dim. Same base tint, so the palette reads unchanged.
+    val faint = Color(0x8AF0E0E2)       // @ 54%
 
     val accent = Color(0xFFEE4034)      // crimson
     val accentGlow = Color(0x8CEE4034)  // @ 55%

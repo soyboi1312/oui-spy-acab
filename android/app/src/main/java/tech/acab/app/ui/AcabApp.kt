@@ -21,7 +21,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -44,6 +46,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -57,9 +60,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -75,6 +81,13 @@ import tech.acab.app.ble.OtaProgress
 import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceType
 import tech.acab.app.ui.theme.Acab
+
+internal fun shouldUseReconnectShell(
+    shellEstablished: Boolean,
+    hadLink: Boolean,
+    state: ConnState,
+    otaActive: Boolean,
+): Boolean = shellEstablished && hadLink && state == ConnState.CONNECTING && !otaActive
 
 /**
  * The pre-connection / first-run screen: says what the beacon hears, explains the permissions
@@ -96,12 +109,21 @@ fun AcabApp(
     val context = LocalContext.current
     val activity = context as? Activity
 
+    // Once the app shell has existed, keep that single composition alive for the rest of this
+    // activity. A transient reconnect must not destroy an in-progress contribution capture,
+    // map camera, log pause snapshot, or dossier. Opaque connect/OTA surfaces can cover it, but
+    // the parked shell is both pointer-disabled and hidden from accessibility while covered.
+    var shellEstablished by rememberSaveable { mutableStateOf(state == ConnState.READY) }
+    LaunchedEffect(state) {
+        if (state == ConnState.READY) shellEstablished = true
+    }
+
     // AcabBleManager keeps its auto-reconnect flag internal, but the transition is visible from
     // here: a user connect enters CONNECTING from SCANNING/DISCONNECTED, while the unexpected-drop
     // auto-reconnect is the only path that arrives at CONNECTING straight from READY (the OTA
     // reboot-reconnect does too, but OtaWaitScreen owns that state below). Tracked above the
     // early returns so the READY hand-off doesn't reset it.
-    var hadLink by remember { mutableStateOf(false) }
+    var hadLink by rememberSaveable { mutableStateOf(state == ConnState.READY) }
     LaunchedEffect(state) {
         when (state) {
             ConnState.READY -> hadLink = true
@@ -112,6 +134,23 @@ fun AcabApp(
 
     // Read-only path into the persisted log, no board needed (mirrors the iOS savedLogCard sheet).
     var showSavedLog by remember { mutableStateOf(false) }
+
+    // The 45s scan window (AcabBleManager.SCAN_TIMEOUT_MS) ending with nothing found used to
+    // fall silently back to the resting panel: the spinner just vanished, which reads as a hang
+    // or a shrug. Track the SCANNING -> DISCONNECTED edge, distinguish the user's own stop-tap
+    // (no message: they asked) from the timeout (message + SCAN AGAIN), and clear on re-scan.
+    var userStoppedScan by remember { mutableStateOf(false) }
+    var scanEndedEmpty by remember { mutableStateOf(false) }
+    var prevConnState by remember { mutableStateOf(state) }
+    LaunchedEffect(state) {
+        if (state == ConnState.SCANNING) scanEndedEmpty = false
+        if (prevConnState == ConnState.SCANNING && state == ConnState.DISCONNECTED &&
+            found.isEmpty() && !userStoppedScan) {
+            scanEndedEmpty = true
+        }
+        if (state != ConnState.SCANNING) userStoppedScan = false
+        prevConnState = state
+    }
 
     // "Don't allow" twice (or the OS auto-deny) makes the permission prompt return immediately
     // with no dialog, which left the CTA a silent no-op forever. rationale == false only means
@@ -124,35 +163,67 @@ fun AcabApp(
         scanPermissions().none { activity.shouldShowRequestPermissionRationale(it) }
     var showDeniedPanel by remember { mutableStateOf(permanentlyDenied()) }
 
-    // Once linked, hand off to the four-tab shell , but the FIRST time a real board connects,
+    val otaActive = ota.phase != OtaPhase.IDLE && ota.phase != OtaPhase.DONE && ota.phase != OtaPhase.FAILED
+    val reconnectUsable = shouldUseReconnectShell(shellEstablished, hadLink, state, otaActive)
+    // Hoisted so the shell can be removed from the semantics tree while the opaque first-run
+    // overlay is visible. Demo must not spend the one-time tour on sample data.
+    var tourDone by rememberSaveable { mutableStateOf(FirstRunTour.hasSeen(context)) }
+    val firstRunTourOpen = shellEstablished && state == ConnState.READY && !demoMode && !tourDone
+    val shellCovered = shellEstablished &&
+        ((state != ConnState.READY && !reconnectUsable) || firstRunTourOpen)
+
+    Box(Modifier.fillMaxSize()) {
+    if (shellEstablished) {
+        val shellModifier = if (shellCovered) {
+            Modifier
+                .clearAndSetSemantics { }
+                .pointerInput(Unit) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            awaitPointerEvent(PointerEventPass.Initial).changes.forEach { it.consume() }
+                        }
+                    }
+                }
+        } else Modifier
+        MainScreen(ble, reconnecting = reconnectUsable, modifier = shellModifier)
+    }
+
+    // Once linked, hand off to the four-tab shell, but the FIRST time a real board connects,
     // show the one-time orientation over it. This is the "I'm connected, now what?" moment new
     // users were getting stuck at. Demo mode is excluded: the tour on sample data would spend the
     // one-time moment on a fake board (mirrors iOS RootView).
     if (state == ConnState.READY) {
-        var tourDone by rememberSaveable { mutableStateOf(demoMode || FirstRunTour.hasSeen(context)) }
-        MainScreen(ble)
-        if (!tourDone) {
+        if (firstRunTourOpen) {
             FirstRunTourOverlay(onFinish = { FirstRunTour.markSeen(context); tourDone = true })
         }
-        return
+        return@Box
     }
 
     // An OTA reboot drops the link to non-READY while the update is still in flight. Show a locked
     // "updating" screen instead of the interactive scan/connect UI, so the user can't fire a second
     // connect that would collide with the post-reboot reconnect loop.
-    val otaActive = ota.phase != OtaPhase.IDLE && ota.phase != OtaPhase.DONE && ota.phase != OtaPhase.FAILED
     if (otaActive) {
         OtaWaitScreen(ota)
-        return
+        return@Box
+    }
+
+    // Unexpected reconnects leave the established shell fully usable. MainScreen owns the
+    // compact status banner; no opaque connect surface is placed over it.
+    if (reconnectUsable) {
+        return@Box
     }
 
     if (showSavedLog) {
         SavedLogScreen(ble, onClose = { showSavedLog = false })
-        return
+        return@Box
     }
 
     Surface(modifier = Modifier.fillMaxSize(), color = Acab.bg) {
-        Column(Modifier.fillMaxSize().padding(Acab.pad)) {
+        Column(
+            Modifier.fillMaxSize()
+                .windowInsetsPadding(WindowInsets.safeDrawing)
+                .padding(Acab.pad),
+        ) {
             WordmarkHero()
             Spacer(Modifier.height(22.dp))
 
@@ -194,7 +265,11 @@ fun AcabApp(
                                                 onRequestPermissions()
                                             }
                                             // The CTA is a stop/start toggle while a scan runs (iOS parity).
-                                            state == ConnState.SCANNING -> ble.stopScan()
+                                            // userStoppedScan: a deliberate stop must not raise
+                                            // the "No boards found" timeout message.
+                                            state == ConnState.SCANNING -> {
+                                                userStoppedScan = true; ble.stopScan()
+                                            }
                                             else -> ble.startScan()
                                         }
                                     },
@@ -205,6 +280,11 @@ fun AcabApp(
                                     Text("Looking for your board…", color = Acab.dim,
                                         fontSize = 12.sp, fontFamily = Acab.mono)
                                 }
+                            }
+                            // The scan window closed with nothing heard: say so and offer the
+                            // retry, instead of the spinner silently becoming a resting button.
+                            if (scanEndedEmpty && state != ConnState.SCANNING && found.isEmpty()) {
+                                item { NoBoardsFoundPanel(onScanAgain = { ble.startScan() }) }
                             }
                             items(found) { board -> BoardRow(board, onConnect = { ble.connect(board) }) }
                         }
@@ -234,6 +314,7 @@ fun AcabApp(
             ScopeFootnote()
         }
     }
+    }
 }
 
 /** "Beacons" wordmark hero over the connect screen. */
@@ -250,7 +331,12 @@ private fun WordmarkHero() {
     }
 }
 
-/** The five signatures the beacon listens for, as a row of glyph tiles. */
+/** The six signatures the beacon listens for, as a SINGLE row of glyph tiles on every font size,
+ *  matching iOS. Each tile is an equal-weight column so all six always share one row; when a label
+ *  is too wide for its column it wraps to two lines rather than the tiles wrapping to a second row,
+ *  which is what used to happen at large font sizes (columns dropped to 3, so a 5-item strip became
+ *  two rows). Network cameras belong here beside trackers: both are opt-in, and the copy below
+ *  names them, so leaving the glyph out read as a gap. */
 @Composable
 private fun BeaconHearsPanel() {
     val hears = listOf(
@@ -259,28 +345,30 @@ private fun BeaconHearsPanel() {
         DeviceType.BODY_CAM to "BODY CAMS",
         DeviceType.TRACKER to "TRACKERS",
         DeviceType.GLASSES to "GLASSES",
+        DeviceType.NETWORK_CAMERA to "NET CAM",
     )
     Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Kicker("WHAT YOUR BEACON CAN HEAR")
-        Row(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             hears.forEach { (type, label) ->
                 Column(
                     Modifier.weight(1f),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(7.dp),
                 ) {
-                    CatGlyph(type, size = 32, filled = true)
-                    Text(label, color = Acab.dim, fontSize = 8.5.sp, fontFamily = Acab.mono,
-                        maxLines = 1)
+                    CatGlyph(type, size = 30, filled = true)
+                    Text(label, color = Acab.dim, fontSize = 8.5.sp,
+                        fontFamily = Acab.mono, maxLines = 2,
+                        textAlign = TextAlign.Center)
                 }
             }
         }
         Text(
-            "a passive listener. it never jams, spoofs, or transmits, it writes down what's already shouting.",
+            "a passive detector. it never jams, spoofs, or interferes with nearby devices; its bluetooth link reports what it heard to your phone.",
             color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono, lineHeight = 15.sp,
         )
         Text(
-            "trackers and network cameras are opt-in, switch them on in Device settings.",
+            "trackers and network cameras are opt-in, switch them on in Beacon settings.",
             color = Acab.faint, fontSize = 9.5.sp, fontFamily = Acab.mono, lineHeight = 14.sp,
         )
     }
@@ -294,8 +382,10 @@ private fun ScanCtaPanel(permissionsGranted: Boolean, scanning: Boolean, onAllow
             Kicker("BEFORE THE SYSTEM ASKS")
             RationaleRow(Icons.Filled.Bluetooth, "Bluetooth",
                 "pairs you to the beacon. The board does the listening, not your phone.")
+            // The claim is scoped honestly: explicit export and the contribution composer
+            // exist, so "nothing leaves this phone" would be a lie. Uploads: never automatic.
             RationaleRow(Icons.Filled.LocationOn, "Location",
-                "pins hits to the map. Nothing leaves this phone, no accounts, no cloud.")
+                "pins observer-based hits to the map and sends your current coordinates over encrypted local Bluetooth to your own beacon for geotagging. Drones can still provide their own Remote ID position if you decline. The app does not automatically upload detections or location to us. Beyond your own beacon, they reach another recipient only when you explicitly export or send them. Map tiles and optional datasets are requested from their providers. No account is required.")
         }
         val label = when {
             !permissionsGranted -> "Allow & scan for boards"
@@ -422,6 +512,7 @@ private fun ConnectingRow(text: String, onCancel: () -> Unit) {
 private fun CancelConnectButton(onClick: () -> Unit) {
     Row(
         Modifier
+            .minimumInteractiveComponentSize()
             .clip(RoundedCornerShape(50))
             .background(Acab.bg2, RoundedCornerShape(50))
             .border(1.dp, Acab.line, RoundedCornerShape(50))
@@ -476,6 +567,21 @@ private fun PermissionDeniedPanel(onOpenSettings: () -> Unit) {
             fontFamily = Acab.mono, textAlign = TextAlign.Center)
         Spacer(Modifier.height(2.dp))
         PrimaryButton("Open Settings", onOpenSettings)
+    }
+}
+
+/** Shown when the bounded scan window ends with no boards heard. Names the two overwhelmingly
+ *  likely causes (power, range) and offers the retry inline, so the timeout never reads as the
+ *  app giving up silently. */
+@Composable
+private fun NoBoardsFoundPanel(onScanAgain: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().panel(),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("No boards found. Make sure your beacon is powered on and nearby, then scan again.",
+            color = Acab.dim, fontSize = 12.sp, fontFamily = Acab.mono, lineHeight = 17.sp)
+        PrimaryButton("SCAN AGAIN", onScanAgain)
     }
 }
 
@@ -593,7 +699,8 @@ private fun SoyboiLink(onClick: () -> Unit) {
         fontSize = 10.5.sp,
         fontFamily = Acab.mono,
         textAlign = TextAlign.Center,
-        modifier = Modifier.fillMaxWidth().clickable { onClick() }.padding(top = 2.dp),
+        modifier = Modifier.fillMaxWidth().minimumInteractiveComponentSize()
+            .clickable { onClick() }.padding(top = 2.dp),
     )
 }
 
@@ -618,8 +725,12 @@ private fun SavedLogScreen(ble: AcabBleManager, onClose: () -> Unit) {
     val uriHandler = LocalUriHandler.current
     // System back peels the dossier first, then closes the saved log (not the app).
     BackHandler { if (selected != null) selected = null else onClose() }
-    Surface(modifier = Modifier.fillMaxSize(), color = Acab.bg) {
-        Column(Modifier.fillMaxSize().statusBarsPadding()) {
+    Surface(
+        modifier = Modifier.fillMaxSize().then(
+            if (selected != null) Modifier.clearAndSetSemantics { } else Modifier),
+        color = Acab.bg,
+    ) {
+        Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = Acab.pad, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -629,12 +740,13 @@ private fun SavedLogScreen(ble: AcabBleManager, onClose: () -> Unit) {
                 Spacer(Modifier.weight(1f))
                 Icon(Icons.Filled.Close, contentDescription = "Close saved log", tint = Acab.dim,
                     modifier = Modifier
+                        .minimumInteractiveComponentSize()
                         .clip(CircleShape)
                         .clickable(onClick = onClose)
                         .padding(6.dp)
                         .size(20.dp))
             }
-            LogScreen(ble, onSelect = { selected = it })
+            LogScreen(ble, onSelect = { selected = it }, pauseStateKey = "saved")
         }
     }
     // Dossier over the log, like MainScreen's compact overlay. "Open in map" has no Map tab to
@@ -664,7 +776,9 @@ private fun scanPermissions(): Array<String> =
 private fun OtaWaitScreen(ota: OtaProgress) {
     Surface(modifier = Modifier.fillMaxSize(), color = Acab.bg) {
         Column(
-            Modifier.fillMaxSize().padding(Acab.pad),
+            Modifier.fillMaxSize()
+                .windowInsetsPadding(WindowInsets.safeDrawing)
+                .padding(Acab.pad),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {

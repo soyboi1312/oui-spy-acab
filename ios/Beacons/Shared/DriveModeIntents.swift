@@ -17,9 +17,26 @@ import Foundation
 enum DriveModeState {
     private static let suite = "group.tech.beacons.app"
     private static let key = "acab.driveModeWanted"
+
+    private static var sharedDefaults: UserDefaults? { UserDefaults(suiteName: suite) }
+
+    /// Nil means the user has never made a choice. Keep that distinct from false so the default
+    /// can be enabled without reviving a setting the user explicitly turned off.
+    static func storedChoice(in defaults: UserDefaults?) -> Bool? {
+        defaults?.object(forKey: key) as? Bool
+    }
+
+    static func setWanted(_ value: Bool, in defaults: UserDefaults?) {
+        defaults?.set(value, forKey: key)
+    }
+
+    static func wanted(in defaults: UserDefaults?) -> Bool {
+        storedChoice(in: defaults) ?? true
+    }
+
     static var wanted: Bool {
-        get { UserDefaults(suiteName: suite)?.bool(forKey: key) ?? false }
-        set { UserDefaults(suiteName: suite)?.set(newValue, forKey: key) }
+        get { wanted(in: sharedDefaults) }
+        set { setWanted(newValue, in: sharedDefaults) }
     }
 }
 

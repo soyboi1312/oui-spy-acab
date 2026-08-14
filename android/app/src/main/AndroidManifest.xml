@@ -52,7 +52,7 @@
 
     <!-- allowBackup=false: the detections file (MACs + capture GPS + timestamps) and the
          ignore-list prefs must not flow to cloud Auto-Backup or device-transfer. The
-         Keystore-wrapped buffer-key blob is safe, but no app data should leave the device. -->
+         Keystore-wrapped buffer-key blob is safe, but no app data should leave by backup. -->
     <application
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -64,12 +64,15 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.OuiAcab">
         <!-- singleTask: the drive-mode notification tap re-delivers its deep-link intent to
-             the running activity (onNewIntent) instead of stacking a second instance. -->
+             the running activity (onNewIntent) instead of stacking a second instance.
+             No screenOrientation lock: tablets/foldables get landscape and the two-pane layout.
+             Rotation recreates the activity, which is lossless now that per-tab UI state rides
+             rememberSaveable + ViewModels (tab shell SaveableStateHolder, ContributionViewModel,
+             the Map camera saver); do not re-add the lock without re-checking those. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
-            android:screenOrientation="portrait"
             android:theme="@style/Theme.OuiAcab">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

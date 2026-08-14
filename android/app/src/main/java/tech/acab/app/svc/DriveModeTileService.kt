@@ -1,6 +1,10 @@
 package tech.acab.app.svc
 
+import android.annotation.SuppressLint
+import android.app.PendingIntent
+import android.content.Intent
 import android.graphics.drawable.Icon
+import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import kotlinx.coroutines.CoroutineScope
@@ -10,6 +14,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
+import tech.acab.app.MainActivity
 import tech.acab.app.R
 import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.ble.ConnState
@@ -77,13 +82,43 @@ class DriveModeTileService : TileService() {
             // manager's driveMode flag; clear it first so startDriveMode can't early-return
             // on a stale true.
             ble.endDriveMode()
-            ble.startDriveMode()
+            requestDriveStartInForeground()
+            // Android 14 does not allow a background tile service to create a location foreground
+            // service with only while-in-use location permission. Keep the tile inactive until
+            // MainActivity is visible and applies the request.
+            render(active = false)
+            return
         } else {
             ble.endDriveMode()
         }
         // Render the intent we just applied; startDriveMode/endDriveMode flip driveModeOn
         // synchronously, and the flow collector re-renders on the emission either way.
         render(turnOn)
+    }
+
+    /** Bring the app to the foreground before starting Drive mode. This preserves normal
+     * while-in-use location semantics instead of silently requiring background location. */
+    @SuppressLint("StartActivityAndCollapseDeprecated")
+    private fun requestDriveStartInForeground() {
+        val launch = Intent(this, MainActivity::class.java)
+            .putExtra(MainActivity.EXTRA_START_DRIVE, true)
+            .addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP,
+            )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val pending = PendingIntent.getActivity(
+                this,
+                REQUEST_START_DRIVE,
+                launch,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            startActivityAndCollapse(pending)
+        } else {
+            @Suppress("DEPRECATION")
+            startActivityAndCollapse(launch)
+        }
     }
 
     private fun render(active: Boolean, available: Boolean = true) {
@@ -98,5 +133,9 @@ class DriveModeTileService : TileService() {
         tile.label = "Drive mode"
         tile.icon = Icon.createWithResource(this, R.drawable.ic_qs_drive)
         tile.updateTile()
+    }
+
+    private companion object {
+        const val REQUEST_START_DRIVE = 41
     }
 }

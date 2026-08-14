@@ -84,7 +84,7 @@ below.
 | `name` | advertised name | optional |
 | `id` | RID serial / operator id | optional (drones) |
 | `det` | detail (raven fw, ssid, drone op-id…) | optional. On `t:3` it names the source, which is how the app tells the four body-cam signals apart: `"BWC DEVICE"` (Axon service-data payload, conf 90, MAC-independent), `"Axon OUI"` (conf 75), `"Utility BodyWorn"` (name 85 / OUI 70), `"Motorola Solutions OUI"` (broad proxy, conf 45) |
-| `cid` | BLE manufacturer company ID (Bluetooth SIG assigned #, integer) | optional; BLE only, present when the advert carried manufacturer-specific data. The field the glasses/tracker detectors key on; the app surfaces it in the detail screen + CSV so a miss is diagnosable |
+| `cid` | BLE manufacturer company ID (Bluetooth SIG assigned #, integer) | optional; BLE only, present when the advert carried manufacturer-specific data. The field the glasses/tracker detectors key on; the app surfaces it in the detail screen + CSV so a miss is diagnosable. **Live-notify only, and first field elided** on a tight-MTU link (it is diagnostics, not alert content, see `detect_elide.h`). Replay frames NEVER carry it: the offline buffer's fixed 64-byte record does not store the company ID, so an elided `cid` is lost, not deferred - do not wait for a drain to recover it |
 | `lat`,`lon` | subject location | **OVERLOADED, read carefully:** drones = the aircraft's own
 broadcast position; everything else = the DETECTOR's GPS. Consumers must branch on the type.
 Exporting it as a device position on a non-drone row, or as an observer position on a drone
@@ -134,8 +134,10 @@ Write a JSON object with any subset of keys:
 | `led` | onboard status LED on/off (default **on**). `false` = "lights out": no idle heartbeat, no detection flashes, no boot sweep, for covert/stationary deploys. Persists across boots |
 | `ble` | enable/disable the BLE detection scan. `false` stops scanning only - the GATT link to the app stays up |
 | `wifi` | enable/disable the Wi-Fi (promiscuous) detection scan |
+| `wifiEco` | Wi-Fi eco mode: integer seconds of Wi-Fi RX sleep between sweeps, `0` (off) / `3` / `7` / `15`. Battery-SKU power saver; BLE capture is untouched. The board reports the active value back in Status under the same key |
 | `beep` | `true` plays one preview beep at the current volume (pair with `volume` to audition a level) |
 | `buffer` | enable/disable the offline detection buffer (default **off**, opt-in). See *Offline detection buffer* below |
+| `bufall` | **record everything**: also buffer uncategorized nearby devices, and re-arm capture every 15 min so a revisit writes a second record (default **off**). Deploy-and-leave only, presented as one experimental **Stationary capture** switch that writes `{"buffer":true,"bufall":true,"desert":true,"buzzer":false}` in a single object after pushing the key. `bufall` without `desert` gets revisit resolution but never classifies an uncategorized device. Cleared automatically when `buffer` is set false. External USB-C power required. Widens the undrained-reboot auto-wipe threshold, which weakens the self-clean guarantee, so the client must say so where the user turns it on. **Not implemented in either app today**: the firmware honours the key, but no shipped app writes it or presents the Stationary capture switch. The disclosure requirement here and the disarm ordering below bind whichever app ships it first, as test assertions, not prose. See *Offline detection buffer* |
 | `key` | 64 lowercase hex chars = the 32-byte at-rest encryption key; the app generates + persists it and pushes it on connect. **The board holds it in RAM AND persists it to NVS while buffering is enabled** (`det_log.cpp` `detLogSetEnabled`), so a board left deployed keeps encrypting across reboots instead of going keyless. **TRADEOFF, state it plainly: a seized board's flash yields the key, so the at-rest buffer is decryptable and is NOT ciphertext-only.** Turning buffering off erases the key from both RAM and NVS. Flash encryption / encrypted NVS is what would restore seized-board protection. See the SECURITY block at the top of `det_log.h`. |
 | `epoch` | unix seconds (the phone's wall clock). The board has no RTC, so this is the only wall clock it ever sees: it stores an *anchor* for the current boot and reconstructs capture times from it later. Persisted, so it dates records from earlier boots too. See *How replay times are derived* below |
 | `sync` | start a replay drain: stream stored records with `seq` greater than this value (`0` = everything) |
@@ -143,7 +145,7 @@ Write a JSON object with any subset of keys:
 | `watch` | the user watchlist: an array of MAC strings (same format as `ignore`, up to 256). A watched device alerts as `t:8` every time it's seen, even with no built-in signature. Persists across boots; the app pushes its list on connect, but **only when it has something to say** (see `clr`). A MAC on both `watch` and `ignore` still alerts: on the dual-radio board the co-processor's ignore mirror is published as *ignore minus watch*, so a starred MAC is never dropped before it reaches the S3. The apps keep the two lists exclusive anyway |
 | `clr` | `true` marks an accompanying **empty** `ignore`/`watch` array as a deliberate clear. **A bare `{"watch":[]}` or `{"ignore":[]}` is REFUSED** and the stored list is kept, unless this peer already committed a non-empty list for that key on this connection. Without this, any app with an empty list wiped the board the moment it connected (a reinstall, or a second phone that had never starred anything), and a starred MAC plus its label exists nowhere else. The second clause is what keeps older apps working: boards update over the air, so the board is routinely newer than the app, and an app that has already replaced the list is not granted any new destructive power by then emptying it. Per-write like `more`; a chunked write carries at most one list, so one flag serves both |
 | `ota` | firmware-update control object (`begin` / `end` / `abort` / `confirm`). See *Firmware update (OTA)* below |
-| `nrfdfu` | `true` triggers a **co-processor (nRF) BLE DFU** (dual board only). The S3 reboots the nRF into its Adafruit bootloader and opens a fault-mute window (Status `nrfup`); the app then drives the signed `.zip` over native Nordic DFU. Part of the combined one-click update (S3 first, then nRF). See *Firmware update (OTA)* below |
+| `nrfdfu` | `true` requests a **co-processor (nRF) BLE DFU** (dual board and protocol 2 only). The encrypted Config session and the two-minute physical-start window must both be live. The board replies `nrf-ready` or `nrf-denied` on OTA, then sets Status `nrfup:true` only after the loop actually forwards the trigger. The app baseline-scans first, waits for `nrfup`, then drives the signed, version-bound, application-only `.zip`. **Trust asymmetry, stated plainly** (mirrors `pair_window.h`): the S3 image is signature-verified ON the board; the nRF image is not. The nRF's stock legacy bootloader is CRC-only and cannot authenticate an image, and its UART trigger accepts a bare token, so the nRF leg's protection is entirely the session + physical-window gate on the S3 side (plus the app's own signature check on the downloaded `.zip`). Migrating the bootloader to signed Secure DFU is what would close it. See *Firmware update (OTA)* below |
 
 Sub-GHz (433/915 MHz) is not present on the OUI-Spy XIAO, so there is no key for it.
 
@@ -196,7 +198,7 @@ window and was sold as a follow-me test it was never able to make.
 ## Status (read / notify)
 
 ```json
-{"fw":"ACAB-ouispy 2.0.0","up":1234,"total":42,
+{"fw":"ACAB-ouispy 2.0.5","up":1234,"total":42,
  "ble":true,"wifi":true,"flock":true,"drone":true,"axon":true,"moto":true,"tracker":false,"glasses":true,"buzzer":true,"vol":80,"gps":false,"bufon":false,"desert":false}
 ```
 
@@ -207,6 +209,10 @@ window and was sold as a follow-me test it was never able to make.
 | `up` | uptime (seconds) |
 | `total` | detections emitted this session |
 | `ble` / `wifi` | detection scan active for that radio (reflects the `ble` / `wifi` config toggles) |
+| `wifiEco` | active Wi-Fi eco value: seconds of Wi-Fi RX sleep between sweeps, `0` (off) / `3` / `7` / `15`. Mirrors the `wifiEco` config key; both apps read it to drive the eco picker |
+| `pairw` | seconds left in the new-phone pairing window. **Emitted only while the window is open**; absent = closed (the normal steady state). Lets an app show a setup countdown; neither app parses it today |
+| `sdrop` | sink-queue drops, total, **emitted only when nonzero**. A nonzero value means the detection sink overflowed and rows were lost before delivery or buffering; the per-category split rides the `{"diag":true}` reply. Neither app parses it today (see the receipts section below) |
+| `buferr` | latched flash-fault bitmask for the offline buffer, **emitted only when nonzero**. Nonzero means the ring stopped accepting writes rather than pretending evidence was stored; only a fully successful physical wipe clears it. Neither app parses it today |
 | `flock` | Flock/ALPR detector enabled. A missing key (older firmware) is treated as on |
 | `drone` | drone Remote ID detector enabled. A missing key (older firmware) is treated as on |
 | `droui` | drone vendor-OUI fallback enabled. A missing key (older firmware) is treated as off (opt-in, default off) |
@@ -217,6 +223,8 @@ window and was sold as a follow-me test it was never able to make.
 | `gps` | a GPS fix is being applied to fixed-device detections |
 | `buf` | number of detections currently held in the offline buffer |
 | `bufon` | offline buffering is enabled |
+| `bufall` | record-everything mode is on. **Sent only when true**; absent means off (saves MTU, same idiom as `ledon`). Not parsed by either app today (the feature has no app-side switch yet) |
+| `bufsat` | the ring filled and refused further uncategorized records, so the **tail of the stored log is censored**. Sent only when true. Persisted across reboots, cleared by `clearlog`. Surface it beside the log, not in settings: without it a full-looking replay cannot be told apart from one that stopped days early |
 | `wiping` | present + `true` **only while** a deferred buffer erase is still sweeping (a `clearlog`, key-change wipe, or auto-wipe runs the flash erase one block per pass so the radios stay live). While set, the board writes no new records; absent = idle. The app can gate a "clearing…" state on it and knows a fresh `sync` won't capture anything until it clears |
 | `ledon` | onboard LED enabled. **Omitted when on** (the default), so an absent key means on; sent as `false` only in lights-out mode |
 | `tracker` | BLE item-tracker detector enabled |
@@ -227,6 +235,26 @@ window and was sold as a follow-me test it was never able to make.
 | `wat` | number of MACs on the board's watchlist (for app reconciliation) |
 | `wseen` | 802.11 management frames seen (two-radio diagnostic; present on all builds) |
 | `bseen` | BLE adverts ingested this session. On the dual board this counts the nRF's forwards, so a flat `bseen` with `co:true` means the co-processor is up but hearing nothing |
+
+
+**`bufall` and `bufsat` are sent only when true, so ABSENT MEANS FALSE, in every fresh
+status frame, not just the first.** Latch them per frame, never cumulatively, or a stale
+saturation warning survives a `clearlog` forever and tells the user a complete log is truncated.
+
+**Disarming Stationary capture is an ordered sequence and the order is load-bearing.** Writing
+`buffer:false` clears the at-rest key from RAM and NVS, so doing it before the replay finishes
+leaves the remaining records undecryptable while still occupying the ring: the deployment is
+destroyed by the act of collecting it. On collection:
+
+1. Connect and let the replay run to completion.
+2. Confirm it ended cleanly, the `{"hist":"end","n":N}` sentinel, with `N` matching the count
+   received. A gap means re-sync, not proceed.
+3. Only then write `{"bufall":false,"desert":false,"buffer":false}`.
+4. Restore the user's prior alert mode through the existing Desert reconciliation path, not by
+   blindly re-enabling the buzzer. The mode forced Silent, and a mode the user hand-picked while
+   Desert ran has to survive.
+5. Let the user erase the log explicitly with `{"clearlog":true}`. Never automatic, they just
+   collected a week of bystander movements, and deleting it is their call and their timing.
 
 ### Dual-radio / battery boards only
 
@@ -261,9 +289,17 @@ The board can record detections to encrypted flash while the app is disconnected
 then replay them when the app reconnects, so a walk with the app closed isn't lost.
 
 **Opt-in and sensitive.** Buffering is **off by default**. Records are encrypted at
-rest (AES-CTR) with a key the app supplies and the board never persists, so a seized
-board's flash dump is ciphertext. The buffer auto-wipes if left undrained across
-reboots, and `{"clearlog":true}` does a real sector erase.
+rest (AES-CTR) with a key the app supplies.
+
+**The board DOES persist that key** to NVS while buffering is enabled, so a
+deploy-and-leave board keeps recording across a reboot instead of going keyless. The
+tradeoff is deliberate and is documented at the top of `det_log.h`: a seized board's
+flash yields the key, so the at-rest buffer is decryptable and **not** ciphertext-only.
+(An earlier version of this section claimed the key was never persisted. It was wrong;
+`detLogSetKey` writes it whenever buffering is on.) What remains is the opt-in default,
+the auto-wipe of records left undrained across reboots, and `{"clearlog":true}` for a
+real sector erase. Flash encryption / encrypted NVS would restore the seized-board
+property.
 
 ### Connect handshake
 
@@ -447,8 +483,9 @@ and results notify on the **OTA** characteristic.
    On any failure it notifies `{"ota":"err","e":"crc|size|image|..."}` and stays on the
    current firmware.
 4. Reconnect after the reboot (same bond). Read Status: `fw` should show the new
-   version. Send `{"ota":{"confirm":true}}` to mark the image healthy (the board answers
-   `{"ota":"ok"}`). If the app never confirms, the board self-confirms after 20 s of
+   version. Send `{"ota":{"confirm":true}}` to mark the image healthy. Before its durable
+   product-health gate is ready the board answers `{"ota":"health-wait"}`; after it has
+   durably disarmed rollback it answers `{"ota":"ok"}`. If the app never confirms, the board self-confirms after 20 s of
    healthy uptime; if the new image fails to reach a healthy state at all, the next boot
    rolls back to the previous firmware, and the app should surface that the update was
    rolled back.
@@ -457,22 +494,23 @@ and results notify on the **OTA** characteristic.
 `{"ota":"abort"}` and resumes scanning). A dropped link mid-transfer aborts the session
 server-side; start over from `begin`.
 
-**Combined one-click update (dual board).** When a release bumps both the S3 app and the
-nRF co-processor app, the app does them in a fixed order: **S3 first, then nRF.** The S3
-hosts the GATT link, so it is updated first (the `{"ota":{...}}` flow above); after
-reconnecting to the new S3, the app writes `{"nrfdfu":true}` to trigger the co-processor
-DFU. The S3 reboots the nRF into its bootloader and opens a fault-mute window (Status
+**Combined update (dual board).** When both radios are stale and protocol 2 is already running,
+the app uses a fixed order: **nRF first, then S3.** The nRF leg must use the short authorization
+window opened by the user's physical power-on. An S3 OTA warm reboot deliberately does not reopen
+that window, so S3-first ordering would make the following nRF request fail by design. The app
+baseline-scans for an already-present AdaDFU device, writes `{"nrfdfu":true}`, requires
+`nrf-ready` and Status `nrfup:true` from this S3, then accepts exactly one newly appearing,
+very-close bootloader candidate. The S3 reboots the nRF into its bootloader and opens a fault-mute window (Status
 `nrfup:true`) so the app shows "updating co-processor" instead of the `co:false` fault
 banner. That window clears event-driven the moment the nRF reports its new version (fast
 success), or after a 5-minute ceiling.
 
-The ordering is not arbitrary. The S3 hosts the GATT link AND is the only thing that can
-drive the nRF into DFU, so it has to be updated and confirmed healthy first. Do it the
-other way and a failed nRF update leaves a co-processor sitting in its bootloader with an
-S3 that may then fail its own update, and nothing left that can reach either. The
-five-minute ceiling exists because the nRF's version report is the only success signal
-there is, and a silent co-processor is indistinguishable from a slow one until something
-times out.
+The phone verifies the ZIP's SHA-256, detached signature, application-only layout, and inner
+`application_version` before it sends the trigger. It never retries legacy DFU automatically.
+After Nordic reports completion, the initiating S3 must report the target `nrfv`; only then does
+the combined coordinator begin S3 OTA. If the connected board still runs protocol 0 or 1, the app
+offers only the S3 update. The user must then physically power-cycle, reconnect on protocol 2, and
+start the separately authorized nRF update.
 
 ## Notes for the app
 
@@ -483,3 +521,248 @@ times out.
   OUI-only Axon hit on a randomized address is capped low.
 - **Map layers** map cleanly to `t`: fixed pins for Flock/Axon, moving track for
   drones (use `lat/lon` + `plat/plon`).
+
+
+
+---
+
+## Detection Receipt: production telemetry contract
+
+A receipt is a document a user shows to somebody else. Every hedge it drops becomes a stronger
+claim than the evidence supports, so what it may assert is defined here rather than composed
+per-screen.
+
+### Two versions
+
+**Version 1 requires app-only implementation. It needs no new production telemetry.** The board
+already emits everything the mapping needs. What is missing is entirely app side:
+
+- **Persistent user notes.** Neither app has them today.
+- **Durable visual confirmation.** The confirmation checkboxes are local UI state and are lost.
+- **A provenance mapping.** `meth` says *how* something matched; it does not encode
+  "registry-sourced" vs "field-validated" vs "vendor identifier". Prefer a **tested app-side
+  mapping** rather than a new firmware field, it avoids enlarging every BLE record for a
+  presentation concern.
+
+The mapper's input is the detection wire tuple, which is **`(t, s, meth, c)` plus `det` as a
+discriminator**. Those are the actual JSON keys: `t` type, `s` source, `meth` method, `c`
+confidence, `det` detail. (`conf` and `detail` are the C struct field names and do not appear on
+the wire.)
+
+**Map on typed values, never on display strings.** `det` in particular is a wire contract the apps
+already resolve by exact match, and a mapper keyed on prose breaks the moment a string is reworded.
+
+**Fail closed on an unknown combination.** Newer firmware will produce tuples this app version has
+never seen, and inventing provenance for them is exactly the failure this contract exists to
+prevent. Emit the observation without an interpretation:
+
+> Detection recorded. Evidence interpretation is unavailable in this app version.
+
+The receipt survives; the claim does not get fabricated.
+
+Version 1's footer reads:
+
+> Session completeness was not assessed. This receipt documents this observation, not every device
+> that may have been nearby.
+
+That phrasing matters: the recorded observation is valid. What is unknown is whether *other*
+observations were missed.
+
+**Version 2 adds a coverage line**, and only after the apps ingest telemetry.
+
+### Four separate statements, never merged
+
+1. **What was observed**, the raw fact. `Axon service UUID FC81 over BLE, 47 times over 3m 12s,
+   strongest -52 dBm.`
+2. **What that evidence supports**, the conclusion, at its actual strength.
+3. **What it does not prove**, stated explicitly, not implied by omission.
+4. **Whether the capture had integrity warnings**, in v1, always "not assessed".
+
+### Controlled vocabulary
+
+Receipt text is **selected, never generated**: one evidence statement, **plus every applicable
+caveat and user attestation**. Several rows are cumulative by design, a vendor identifier is
+always accompanied by the product-type caveat, and a user attestation stacks on top of whatever
+the machine concluded.
+
+| Row | Applies when | Sentence |
+|---|---|---|
+| evidence | SIG company ID, manufacturer AD `0xFF` | "Axon vendor identifier observed." |
+| evidence | SIG service UUID, AD `0x02` / `0x03` / `0x16` | "Axon vendor identifier observed." |
+| evidence | corporate OUI match | "MAC registrant association only." |
+| evidence | validated product payload or name | "Field-validated product signature." |
+| caveat | with any vendor identifier | "The product type is unknown." |
+| caveat | with an OUI match | "This association does not identify a product type." |
+| caveat | with a field-validated signature | "A matching signature does not constitute visual confirmation of this device." |
+| caveat | with any Remote ID detection | "Remote ID is a self-declared broadcast." |
+| caveat | SIG UUID seen only in solicitation AD `0x14` | "Solicitation observed; this may be another device looking for Axon equipment." |
+| attestation | user marked it confirmed | "Visually confirmed by the user." |
+
+A company ID rides in manufacturer data (`0xFF`); `0x02`/`0x03`/`0x16` are the UUID-bearing
+structures. An OUI establishes a **registry association**, not the product manufacturer, hence
+"MAC registrant association only".
+
+**Every caveat required by the selected evidence class must be included.** The earlier phrasing
+("an evidence row with no applicable caveat is a bug") contradicted the table, which then listed no
+caveat for the OUI or field-validated rows, making valid receipts unconstructible. The caveats
+above now cover every evidence class, and the rule is a completeness requirement rather than an
+existence one.
+
+### Version 2 coverage: two contracts, not one
+
+Live and buffered receipts have different failure modes, so they get different gates. **Both are
+evaluated as DELTAS between a start diagnostic and an end diagnostic**, never as absolute zero: a
+counter that was already nonzero from an earlier session must not contaminate a clean one, and
+requiring lifetime zero is stronger than the claim needs.
+
+Permitted phrasing either way:
+
+> No evidence-loss indicators observed
+
+**Live session** (app connected throughout):
+
+- no new `sdDeliv`, a dropped live notify usually re-arrives, but a one-time advert never does
+- no new `nOver`
+- radio health for the relevant radio (below)
+- co-processor liveness sampled healthy throughout, on a dual-radio board
+
+**Buffered deployment** (replayed after the app was away):
+
+- no new `sdBuf`
+- `bufsat == false`
+- clean replay: `hist:begin.n == hist:end.n == records actually received`, no sequence gaps, no
+  accepted-after-retry-cap state
+- live-notify drops are **not** relevant here; nothing was being delivered live
+
+### Radio health cannot validate every receipt
+
+Health is **per-radio**, never both. A BLE receipt needs `bseen` to have advanced; a WiFi receipt
+needs `wseen`. A radio that is disabled or irrelevant to this detection is **"not evaluated"**,
+never "healthy" and never a failure.
+
+Two structural limits:
+
+**`wseen` counts management frames only.** The increment sits *after* the mgmt gate:
+
+```c
+netcamClassifyWiFi(payload, len, /*isDataFrame=*/true, ...);   // data-frame detection happens
+if (type == WIFI_PKT_DATA) { ...netcam data-frame detection...; return; }  // data frames exit HERE
+if (type != WIFI_PKT_MGMT) return;                             // and any other non-mgmt too
+gWifiSeen++;                                                    // never reached for them
+```
+
+So a network-camera detection produced from an associated **data** frame is real while `wseen`
+never moves. Until that is addressed, `wseen`'s coverage claim is limited to **management-frame
+detections**. Fixing it properly means either counting all WiFi frames before the split, or adding
+a separate `wdata` counter.
+
+**Remote ID loses its bearer.** `SRC_REMOTEID = 2` is documented in `detection.h` as "OpenDroneID
+payload (over BLE or WiFi)", so a drone receipt cannot tell which radio carried it and therefore
+cannot select the relevant health counter. Version 2 must report drone coverage as **not
+evaluated** unless the bearer is retained.
+
+### Unattended captures cannot claim integrity yet
+
+For a replayed deployment the footer must read:
+
+> Capture integrity across unattended reboots was not assessed.
+
+Three structural reasons:
+
+- **`bootCount` is not in Status.** It appears only on replayed records (`boot`), so a quiet
+  session may contain no record from which the current boot can be inferred.
+- **`sdBuf` resets in `acabScannerBegin()`**, so after an unattended reboot `sdBuf == 0` says
+  nothing about the boot that mattered.
+- **`co` is current sampled liveness**, not "healthy throughout", least of all while the phone was
+  disconnected.
+
+Honest coverage for unattended capture needs **persisted, deployment-scoped latches**: a
+buffer-bearing enqueue loss occurred, a co-processor or radio-health gap occurred, the buffer
+saturated (`bufsat` already is one), and the boot changed during the deployment.
+
+### Why the replay check needs all three numbers
+
+`hist:begin.n` is the number promised. `hist:end.n` is `gHistSent`, which counts records that were
+**sent**. A record exceeding `notifyCap()` is consumed from the drain and then skipped:
+
+```c
+if (detLogNextForDrain(&r)) {              // consumed from the ring
+    if (len > 0 && len <= notifyCap()) {   // counted only if it fits
+        ...notify...; gHistSent++;
+    }                                       // else: gone, and never counted
+}
+```
+
+`begin.n = 100, end.n = 99, received = 99` is reachable with one stored record silently skipped,
+and a `received == end.n` check passes. Compare all three.
+
+Both apps now do: `received == end.n` drives the gap/resync loop as before, and a
+`begin.n > end.n` shortfall is surfaced in the reconnect banner as records that could not be
+replayed. It is a disclosure, not a resync: the skipped record was consumed from the ring, so no
+retry can refill it.
+
+This is **replay completeness**, unrelated to `nOver`, which counts oversized *live* notifications.
+Replay oversize has no counter of its own.
+
+### Drop counters: what each one actually means
+
+| field | meaning | evidence impact |
+|---|---|---|
+| `sdBuf` | buffer-bearing enqueue failed | **permanent loss** of a record the user asked to keep |
+| `sdDeliv` | live notify dropped | **possible** loss, usually re-arrives on the next sighting, but a one-time advert never does |
+| `sdRepl` | replay/black-box dump attempt dropped | none, the source ring still holds it |
+| `nOver` | live record exceeded negotiated notify capacity | live observation lost |
+
+`sdDeliv` is not benign in the opportunistic case. A Falcon probe request or a single BLE advert
+that never repeats is exactly what this product exists to catch.
+
+`sdrop` is the sum of the first three. `sdrop == 0` does correctly imply `sdBuf == 0` **for the
+current boot**. Its problems are that a nonzero value is ambiguous between outcomes with very
+different meanings, and that it resets across reboots. Read the individual counters.
+
+### `buf` is storage used, NOT "records waiting for you"
+
+Observed 2026-08-08: a board reporting `buf=166` replayed 37 records, and the app correctly showed
+"37 detections recorded while you were away". Both numbers are right, and they answer different
+questions:
+
+| value | meaning |
+|---|---|
+| `buf` (`detLogCount`) = `gHead - gOldest` | **total ring occupancy**, everything stored, including records the phone has already replayed |
+| `detLogPendingDrain()` = `gHead - 1 - gDrain` | what a sync would actually deliver |
+
+Use `buf` for **storage used** and saturation context. Never label it "pending", "waiting" or
+"new". There is no status field for the pending count, `detLogPendingDrain()` is exposed **only**
+as `hist:begin.n`, so it can only be learned by starting a drain. The Stationary Capture "verify
+the final record count" step must compare against `hist:begin.n`, not `buf`.
+
+### What is NOT a receipt input
+
+- **`accounted=` is capture-build only**, and covers only the BLE marker table. It says nothing
+  about whether the radio heard everything, the nRF forwarded everything, or the shipping pipeline
+  lost anything.
+- **Vendor-confirmed vs solicited is capture instrumentation**, not a shipping classifier result.
+  Until that ships, no receipt can carry those two sentences.
+- **Neither app parses `bufsat`, `sdrop`, `sdBuf`, `sdDeliv` or `nOver` today.** The firmware emits
+  them; nothing consumes them. That ingestion is a prerequisite for version 2, not a follow-up.
+
+### Review checklist for any user-facing claim
+
+This section found four defects that were invisible from the UI side: `wseen` counting something
+other than its name, `buf` meaning something other than its label, `sdrop` conflating three
+outcomes, and `accounted=` being capture-only. None of those are rendering bugs. All of them would
+have shipped as confident text.
+
+Run this against every claim the product makes, not just receipts:
+
+| | |
+|---|---|
+| **Claim** | the exact sentence a user will read |
+| **Inputs** | which fields it is computed from, by wire key |
+| **Measurement scope** | what those fields actually count, which is often narrower than the name |
+| **Reset/persistence scope** | per boot, per session, per deployment, or lifetime |
+| **Unavailable-state wording** | what is said when an input is missing, never silence |
+| **App/firmware version compatibility** | behaviour when the board is newer than the app |
+
+The product's differentiator is not detection. It is the boundary between measurement and claim,
+and that boundary is only maintained by writing the claim contract before the screen.

@@ -1,6 +1,7 @@
 package tech.acab.app.ui
 
 import android.content.Context
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -13,8 +14,13 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -23,6 +29,7 @@ import androidx.compose.material.icons.automirrored.filled.ListAlt
 import androidx.compose.material.icons.filled.Percent
 import androidx.compose.material.icons.filled.SettingsInputAntenna
 import androidx.compose.material3.Icon
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -30,6 +37,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -63,7 +72,7 @@ private val TOUR_CARDS = listOf(
         Icons.Filled.SettingsInputAntenna,
         "your beacon is listening",
         "It scans on two radios at once and sends what it hears to your phone. You don't have to point it, aim it, or press anything.",
-        "It never transmits, jams, or spoofs. It only writes down what is already being broadcast.",
+        "Detection is passive: it does not jam, spoof, or control nearby devices. It only reports what they already broadcast.",
     ),
     TourCard(
         Icons.AutoMirrored.Filled.ListAlt,
@@ -77,16 +86,21 @@ private val TOUR_CARDS = listOf(
         "Each hit carries a percentage. 80 and up is a strong signature match. Under 50 means something looked similar and is worth a second glance, not an alarm.",
         "Tap a row for the full reasoning: which signal matched, and why the beacon scored it that way.",
     ),
+    // The body leads with "Most places are quiet." then the canonical empty-log wording (both
+    // kept in step with iOS): an empty log is a statement about compatible BROADCASTS, never a
+    // clean bill of health. Silent gear exists. The note names the right opt-in set: body cams
+    // default ON in firmware, so it is trackers and network cameras that need the settings trip.
     TourCard(
         Icons.Filled.CheckCircle,
         "quiet is a real result",
-        "Most places are quiet, and an empty Log usually means there is nothing to find, not that something is broken.",
-        "Want to see it work? Body cams and drones are common. Trackers and body cams are opt-in, switch them on in Device settings.",
+        "Most places are quiet. An empty log means no compatible radio broadcast was recognized nearby - not that nothing is there. Silent, wired, cellular-only, or powered-off equipment has nothing for beacons to hear.",
+        "Want to see it work? Body cams and drones are common. Trackers and network cameras are opt-in, switch them on in Beacon settings.",
     ),
 )
 
 @Composable
 fun FirstRunTourOverlay(onFinish: () -> Unit) {
+    BackHandler(onBack = onFinish)
     val pager = rememberPagerState(pageCount = { TOUR_CARDS.size })
     val scope = rememberCoroutineScope()
     // Full-bleed opaque surface with a swallow-taps click so nothing behind it can be reached
@@ -95,7 +109,18 @@ fun FirstRunTourOverlay(onFinish: () -> Unit) {
         Modifier
             .fillMaxSize()
             .background(Acab.bg)
-            .clickable(enabled = false) {},
+            .windowInsetsPadding(WindowInsets.safeDrawing)
+            // Consume only pointer changes no child handled. Skip/Next still receive their taps,
+            // while empty overlay space cannot reach the app beneath and no giant disabled
+            // TalkBack node is published for this touch shield.
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent(PointerEventPass.Final)
+                        event.changes.filterNot { it.isConsumed }.forEach { it.consume() }
+                    }
+                }
+            },
     ) {
         Column(Modifier.fillMaxSize()) {
             Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 10.dp),
@@ -108,8 +133,11 @@ fun FirstRunTourOverlay(onFinish: () -> Unit) {
 
             HorizontalPager(state = pager, modifier = Modifier.weight(1f)) { i ->
                 val c = TOUR_CARDS[i]
+                // Scrollable: at large font scales (or a short landscape window) a page's copy
+                // outgrows the viewport, and without the scroll the overflow was simply cut off.
                 Column(
-                    Modifier.fillMaxSize().padding(horizontal = 26.dp),
+                    Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                        .padding(horizontal = 26.dp, vertical = 18.dp),
                     verticalArrangement = Arrangement.Center,
                 ) {
                     Icon(c.icon, contentDescription = null, tint = Acab.accent,
@@ -148,6 +176,7 @@ fun FirstRunTourOverlay(onFinish: () -> Unit) {
                     .fillMaxWidth()
                     .padding(horizontal = 20.dp)
                     .padding(bottom = 26.dp)
+                    .minimumInteractiveComponentSize()
                     .background(Acab.accent, RoundedCornerShape(Acab.radiusSm))
                     .clickable {
                         if (last) onFinish()

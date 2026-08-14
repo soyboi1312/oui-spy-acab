@@ -25,7 +25,7 @@ enum class CombinedUpdatePhase {
     VERIFYING,         // nRF flashed; confirming the new version
     DONE,              // everything current
     FAILED,            // the flow stopped (see [CombinedUpdateProgress.reason])
-    PARTIAL,           // S3 took but the co-processor leg didn't finish (re-offer the nRF leg)
+    PARTIAL,           // a planned co-processor leg did not finish or could not be confirmed
 }
 
 /** One value at a time on [CombinedUpdateCoordinator.progress]: the phase, a merged 0..1 bar, a
@@ -45,6 +45,8 @@ data class CombinedUpdateProgress(
     /** Was a co-processor leg part of this run's plan? Lets the UI distinguish "the board updated
      *  and the second radio didn't" from "only the second radio was ever in scope". */
     val nrfPlanned: Boolean = false,
+    /** False once an S3 image has committed and the app must keep its reconnect/confirm loop alive. */
+    val canCancel: Boolean = false,
 ) {
     /** True while the flow is actively working (drives banner suppression + the progress UI). */
     val isRunning: Boolean
@@ -56,8 +58,9 @@ data class CombinedUpdateProgress(
 }
 
 /**
- * One-click combined update: a single "Update" flow that brings a beacon fully current, S3
- * application firmware FIRST, then, when it applies, the nRF co-processor. This COMPOSES the two
+ * One-click combined update: a single "Update" flow that brings a beacon fully current. It updates
+ * the nRF co-processor first while the physical-start authorization is live, then the S3
+ * application firmware. This COMPOSES the two
  * proven engines ([AcabBleManager.startOta] / [NrfDfuCoordinator]); it re-implements no transfer.
  * It only sequences them, maps their two progress streams onto one 0..1 bar, and self-heals the
  * seam where the S3 reboot reset-pulses the nRF (so its reported version briefly disappears).
@@ -74,6 +77,7 @@ class CombinedUpdateCoordinator(
     private val otaCapable: StateFlow<Boolean>,
     private val startS3: (FirmwareBuild) -> Unit,     // AcabBleManager.startOta
     private val cancelS3: () -> Unit,                 // AcabBleManager.cancelOta
+    private val canCancelS3: () -> Boolean,
     private val dismissS3: () -> Unit,                // AcabBleManager.clearOtaResult
     private val startNrf: (FirmwareBuild) -> Unit,    // AcabBleManager.startNrfUpdate
     private val cancelNrf: () -> Unit,                // AcabBleManager.cancelNrfUpdate
@@ -101,7 +105,7 @@ class CombinedUpdateCoordinator(
     private var startedAt = 0L
 
     // What we planned at the start, and how the 0..1 bar splits (single leg spans the whole bar;
-    // both legs split 0-60 / 60-100).
+    // both legs split nRF 0-40 / S3 40-100).
     private var s3Planned = false
     private var nrfPlanned = false
     private var s3Base = 0f; private var s3Span = 0f
@@ -113,7 +117,11 @@ class CombinedUpdateCoordinator(
     private var reconnectStartedAt = 0L
     private var nrfIndeterminateStartedAt = 0L
     private var verifyStartedAt = 0L
-    private var nrfRetried = false       // the nRF leg auto-retries exactly once
+    private var nrfFinished = false
+    // A Nordic callback has no attempt identity, so a second automatic transfer can overlap a
+    // late callback from the first. On failure we only request one fresh status read and decide
+    // whether the first attempt actually took; a real retry is a new user action after reconnect.
+    private var nrfFailureRecheckAt = 0L
 
     private var runJob: Job? = null
 
@@ -124,7 +132,11 @@ class CombinedUpdateCoordinator(
      *  strictly older than the manifest's. Mirrors iOS s3UpdateStale. */
     fun s3UpdateStale(build: FirmwareBuild): Boolean {
         if (!build.ota || !build.hasVerifiableImage || !otaCapable.value) return false
-        val installed = status.value?.version ?: return false
+        val live = status.value ?: return false
+        if (live.needsNewerApp) return false
+        if (build.manifestLabel.isBlank() || build.manifestLabel != live.firmwareLabel) return false
+        val installed = live.version
+        if (!isNumericFirmwareVersion(installed) || !isNumericFirmwareVersion(build.version)) return false
         return isOlderThan(installed, build.version)
     }
 
@@ -154,8 +166,8 @@ class CombinedUpdateCoordinator(
         s3Planned = s3
         nrfPlanned = nrf
         if (s3 && nrf) {
-            s3Base = 0f; s3Span = 0.60f            // S3 = 0-60%
-            nrfBase = 0.60f; nrfSpan = 0.40f       // nRF = 60-100%
+            nrfBase = 0f; nrfSpan = 0.40f          // nRF = 0-40%
+            s3Base = 0.40f; s3Span = 0.60f         // S3 = 40-100%
         } else if (s3) {
             s3Base = 0f; s3Span = 1.0f             // S3 spans the whole bar
             nrfBase = 1.0f; nrfSpan = 0f
@@ -164,7 +176,8 @@ class CombinedUpdateCoordinator(
             nrfBase = 0f; nrfSpan = 1.0f           // nRF spans the whole bar
         }
         s3Finished = false; s3DidUpdate = false; s3DoneAt = 0L; reconnectStartedAt = 0L
-        nrfIndeterminateStartedAt = 0L; verifyStartedAt = 0L; nrfRetried = false
+        nrfIndeterminateStartedAt = 0L; verifyStartedAt = 0L; nrfFailureRecheckAt = 0L
+        nrfFinished = false
         notice = null; reason = null; progressF = 0f; elapsed = 0
         startedAt = SystemClock.elapsedRealtime()
         phase = CombinedUpdatePhase.CHECKING
@@ -181,9 +194,9 @@ class CombinedUpdateCoordinator(
      *  reconnect/confirm loop and tell the user "cancelled" about an update that actually took.
      *  Let the engine finish quietly instead (iOS BLEManager+CombinedUpdate isCancellable parity). */
     fun cancel() {
-        if (!_progress.value.isRunning) return
+        if (!_progress.value.isRunning || !canCancelNow()) return
         stopDrivers()
-        if (otaCancellable()) cancelS3()
+        if (canCancelS3()) cancelS3()
         if (nrfProgress.value.isRunning) cancelNrf()
         releaseHold()
         phase = CombinedUpdatePhase.FAILED
@@ -209,7 +222,11 @@ class CombinedUpdateCoordinator(
 
     private fun beginFirstLeg() {
         val b = build ?: return
-        if (s3Planned) {
+        if (s3Planned && nrfPlanned) {
+            // Protocol v2 consumes a short physical-start authorization when the S3 relays the
+            // nRF handoff. Running the several-minute S3 reboot/confirm first can expire it.
+            beginNrfLeg()
+        } else if (s3Planned) {
             phase = CombinedUpdatePhase.UPDATING_S3
             startS3(b)
         } else {
@@ -276,7 +293,7 @@ class CombinedUpdateCoordinator(
     private fun driveS3() {
         when (otaProgress.value.phase) {
             OtaPhase.FAILED ->
-                // S3 failed: abort the whole flow, never touch the nRF.
+                // S3 failed: abort the whole flow. In a two-leg run the nRF may already be current.
                 fail(otaProgress.value.message.ifEmpty { "The board update failed." })
             OtaPhase.DONE -> {
                 // Engine handled reboot + reconnect + confirm internally.
@@ -341,9 +358,10 @@ class CombinedUpdateCoordinator(
             return
         }
 
-        // S3 finished (or was skipped). No planned co-processor leg -> done as soon as the S3 reboot
-        // settled; don't stall on a nrfv a single-radio board never reports.
-        if (!nrfPlanned) { decideNrfLeg(); return }
+        // No planned co-processor leg means done. In particular, an old protocol can become v2
+        // after this S3 update, but its warm OTA reboot does not open the physical-start window.
+        // Never discover and start an unplanned nRF leg here; the user must power-cycle first.
+        if (!nrfPlanned) { finish(CombinedUpdatePhase.DONE); return }
 
         // The S3 reboot reset-pulsed the nRF, so nrfv is briefly absent. Wait for it to repopulate
         // before re-evaluating the co-processor leg on a fresh Status.
@@ -355,14 +373,24 @@ class CombinedUpdateCoordinator(
 
     private fun decideNrfLeg() {
         val b = build ?: return
+        if (nrfFinished) {
+            val target = b.nrf?.version
+            val running = status.value?.nrfVersion
+            if (target != null && running != null && running >= target) {
+                finish(CombinedUpdatePhase.DONE)
+            } else {
+                notice = "The co-processor updated before the board restart, but the board is no longer reporting its target version. Reconnect and check it before retrying."
+                finish(CombinedUpdatePhase.PARTIAL)
+            }
+            return
+        }
         if (status.value?.nrfVersion == null) {
             if (nrfPlanned) {
                 // We meant to update the co-processor but can't read its version right now. Don't
-                // claim it updated; finish S3-only with a soft notice. The single button self-heals:
-                // staleness re-evaluates per Status frame, so it re-offers the nRF-only run once
-                // nrfv returns.
+                // claim it updated, and never call a planned two-radio run DONE without the target
+                // version. PARTIAL is the honest terminal; a fresh Status later can re-offer it.
                 notice = "Couldn't reach the co-processor to check its version - reconnect and try Update again if its update is available."
-                finish(if (s3DidUpdate) CombinedUpdatePhase.DONE else CombinedUpdatePhase.PARTIAL)
+                finish(CombinedUpdatePhase.PARTIAL)
             } else {
                 // Single-radio board (or no co-processor package): S3-only, cleanly done.
                 finish(CombinedUpdatePhase.DONE)
@@ -404,31 +432,55 @@ class CombinedUpdateCoordinator(
                 setProgress(nrfBase + nrfSpan * sub)
             }
             NrfDfuPhase.CONFIRMING -> {
-                // Best-effort confirm: the nRF engine resolves to DONE after a bounded wait even if
-                // the new version isn't re-reported, so this is "updated (verifying)", not a failure.
+                // The initiating S3 must report the target nRF version before this becomes DONE.
                 if (phase != CombinedUpdatePhase.VERIFYING) verifyStartedAt = now
                 phase = CombinedUpdatePhase.VERIFYING
                 val started = if (verifyStartedAt != 0L) verifyStartedAt else now
                 val t = ((now - started).toFloat() / CONFIRM_CREEP_MS).coerceAtMost(1f)
                 setProgress(nrfBase + nrfSpan * (0.875f + 0.125f * t * 0.9f))
             }
-            NrfDfuPhase.DONE -> finish(CombinedUpdatePhase.DONE)
+            NrfDfuPhase.DONE -> completeNrfLeg()
             NrfDfuPhase.FAILED -> {
-                if (!nrfRetried) {
-                    // Auto-retry the co-processor leg exactly once (the DFU is idempotent).
-                    nrfRetried = true
-                    nrfIndeterminateStartedAt = SystemClock.elapsedRealtime()
-                    phase = CombinedUpdatePhase.UPDATING_COPROC
-                    dismissNrf()               // reset FAILED -> IDLE so startNrf takes
-                    build?.let { startNrf(it) }
+                val target = build?.nrf?.version
+                val running = status.value?.nrfVersion
+                if (target != null && running != null && running >= target) {
+                    completeNrfLeg()
+                    return
+                }
+                if (nrfFailureRecheckAt == 0L) {
+                    // A completed transfer can beat the S3's UART/status refresh. Ask once and give
+                    // that live read a short bounded window before deciding. Do not start another
+                    // Nordic service: its callbacks have no run token and could overlap this one.
+                    nrfFailureRecheckAt = now
+                    phase = CombinedUpdatePhase.VERIFYING
+                    rereadStatus()
+                    return
+                }
+                if (now - nrfFailureRecheckAt < NRF_FAILURE_RECHECK_MS) return
+                val failure = nrfProgress.value.message.ifEmpty {
+                    "The co-processor update could not be confirmed. Reconnect and try again."
+                }
+                if (s3Planned && !s3Finished) {
+                    // The physical-authorized first leg failed. Do not continue into an unrelated
+                    // S3 flash and then describe the result as a successful combined update.
+                    fail(failure)
                 } else {
-                    // S3 already took (or wasn't needed); the co-processor didn't. Surface partial so
-                    // the same button can re-offer just the nRF leg.
-                    notice = nrfProgress.value.message
+                    notice = failure
                     finish(CombinedUpdatePhase.PARTIAL)
                 }
             }
             NrfDfuPhase.IDLE -> {}   // transient between a retry reset and the next start
+        }
+    }
+
+    private fun completeNrfLeg() {
+        nrfFinished = true
+        if (s3Planned && !s3Finished) {
+            dismissNrf()
+            phase = CombinedUpdatePhase.UPDATING_S3
+            build?.let { startS3(it) }
+        } else {
+            finish(CombinedUpdatePhase.DONE)
         }
     }
 
@@ -490,9 +542,11 @@ class CombinedUpdateCoordinator(
     /** Cancel only makes sense before the point of no return (the board reboot). REBOOTING and
      *  CONFIRMING are busy but NOT cancellable: the flash already committed and the engine is
      *  bringing the board back up. Mirrors iOS OtaState.isCancellable. */
-    private fun otaCancellable(): Boolean = when (otaProgress.value.phase) {
-        OtaPhase.CHECKING, OtaPhase.DOWNLOADING, OtaPhase.VERIFYING, OtaPhase.SENDING -> true
-        else -> false
+    private fun canCancelNow(): Boolean = when {
+        !phase.isRunningPhase() -> false
+        phase == CombinedUpdatePhase.UPDATING_S3 -> canCancelS3()
+        phase == CombinedUpdatePhase.RECONNECTING && s3Planned -> false
+        else -> true
     }
 
     private fun publish() {
@@ -505,6 +559,7 @@ class CombinedUpdateCoordinator(
             reason = reason,
             s3Updated = s3DidUpdate,
             nrfPlanned = nrfPlanned,
+            canCancel = canCancelNow(),
         )
     }
 
@@ -536,5 +591,6 @@ class CombinedUpdateCoordinator(
         private const val TRIGGER_CREEP_MS = 12_000L     // nRF trigger/scan band
         private const val CONFIRM_CREEP_MS = 30_000L     // nRF confirm band
         private const val NRFV_WAIT_MS = 15_000L         // wait for nrfv to come back
+        private const val NRF_FAILURE_RECHECK_MS = 5_000L
     }
 }

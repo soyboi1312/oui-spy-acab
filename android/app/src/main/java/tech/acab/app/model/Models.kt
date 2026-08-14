@@ -28,14 +28,12 @@ enum class DeviceType(val raw: Int) {
      * Key into `faq-content.json`'s `relatedHelp` map. These enum names ARE the keys, which is why
      * the shared JSON uses SCREAMING_CASE; iOS maps its own camelCase DeviceType onto them.
      *
-     * TWO KINDS OF "NO PANEL" HERE, and they are not the same thing:
-     *  - BODY_CAM and GLASSES are real keys the JSON has no entry for. RESERVED, not dead: both
-     *    already carry an experimental note on the dossier, and stacking a second hedge under it
-     *    reads as doubt about the detection rather than a pointer to context. If those notes ever
-     *    go away, add the entries and the panel appears with no code change.
-     *  - NEARBY_DEVICE and UNKNOWN return "", which means NEVER. Neither is a category a user can
-     *    have a question about: NEARBY_DEVICE is Desert mode's firehose, UNKNOWN is a parse
-     *    fallback. Mirrors iOS DeviceType.faqKey.
+     * Every real key now has a relatedHelp entry (BODY_CAM and GLASSES got theirs 2026-08-10;
+     * the earlier reserved-on-purpose state is over), and check-signature-drift.py FAILS the
+     * build if a real key ever loses its entry, so add the JSON row in the same commit as a new
+     * category. NEARBY_DEVICE and UNKNOWN return "", which means NEVER a panel: neither is a
+     * category a user can have a question about (NEARBY_DEVICE is Desert mode's firehose,
+     * UNKNOWN is a parse fallback). Mirrors iOS DeviceType.faqKey.
      */
     val faqKey: String
         get() = when (this) {
@@ -325,11 +323,16 @@ data class Detection(
             isNew = o.optBoolean("new", false),
             gpsAgeSec = if (o.has("gage")) o.optInt("gage") else null,
             hist = o.optBoolean("hist", false),
-            seq = if (o.has("seq")) o.optLong("seq") else 0L,
-            at = if (o.has("at")) o.optLong("at") else 0L,
+            // Clamped to the uint32 wire type (firmware det_log.h), matching iOS's UInt32
+            // narrowing. A negative seq flips fileHistory's pseudo-stamp subtraction into an
+            // addition, lifting a timeless record above HIST_PSEUDO_BASE where isApproxTime reads
+            // it as a REAL timestamp; a huge `at` overflows the at*1000 ms conversion. ms/boot
+            // ride the same clamp: they are uint32 on the wire and feed arithmetic too.
+            seq = (if (o.has("seq")) o.optLong("seq") else 0L).coerceIn(0L, 0xFFFF_FFFFL),
+            at = (if (o.has("at")) o.optLong("at") else 0L).coerceIn(0L, 0xFFFF_FFFFL),
             approx = o.optBoolean("approx", false),
-            ms = if (o.has("ms")) o.optLong("ms") else 0L,
-            boot = if (o.has("boot")) o.optLong("boot") else 0L,
+            ms = (if (o.has("ms")) o.optLong("ms") else 0L).coerceIn(0L, 0xFFFF_FFFFL),
+            boot = (if (o.has("boot")) o.optLong("boot") else 0L).coerceIn(0L, 0xFFFF_FFFFL),
             // Only ever set on the persisted-reload path (detectionToJson writes it); a live
             // wire frame never carries "offline", so live records stay false. The replay path
             // sets it in the manager after fromJson, not off the wire.
@@ -516,7 +519,7 @@ data class DeviceStatus(
     companion object {
         /** Newest BLE JSON contract this build can parse. Raise it in the SAME commit that teaches
          *  the app that contract, never ahead of it. Mirrors iOS supportedProtoVersion. */
-        const val SUPPORTED_PROTO_VERSION = 1
+        const val SUPPORTED_PROTO_VERSION = 2
 
         fun fromJson(o: JSONObject) = DeviceStatus(
             firmware = o.optString("fw", ""),

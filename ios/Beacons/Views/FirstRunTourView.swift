@@ -26,7 +26,7 @@ struct FirstRunTourView: View {
         Card(glyph: "dot.radiowaves.left.and.right",
              title: "your beacon is listening",
              body: "It scans on two radios at once and sends what it hears to your phone. You don't have to point it, aim it, or press anything.",
-             note: "It never transmits, jams, or spoofs. It only writes down what is already being broadcast."),
+             note: "Detection is passive: it does not jam, spoof, or control nearby devices. It only reports what they already broadcast."),
         Card(glyph: "list.bullet.rectangle",
              title: "the Log is the answer",
              body: "Every device it recognizes lands in the Log, newest first. Tap any row to see what it is, how sure the beacon is, and where you were when it was heard.",
@@ -35,10 +35,14 @@ struct FirstRunTourView: View {
              title: "read the confidence number",
              body: "Each hit carries a percentage. 80 and up is a strong signature match. Under 50 means something looked similar and is worth a second glance, not an alarm.",
              note: "Tap a row for the full reasoning: which signal matched, and why the beacon scored it that way."),
+        // The empty-log sentence is canonical, shared with Android: the old wording ("nothing
+        // to find") over-promised. An empty log only means nothing RECOGNIZABLE was BROADCASTING,
+        // and equipment that is silent, wired, cellular-backhauled or off is invisible to this
+        // hardware by design.
         Card(glyph: "checkmark.circle",
              title: "quiet is a real result",
-             body: "Most places are quiet, and an empty Log usually means there is nothing to find, not that something is broken.",
-             note: "Want to see it work? Body cams and drones are common. Trackers and body cams are opt-in, switch them on in Device settings."),
+             body: "Most places are quiet. An empty log means no compatible radio broadcast was recognized nearby - not that nothing is there. Silent, wired, cellular-only, or powered-off equipment has nothing for beacons to hear.",
+             note: "Want to see it work? Body cams and drones are common. Trackers and network cameras are opt-in, switch them on in Beacon settings."),
     ]
 
     var body: some View {
@@ -48,6 +52,8 @@ struct FirstRunTourView: View {
                 Button("Skip") { finish() }
                     .font(ACABTheme.mono(12, weight: .medium))
                     .foregroundStyle(ACABTheme.dim)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
             }
             .padding(.horizontal, 20).padding(.top, 18)
 
@@ -93,33 +99,43 @@ struct FirstRunTourView: View {
                                            // half-swiped away and marked seen without being read
     }
 
+    /// Wrapped in a ScrollView so large Dynamic Type never clips a card: at accessibility
+    /// sizes a page's text outgrows the fixed TabView page and was simply cut off. The inner
+    /// minHeight keeps the Spacer-centering at default sizes, so the page looks exactly as
+    /// before whenever the content still fits; it only starts scrolling once it does not.
     private func cardView(_ c: Card) -> some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Spacer(minLength: 0)
-            Image(systemName: c.glyph)
-                .font(.system(size: 34, weight: .regular))
-                .foregroundStyle(ACABTheme.accent)
-            Text(c.title)
-                .font(ACABTheme.display(23, weight: .semibold))
-                .foregroundStyle(ACABTheme.text)
-                .fixedSize(horizontal: false, vertical: true)
-            Text(c.body)
-                .font(ACABTheme.mono(12.5))
-                .foregroundStyle(ACABTheme.dim)
-                .lineSpacing(3)
-                .fixedSize(horizontal: false, vertical: true)
-            if let n = c.note {
-                Text(n)
-                    .font(ACABTheme.mono(10.5))
-                    .foregroundStyle(ACABTheme.faint)
-                    .lineSpacing(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 2)
+        GeometryReader { geo in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Spacer(minLength: 0)
+                    Image(systemName: c.glyph)
+                        .font(.system(size: 34, weight: .regular))
+                        .foregroundStyle(ACABTheme.accent)
+                    Text(c.title)
+                        .font(ACABTheme.display(23, weight: .semibold))
+                        .foregroundStyle(ACABTheme.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(c.body)
+                        .font(ACABTheme.mono(12.5))
+                        .foregroundStyle(ACABTheme.dim)
+                        .lineSpacing(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let n = c.note {
+                        Text(n)
+                            .font(ACABTheme.mono(10.5))
+                            .foregroundStyle(ACABTheme.faint)
+                            .lineSpacing(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 2)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 26)
+                .frame(minHeight: geo.size.height)
             }
-            Spacer(minLength: 0)
+            .scrollBounceBehavior(.basedOnSize)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 26)
     }
 
     private func finish() {

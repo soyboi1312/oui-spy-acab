@@ -21,10 +21,17 @@ final class DeviceStatusProtoTests: XCTestCase {
         XCTAssertFalse(s.needsNewerApp, "older firmware must never demand a newer app")
     }
 
-    func testProtoEqualToSupportedIsCompatible() throws {
+    func testProtoBelowSupportedIsCompatible() throws {
         let s = try status(#"{"fw":"beacon board 2.0.4","proto":1}"#)
         XCTAssertEqual(s.protoVersion, 1)
         XCTAssertFalse(s.needsNewerApp)
+    }
+
+    func testProtoEqualToSupportedIsCompatible() throws {
+        let s = try status(#"{"fw":"beacon board 2.0.5","proto":2,"bodycam":true}"#)
+        XCTAssertEqual(s.protoVersion, 2)
+        XCTAssertFalse(s.needsNewerApp)
+        XCTAssertTrue(s.axon, "the v2 bodycam alias must land on the body-cam field")
     }
 
     func testProtoGreaterThanSupportedAsksForANewerApp() throws {
@@ -44,7 +51,7 @@ final class DeviceStatusProtoTests: XCTestCase {
 
     /// Both platforms must agree on the supported version, or one will warn where the other does not.
     func testSupportedVersionMatchesTheAndroidConstant() {
-        XCTAssertEqual(DeviceStatus.supportedProtoVersion, 1,
+        XCTAssertEqual(DeviceStatus.supportedProtoVersion, 2,
                        "must equal DeviceStatus.SUPPORTED_PROTO_VERSION in Android Models.kt")
     }
 }

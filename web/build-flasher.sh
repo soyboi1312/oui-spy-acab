@@ -11,6 +11,18 @@
 # two repos). Run that one to refresh the beacon-board flasher and firmware-latest.json entry.
 set -euo pipefail
 
+# --unsigned-usb-only: explicitly stage an UNSIGNED cut (empty manifest sigs, in-app OTA disabled).
+# Without it, a missing signing key ABORTS instead of warn-and-continue, matching release.sh's
+# posture: the two entry points must not disagree, or the lenient one quietly publishes a manifest
+# whose empty sig makes every in-app OTA fail in the field.
+UNSIGNED_OK=0
+for arg in "$@"; do
+  case "$arg" in
+    --unsigned-usb-only) UNSIGNED_OK=1 ;;
+    *) echo "unknown argument: $arg (only --unsigned-usb-only is accepted)"; exit 1 ;;
+  esac
+done
+
 # Vendor guard. web/index.html loads ./vendor/esp-web-tools/install-button.js as a module, and
 # .github/workflows/pages.yml deploys `path: web` on any push touching web/**. All 28 files under
 # web/vendor/esp-web-tools/ were UNTRACKED, with no .gitignore rule covering them, so a deploy
@@ -123,7 +135,16 @@ if [ -n "$SIBLING" ] && [ -f "$SIBLING/firmware-latest.json" ] && [ -n "${VER:-}
     rm -f "$tmp"
   }
   if [ ! -f "$OTA_KEY" ]; then
-    echo "!! WARNING: OTA signing key not found at $OTA_KEY; sigs left empty (in-app OTA disabled)"
+    if [ "$UNSIGNED_OK" = "1" ]; then
+      echo "!! WARNING: OTA signing key not found at $OTA_KEY; sigs left empty (in-app OTA disabled)"
+      echo "!! (--unsigned-usb-only passed: continuing on your explicit say-so)"
+    else
+      echo "!! OTA signing key not found at $OTA_KEY."
+      echo "!! An empty sig ships a manifest every board rejects in the field (silent bricked-update"
+      echo "!! release). Restore the offline key, or pass --unsigned-usb-only to stage an explicitly"
+      echo "!! unsigned USB-only cut."
+      exit 1
+    fi
   fi
   SIG_OUISPY="$(sig_hex "$ROOT/web/firmware/acab-oui-spy-app.bin")"
   SIG_MESH="$(sig_hex "$ROOT/web/firmware/acab-mesh-detect-app.bin")"

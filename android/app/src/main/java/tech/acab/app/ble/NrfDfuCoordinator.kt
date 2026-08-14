@@ -25,11 +25,16 @@ import no.nordicsemi.android.dfu.DfuServiceInitiator
 import no.nordicsemi.android.dfu.DfuServiceListenerHelper
 import tech.acab.app.model.DeviceStatus
 import tech.acab.app.net.FirmwareBuild
+import tech.acab.app.net.NrfBuild
+import tech.acab.app.net.firmwareArtifactResponseAllowed
+import tech.acab.app.net.trustedFirmwareArtifactUrl
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.net.HttpURLConnection
-import java.net.URL
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
 
 enum class NrfDfuPhase { IDLE, PREPARING, TRIGGERING, SCANNING, FLASHING, CONFIRMING, DONE, FAILED }
 
@@ -55,32 +60,47 @@ class NrfDfuCoordinator(
     private val adapter: BluetoothAdapter?,
     private val scope: CoroutineScope,
     private val sendTrigger: () -> Unit,           // writeConfig {"nrfdfu": true}
+    private val requestStatus: () -> Unit,
     private val statusProvider: () -> DeviceStatus?, // for the post-flash version confirm
     private val otaInProgress: () -> Boolean,      // true while an S3 OTA is live (never overlap)
+    /** Monotonic identity of the encrypted S3 GATT session that owns this attempt. */
+    private val linkSessionProvider: () -> Long,
+    private val linkReady: () -> Boolean,
+    /** Increments for every status frame, including identical values. */
+    private val statusRevisionProvider: () -> Long,
 ) {
     private val _progress = MutableStateFlow(NrfDfuProgress())
     val progress: StateFlow<NrfDfuProgress> = _progress.asStateFlow()
 
     private var job: Job? = null
     private var scanCb: ScanCallback? = null
+    private var preflightScanCb: ScanCallback? = null
     private var confirmTarget: Int = 0
+    private var ownerSession: Long? = null
+    private var triggerStatusRevision = 0L
+    private var triggerSent = false
+    /** A board-touched failed run may still have replies in this GATT's queues. Never reuse it. */
+    private var quarantinedSession: Long? = null
     private val main = Handler(Looper.getMainLooper())
 
-    // START-phase stall recovery, mirroring the iOS NrfDfuFlasher winning stack (proven on
+    // START-phase stall watchdog, mirroring the iOS NrfDfuFlasher stack (proven on
     // hardware 2026-07-23). Two field-confirmed failure modes wedge the legacy START handshake
     // indefinitely: the image-size write dropped under radio congestion, and the Adafruit
-    // bootloader stalling in its erase-before-response window. Both recover on a fresh attempt, so
-    // we watchdog the window between start() and the first upload progress and, on expiry, abort +
-    // rescan + retry, bounded.
+    // bootloader stalling in its erase-before-response window. We watchdog the window between
+    // start() and the first upload progress and fail the whole attempt on expiry. Nordic callbacks
+    // have no attempt identity, so an automatic overlapping retry is unsafe.
     private var dfuController: no.nordicsemi.android.dfu.DfuServiceController? = null
     private var pendingZip: File? = null
-    private var retryCount = 0
     private var intentionalAbort = false   // our own stall-recovery abort must not read as failure
     private var pastStart = false          // true once upload progress begins (watchdog disarm)
     private var listenerRegistered = false
     private var settleRunnable: Runnable? = null
     private var watchdogRunnable: Runnable? = null
     private var scanTimeoutRunnable: Runnable? = null
+    private var armReplyTimeoutRunnable: Runnable? = null
+    private var candidateWindowRunnable: Runnable? = null
+    private var preflightWindowRunnable: Runnable? = null
+    private val closeCandidates = LinkedHashMap<String, Int>()
 
     companion object {
         // Legacy Nordic DFU service, advertised by the Adafruit/Seeed bootloader in OTA mode.
@@ -91,12 +111,15 @@ class NrfDfuCoordinator(
         // connect + service discovery + START + the bootloader's erase-before-response all fit well
         // inside this; the first upload-progress callback disarms it.
         private const val START_WATCHDOG_MS = 25_000L
-        private const val RETRY_BACKOFF_MS = 2_000L
-        private const val MAX_START_RETRIES = 3
+        private const val ARM_REPLY_TIMEOUT_MS = 10_000L
+        // A qualifying advertiser is not selected immediately. Give the scanner a short window to
+        // reveal a second nearby AdaDFU and refuse ambiguity rather than flash whichever callback won.
+        private const val PREFLIGHT_WINDOW_MS = 2_000L
+        private const val CANDIDATE_WINDOW_MS = 2_000L
         // Proximity gate: the UI tells the user to hold the phone next to the beacon, so a real
         // target is loud. Reject weaker advertisers so a wildcard-signed zip can't flash a
         // neighbor board that happens to be in bootloader mode. 127 = RSSI unavailable.
-        private const val MIN_RSSI = -70
+        private const val MIN_RSSI = -55
         // The stock Adafruit/Seeed bootloader HARD-FAILS the transfer (Response op=3 status=6
         // "Operation failed" + disconnect, seen on hardware 2026-07-23) when data packets outrun
         // its shallow HCI RX queue. Adafruit's guidance: OTA needs PRN <= 8; the library default is
@@ -146,10 +169,15 @@ class NrfDfuCoordinator(
      *  Gated: with [NRF_DFU_ENABLED] false this is always false, so the update is never OFFERED -
      *  the combined flow's staleness check ORs this in, so it simply plans an S3-only run. */
     fun updateAvailable(build: FirmwareBuild): Boolean {
-        if (!NRF_DFU_ENABLED) return false
-        val nrf = build.nrf ?: return false
-        val running = statusProvider()?.nrfVersion ?: return false
-        return nrf.hasVerifiableImage && nrf.version > running
+        val status = statusProvider()
+        return nrfUpdateOfferAllowed(
+            releaseEnabled = NRF_DFU_ENABLED,
+            nrf = build.nrf,
+            buildLabel = build.manifestLabel,
+            liveLabel = status?.firmwareLabel,
+            runningVersion = status?.nrfVersion,
+            protocolVersion = status?.protoVersion,
+        )
     }
 
     fun startUpdate(build: FirmwareBuild) {
@@ -167,21 +195,71 @@ class NrfDfuCoordinator(
             set(NrfDfuPhase.FAILED, 0, "Finish the board update first, then update the co-processor.")
             return
         }
+        if (!linkReady()) {
+            set(NrfDfuPhase.FAILED, 0, "The board isn't connected. Reconnect and try again.")
+            return
+        }
+        val session = linkSessionProvider()
+        if (quarantinedSession == session) {
+            set(NrfDfuPhase.FAILED, 0,
+                "Reconnect to the beacon before retrying the co-processor update. This clears any delayed update replies from the previous attempt.")
+            return
+        }
+        val liveStatus = statusProvider()
+        if (liveStatus?.needsNewerApp != false) {
+            set(NrfDfuPhase.FAILED, 0,
+                "This board needs a newer version of the app before it can be updated safely.")
+            return
+        }
+        if (liveStatus.protoVersion != DeviceStatus.SUPPORTED_PROTO_VERSION) {
+            set(NrfDfuPhase.FAILED, 0,
+                "Update the board firmware first, then power-cycle and reconnect before updating the co-processor.")
+            return
+        }
+        if (liveStatus.nrfUpdating) {
+            set(NrfDfuPhase.FAILED, 0,
+                "The co-processor is already in update mode. Wait for it to finish, then reconnect before trying again.")
+            return
+        }
+        val runningNrfVersion = liveStatus.nrfVersion
+        if (runningNrfVersion == null) {
+            set(NrfDfuPhase.FAILED, 0,
+                "The beacon did not report its co-processor version. Refresh its status and try again.")
+            return
+        }
+        val liveLabel = liveStatus.firmwareLabel
+        if (build.manifestLabel.isBlank() || build.manifestLabel != liveLabel) {
+            set(NrfDfuPhase.FAILED, 0,
+                "This update package does not match the connected board. Refresh its status and try again.")
+            return
+        }
         val nrf = build.nrf
-        if (nrf == null || !nrf.hasVerifiableImage) {
+        if (nrf == null || !nrf.ota || !nrf.hasVerifiableImage) {
             set(NrfDfuPhase.FAILED, 0, "No verified co-processor update is published for this board yet.")
             return
         }
+        if (nrf.version <= runningNrfVersion) {
+            set(NrfDfuPhase.FAILED, 0, "The co-processor is already on this version or newer.")
+            return
+        }
         confirmTarget = nrf.version
-        retryCount = 0
+        ownerSession = session
+        triggerStatusRevision = 0L
+        triggerSent = false
         intentionalAbort = false
         pastStart = false
         DfuServiceInitiator.createDfuNotificationChannel(context)
 
-        job = scope.launch {
+        // All state-machine transitions and scanner ownership are main-thread serialized. Only the
+        // bounded download/verification body leaves Main below.
+        job = scope.launch(Dispatchers.Main.immediate) {
             set(NrfDfuPhase.PREPARING, 0, "Preparing update…")
             val zipFile = try {
-                withContext(Dispatchers.IO) { downloadAndVerify(nrf.zipUrl, nrf.size, nrf.sha256, nrf.sig) }
+                withContext(Dispatchers.IO) {
+                    downloadAndVerify(
+                        nrf.zipUrl, nrf.size, nrf.sha256, nrf.sig, nrf.version,
+                    )
+                }
             } catch (e: CancellationException) {
                 // cancel() already owns the state ("Co-processor update cancelled."). The blocking
                 // HTTP read isn't interruptible, so this zombie resume can land seconds later; it
@@ -193,10 +271,93 @@ class NrfDfuCoordinator(
                     ?: "Couldn't download the co-processor update. Check your connection and try again.")
                 return@launch
             }
-            // Trigger the nRF into its bootloader, then look for AdaDFU.
-            set(NrfDfuPhase.TRIGGERING, 0, "Starting co-processor update mode…")
-            main.post { sendTrigger() }
-            scanForDfuTarget(zipFile)
+            if (!ownsLiveSession()) {
+                set(NrfDfuPhase.FAILED, 0,
+                    "The board changed before the co-processor update could start. Reconnect and try again.")
+                return@launch
+            }
+            // First prove no generic AdaDFU target was already nearby. The bootloader has no board
+            // identity, so a pre-existing candidate cannot be associated with this trigger.
+            set(NrfDfuPhase.PREPARING, 0, "Checking for other devices already in update mode…")
+            pendingZip = zipFile
+            main.post {
+                if (!ownsLiveSession() || _progress.value.phase != NrfDfuPhase.PREPARING) {
+                    set(NrfDfuPhase.FAILED, 0,
+                        "The board changed before the co-processor update could start. Reconnect and try again.")
+                    return@post
+                }
+                verifyNoPreexistingDfuTarget { armDfuHandoff(zipFile) }
+            }
+        }
+    }
+
+    private fun armDfuHandoff(zipFile: File) {
+        if (!ownsLiveSession() || _progress.value.phase != NrfDfuPhase.PREPARING) {
+            set(NrfDfuPhase.FAILED, 0,
+                "The board changed before the co-processor update could start. Reconnect and try again.")
+            return
+        }
+        // Protocol v2 explicitly accepts or denies the physical-start gate. Do not scan until this
+        // encrypted session then reports a fresh nrfup handoff.
+        set(NrfDfuPhase.TRIGGERING, 0, "Starting co-processor update mode…")
+        triggerStatusRevision = statusRevisionProvider()
+        triggerSent = true
+        sendTrigger()
+        val timeout = Runnable {
+            if (_progress.value.phase == NrfDfuPhase.TRIGGERING) {
+                set(NrfDfuPhase.FAILED, 0,
+                    "The beacon did not acknowledge co-processor update mode. Power-cycle it, reconnect, and retry within two minutes.")
+            }
+        }
+        armReplyTimeoutRunnable = timeout
+        main.postDelayed(timeout, ARM_REPLY_TIMEOUT_MS)
+    }
+
+    /** Protocol-v2 reply from the initiating board's authenticated OTA notification channel. */
+    fun handleArmReply(allowed: Boolean, sourceSession: Long) {
+        main.post {
+            if (_progress.value.phase != NrfDfuPhase.TRIGGERING ||
+                ownerSession != sourceSession || !ownsLiveSession()) return@post
+            val zip = pendingZip
+            if (!allowed) {
+                armReplyTimeoutRunnable?.let { main.removeCallbacks(it) }
+                armReplyTimeoutRunnable = null
+                set(NrfDfuPhase.FAILED, 0,
+                    "For safety, co-processor updates require a recent physical start. Power-cycle the beacon, reconnect, and retry within two minutes.")
+            } else if (zip == null) {
+                armReplyTimeoutRunnable?.let { main.removeCallbacks(it) }
+                armReplyTimeoutRunnable = null
+                set(NrfDfuPhase.FAILED, 0,
+                    "The co-processor update package was no longer available. Retry the update.")
+            } else {
+                // Acceptance precedes the loop-task drain's final secure-window recheck. Wait for
+                // status.nrfup, which proves this S3 actually forwarded the command. Keep the
+                // original timeout armed: nrf-ready alone is not the handoff.
+                requestStatus()
+            }
+        }
+    }
+
+    /** Status-side proof of the actual S3-to-nRF handoff, and fallback for a lost optional ack. */
+    fun handleStatusUpdate(status: DeviceStatus, sourceSession: Long, revision: Long) {
+        main.post {
+            if (!nrfHandoffStatusIsFresh(
+                    protoVersion = status.protoVersion,
+                    nrfUpdating = status.nrfUpdating,
+                    statusRevision = revision,
+                    triggerRevision = triggerStatusRevision,
+                    ownerSession = ownerSession,
+                    sourceSession = sourceSession,
+                ) || !ownsLiveSession() ||
+                _progress.value.phase != NrfDfuPhase.TRIGGERING) return@post
+            val zip = pendingZip ?: run {
+                set(NrfDfuPhase.FAILED, 0,
+                    "The co-processor update package was no longer available. Retry the update.")
+                return@post
+            }
+            armReplyTimeoutRunnable?.let { main.removeCallbacks(it) }
+            armReplyTimeoutRunnable = null
+            scanForDfuTarget(zip)
         }
     }
 
@@ -212,6 +373,24 @@ class NrfDfuCoordinator(
         if (_progress.value.isRunning) set(NrfDfuPhase.FAILED, 0, "Co-processor update cancelled.")
     }
 
+    /** The generic AdaDFU link has no board identity of its own. If its owning S3 link ends, abort
+     *  immediately instead of letting a nearby bootloader continue under a different session. */
+    fun onLinkTeardown(endedSession: Long) {
+        main.post {
+            if (ownerSession != endedSession || !_progress.value.isRunning) return@post
+            job?.cancel(); job = null
+            stopScan()
+            clearPendingCallbacks()
+            if (_progress.value.phase == NrfDfuPhase.FLASHING) {
+                intentionalAbort = true
+                sendAbortBroadcast()
+            }
+            unregisterDfuListener()
+            set(NrfDfuPhase.FAILED, 0,
+                "The beacon connection ended during the co-processor update. Reconnect and try again.")
+        }
+    }
+
     fun dismiss() {
         if (!_progress.value.isRunning) set(NrfDfuPhase.IDLE, 0, "")
     }
@@ -220,14 +399,83 @@ class NrfDfuCoordinator(
 
     private class PrepError(val msg: String) : Exception(msg)
 
-    private fun downloadAndVerify(url: String, expectedSize: Long, expectedSha: String, sigHex: String): File {
-        val parsed = URL(url)
-        if (!parsed.protocol.equals("https", ignoreCase = true)) throw PrepError("Update URL must be https.")
+    /** Observe the generic bootloader namespace before triggering this board. Any already-close
+     * AdaDFU makes identity unknowable, so fail before changing hardware state. */
+    @SuppressLint("MissingPermission")
+    private fun verifyNoPreexistingDfuTarget(onClear: () -> Unit) {
+        val scanner = runCatching { adapter?.bluetoothLeScanner }.getOrNull()
+        if (scanner == null) {
+            set(NrfDfuPhase.FAILED, 0, "Bluetooth is off.")
+            return
+        }
+        val found = LinkedHashSet<String>()
+        val cb = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                if (preflightScanCb !== this) return
+                val address = matchingCloseDfuAddress(result) ?: return
+                found += address
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                if (preflightScanCb !== this) return
+                stopPreflightScan()
+                set(NrfDfuPhase.FAILED, 0,
+                    "Couldn't check for other update-mode devices. Reconnect and try again.")
+            }
+        }
+        preflightScanCb = cb
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        runCatching { scanner.startScan(null, settings, cb) }
+            .onFailure {
+                stopPreflightScan()
+                set(NrfDfuPhase.FAILED, 0,
+                    "Couldn't check for other update-mode devices. Reconnect and try again.")
+                return
+            }
+        val finish = Runnable {
+            if (preflightScanCb !== cb) return@Runnable
+            stopPreflightScan()
+            preflightWindowRunnable = null
+            if (_progress.value.phase != NrfDfuPhase.PREPARING || !ownsLiveSession()) {
+                if (_progress.value.phase == NrfDfuPhase.PREPARING) {
+                    set(NrfDfuPhase.FAILED, 0,
+                        "The board connection changed during the safety check. Reconnect and try again.")
+                }
+            } else if (!preflightDfuClear(found)) {
+                set(NrfDfuPhase.FAILED, 0,
+                    "A nearby co-processor was already in update mode, so it cannot be tied safely to this beacon. Move it away or recover it, then reconnect and try again.")
+            } else {
+                onClear()
+            }
+        }
+        preflightWindowRunnable = finish
+        main.postDelayed(finish, PREFLIGHT_WINDOW_MS)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopPreflightScan() {
+        val cb = preflightScanCb ?: return
+        preflightScanCb = null
+        runCatching { adapter?.bluetoothLeScanner?.stopScan(cb) }
+    }
+
+    private fun downloadAndVerify(
+        url: String,
+        expectedSize: Long,
+        expectedSha: String,
+        sigHex: String,
+        expectedVersion: Int,
+    ): File {
+        val parsed = trustedFirmwareArtifactUrl(url)
+            ?: throw PrepError("The co-processor update URL was not from the trusted firmware host.")
         val conn = (parsed.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"; connectTimeout = 15_000; readTimeout = 20_000
+            instanceFollowRedirects = false
         }
         val bytes = try {
-            if (conn.responseCode != HttpURLConnection.HTTP_OK)
+            val responseCode = conn.responseCode
+            if (!firmwareArtifactResponseAllowed(parsed, conn.url, responseCode))
                 throw PrepError("Couldn't download the co-processor update. Check your connection and try again.")
             val cap = expectedSize.coerceIn(1L, 4L * 1024 * 1024) + 4096
             val out = java.io.ByteArrayOutputStream(cap.toInt())
@@ -251,6 +499,13 @@ class NrfDfuCoordinator(
         // App-side signature gate: the ONLY gate for the nRF (its bootloader can't verify our sig).
         if (!NrfDfuSignature.isValid(bytes, sigHex))
             throw PrepError("The co-processor update couldn't be verified as signed by the beacon maker, so it wasn't installed.")
+        val embeddedVersion = nrfPackageApplicationVersion(bytes)
+            ?: throw PrepError("The signed co-processor package did not contain a valid embedded application version, so it wasn't installed.")
+        if (embeddedVersion != expectedVersion.toLong()) {
+            throw PrepError(
+                "The signed co-processor package identifies as version $embeddedVersion instead of $expectedVersion, so it wasn't installed.",
+            )
+        }
 
         val f = File(context.cacheDir, "beacon-nrf-dfu.zip")
         f.writeBytes(bytes)
@@ -259,8 +514,16 @@ class NrfDfuCoordinator(
 
     @SuppressLint("MissingPermission")
     private fun scanForDfuTarget(zipFile: File) {
+        if (!ownsLiveSession()) {
+            set(NrfDfuPhase.FAILED, 0,
+                "The board connection changed before the co-processor appeared. Reconnect and try again.")
+            return
+        }
         pendingZip = zipFile
-        val scanner = adapter?.bluetoothLeScanner
+        closeCandidates.clear()
+        candidateWindowRunnable?.let { main.removeCallbacks(it) }
+        candidateWindowRunnable = null
+        val scanner = runCatching { adapter?.bluetoothLeScanner }.getOrNull()
         if (scanner == null) { set(NrfDfuPhase.FAILED, 0, "Bluetooth is off."); return }
         set(NrfDfuPhase.SCANNING, 0, "Looking for the co-processor in update mode…")
 
@@ -273,31 +536,21 @@ class NrfDfuCoordinator(
                 // enqueuing a doomed second transfer into the DfuBaseService queue. Drop anything
                 // from a callback that is no longer the active scan.
                 if (scanCb !== this) return
-                val addr = result.device?.address ?: return
-                // Match by name OR the advertised DFU service. The bootloader's DFU service is a
-                // 128-bit UUID that can ride in the scan response, which a hardware ScanFilter
-                // matches unreliably; the name "AdaDFU" is the reliable key. We scan unfiltered and
-                // decide here.
-                val name = runCatching { result.device?.name }.getOrNull()
-                    ?: result.scanRecord?.deviceName
-                val hasService = result.scanRecord?.serviceUuids?.any { it.uuid == DFU_SERVICE } == true
-                if (name?.equals("AdaDFU", ignoreCase = true) != true && !hasService) return
-                // Proximity gate (iOS parity: guard rssi != 127, rssi > -70). Without it ANY
-                // Adafruit/Seeed board in bootloader mode nearby matches the name and would accept
-                // our wildcard zip. 127 = RSSI unavailable.
+                val addr = matchingDfuAddress(result) ?: return
                 val rssi = result.rssi
-                if (rssi == 127 || rssi <= MIN_RSSI) {
-                    set(NrfDfuPhase.SCANNING, 0, "A co-processor is in update mode but too far. Hold the phone closer.")
+                if (!isCloseDfuRssi(rssi)) {
+                    if (closeCandidates.isEmpty()) {
+                        set(NrfDfuPhase.SCANNING, 0, "A co-processor is in update mode but too far. Hold the phone closer.")
+                    }
                     return
                 }
-                stopScan()
-                clearScanTimeout()
-                // Settle before opening the transfer: lets the Adafruit HCI queue drain so the
-                // START-phase image-size write isn't silently discarded under radio congestion.
-                set(NrfDfuPhase.SCANNING, 0, "Found the co-processor; settling…")
-                val r = Runnable { beginDfu(addr, zipFile) }
-                settleRunnable = r
-                main.postDelayed(r, SETTLE_MS)
+                closeCandidates[addr] = maxOf(closeCandidates[addr] ?: Int.MIN_VALUE, rssi)
+                if (candidateWindowRunnable == null) {
+                    set(NrfDfuPhase.SCANNING, 0, "Checking that only this co-processor is nearby…")
+                    val r = Runnable { chooseDfuCandidate(zipFile) }
+                    candidateWindowRunnable = r
+                    main.postDelayed(r, CANDIDATE_WINDOW_MS)
+                }
             }
         }
         scanCb = cb
@@ -319,6 +572,51 @@ class NrfDfuCoordinator(
         main.postDelayed(to, SCAN_TIMEOUT_MS)
     }
 
+    @SuppressLint("MissingPermission")
+    private fun matchingDfuAddress(result: ScanResult): String? {
+        val address = runCatching { result.device?.address }.getOrNull() ?: return null
+        val name = runCatching { result.device?.name }.getOrNull()
+            ?: result.scanRecord?.deviceName
+        val hasService = result.scanRecord?.serviceUuids?.any { it.uuid == DFU_SERVICE } == true
+        return address.takeIf { name?.equals("AdaDFU", ignoreCase = true) == true || hasService }
+    }
+
+    private fun matchingCloseDfuAddress(result: ScanResult): String? =
+        matchingDfuAddress(result)?.takeIf { isCloseDfuRssi(result.rssi) }
+
+    private fun isCloseDfuRssi(rssi: Int): Boolean = rssi != 127 && rssi > MIN_RSSI
+
+    /** Freeze the brief candidate set. Exactly one close bootloader is safe; zero keeps scanning
+     *  only when the window has not actually collected anything, and two or more fail closed. */
+    private fun chooseDfuCandidate(zipFile: File) {
+        candidateWindowRunnable = null
+        if (_progress.value.phase != NrfDfuPhase.SCANNING || !ownsLiveSession()) {
+            if (_progress.value.phase == NrfDfuPhase.SCANNING) {
+                stopScan()
+                set(NrfDfuPhase.FAILED, 0,
+                    "The board connection changed during target selection. Reconnect and try again.")
+            }
+            return
+        }
+        when (val decision = decideDfuCandidates(closeCandidates.keys)) {
+            is DfuCandidateDecision.One -> {
+                stopScan()
+                clearScanTimeout()
+                set(NrfDfuPhase.SCANNING, 0, "Found the co-processor; settling…")
+                val r = Runnable { beginDfu(decision.address, zipFile) }
+                settleRunnable = r
+                main.postDelayed(r, SETTLE_MS)
+            }
+            DfuCandidateDecision.Ambiguous -> {
+                stopScan()
+                clearScanTimeout()
+                set(NrfDfuPhase.FAILED, 0,
+                    "More than one nearby co-processor is in update mode. Move the other beacon away, reconnect, and try again.")
+            }
+            DfuCandidateDecision.None -> Unit
+        }
+    }
+
     private fun clearScanTimeout() {
         scanTimeoutRunnable?.let { main.removeCallbacks(it) }
         scanTimeoutRunnable = null
@@ -327,6 +625,10 @@ class NrfDfuCoordinator(
     private fun clearPendingCallbacks() {
         settleRunnable?.let { main.removeCallbacks(it) }; settleRunnable = null
         watchdogRunnable?.let { main.removeCallbacks(it) }; watchdogRunnable = null
+        armReplyTimeoutRunnable?.let { main.removeCallbacks(it) }; armReplyTimeoutRunnable = null
+        candidateWindowRunnable?.let { main.removeCallbacks(it) }; candidateWindowRunnable = null
+        preflightWindowRunnable?.let { main.removeCallbacks(it) }; preflightWindowRunnable = null
+        stopPreflightScan()
         clearScanTimeout()
     }
 
@@ -339,6 +641,11 @@ class NrfDfuCoordinator(
 
     private fun beginDfu(address: String, zipFile: File) {
         if (!_progress.value.isRunning) return
+        if (!ownsLiveSession()) {
+            set(NrfDfuPhase.FAILED, 0,
+                "The board connection changed before the transfer started. Reconnect and try again.")
+            return
+        }
         settleRunnable = null
         registerDfuListener()
         pastStart = false
@@ -396,26 +703,12 @@ class NrfDfuCoordinator(
         // Only fires if upload never began (pastStart disarms it). A terminal phase means we lost
         // the race with a real callback; nothing to do.
         if (pastStart || _progress.value.phase != NrfDfuPhase.FLASHING) return
-        retryCount += 1
-        if (retryCount > MAX_START_RETRIES) {
-            intentionalAbort = true          // swallow the resulting onDfuAborted
-            sendAbortBroadcast()
-            unregisterDfuListener()
-            set(NrfDfuPhase.FAILED, 0,
-                "The co-processor didn't acknowledge the update. Stop here and contact support; repeated attempts may require USB recovery.")
-            return
-        }
-        // Abort the wedged transfer, then rescan for AdaDFU and retry from a fresh connection. The
-        // abort's onDfuAborted is swallowed (intentionalAbort); the retry owns the flow.
-        set(NrfDfuPhase.SCANNING, 0, "No response from the co-processor; retrying ($retryCount/$MAX_START_RETRIES)…")
         intentionalAbort = true
         sendAbortBroadcast()
-        val zip = pendingZip
-        main.postDelayed({
-            if (!_progress.value.isRunning) return@postDelayed
-            if (zip == null) { set(NrfDfuPhase.FAILED, 0, "The co-processor update failed. Reconnect and try again."); return@postDelayed }
-            scanForDfuTarget(zip)
-        }, RETRY_BACKOFF_MS)
+        unregisterDfuListener()
+        clearPendingCallbacks()
+        set(NrfDfuPhase.FAILED, 0,
+            "The co-processor didn't acknowledge the update. Reconnect and try again.")
     }
 
     private fun sendAbortBroadcast() {
@@ -455,21 +748,25 @@ class NrfDfuCoordinator(
 
     private val dfuListener = object : DfuProgressListenerAdapter() {
         override fun onDfuProcessStarted(deviceAddress: String) {
+            if (_progress.value.phase != NrfDfuPhase.FLASHING) return
             // Upload is underway: past the START handshake, stand the watchdog down.
             disarmStartWatchdog()
         }
         override fun onProgressChanged(deviceAddress: String, percent: Int, speed: Float,
                                        avgSpeed: Float, currentPart: Int, partsTotal: Int) {
+            if (_progress.value.phase != NrfDfuPhase.FLASHING) return
             disarmStartWatchdog()
             set(NrfDfuPhase.FLASHING, percent.coerceIn(0, 100), "Sending to co-processor…")
         }
         override fun onDfuCompleted(deviceAddress: String) {
+            if (_progress.value.phase != NrfDfuPhase.FLASHING) return
             unregisterDfuListener()
             clearPendingCallbacks()
             dfuController = null
             startConfirm()
         }
         override fun onDfuAborted(deviceAddress: String) {
+            if (_progress.value.phase != NrfDfuPhase.FLASHING) return
             // Our own stall-recovery abort lands here; the rescan/retry (or the terminal fail) owns
             // the flow, so don't clobber it.
             if (intentionalAbort) { intentionalAbort = false; return }
@@ -478,6 +775,7 @@ class NrfDfuCoordinator(
             set(NrfDfuPhase.FAILED, 0, "The co-processor update was stopped.")
         }
         override fun onError(deviceAddress: String, error: Int, errorType: Int, message: String?) {
+            if (_progress.value.phase != NrfDfuPhase.FLASHING) return
             // An error surfaced by our own abort isn't a failure; the retry owns the flow.
             if (intentionalAbort) { intentionalAbort = false; return }
             unregisterDfuListener()
@@ -494,22 +792,207 @@ class NrfDfuCoordinator(
     }
 
     /** After the flash, the nRF reboots into the new app and reports its version to the S3 over
-     *  UART (emitted as nrfv). We're still linked to the S3, so watch status for the target. If it
-     *  never arrives, the flash still succeeded, so resolve to DONE rather than crying failure. */
+     *  UART (emitted as nrfv). Only that report associates the generic legacy-DFU transfer with
+     *  this beacon, so a missing target version is unconfirmed, never success. */
     private fun startConfirm() {
+        if (!ownsLiveSession()) {
+            set(NrfDfuPhase.FAILED, 100,
+                "The transfer finished, but the initiating beacon is no longer connected, so it could not be confirmed.")
+            return
+        }
         set(NrfDfuPhase.CONFIRMING, 100, "Confirming update…")
         val deadline = System.currentTimeMillis() + 60_000
+        var nextStatusReadAt = 0L
         fun tick() {
             if (_progress.value.phase != NrfDfuPhase.CONFIRMING) return
+            if (!ownsLiveSession()) {
+                set(NrfDfuPhase.FAILED, 100,
+                    "The transfer finished, but the initiating beacon is no longer connected, so it could not be confirmed.")
+                return
+            }
+            val now = System.currentTimeMillis()
+            if (now >= nextStatusReadAt) {
+                requestStatus()
+                nextStatusReadAt = now + 5_000L
+            }
             val v = statusProvider()?.nrfVersion
             if (v != null && v >= confirmTarget) { set(NrfDfuPhase.DONE, 100, "Co-processor updated."); return }
-            if (System.currentTimeMillis() >= deadline) { set(NrfDfuPhase.DONE, 100, "Co-processor updated."); return }
+            if (now >= deadline) {
+                set(NrfDfuPhase.FAILED, 100,
+                    "The transfer finished, but this beacon did not report the new co-processor version. It was not confirmed; reconnect and try again.")
+                return
+            }
             main.postDelayed({ tick() }, 1_000)
         }
         tick()
     }
 
     private fun set(phase: NrfDfuPhase, pct: Int, message: String) {
+        if (phase == NrfDfuPhase.FAILED || phase == NrfDfuPhase.DONE) {
+            val terminalOwner = ownerSession
+            if (phase == NrfDfuPhase.FAILED && triggerSent && terminalOwner != null) {
+                quarantinedSession = terminalOwner
+            }
+            pendingZip?.delete()
+            pendingZip = null
+            clearPendingCallbacks()
+            stopScan()
+            closeCandidates.clear()
+            triggerSent = false
+            ownerSession = null
+        }
         _progress.value = NrfDfuProgress(phase, pct, message)
     }
+
+    private fun ownsLiveSession(): Boolean {
+        val owner = ownerSession ?: return false
+        return linkReady() && linkSessionProvider() == owner
+    }
 }
+
+/** Pure target decision so ambiguity stays pinned without an Android BLE runtime. */
+internal sealed interface DfuCandidateDecision {
+    data object None : DfuCandidateDecision
+    data class One(val address: String) : DfuCandidateDecision
+    data object Ambiguous : DfuCandidateDecision
+}
+
+internal fun decideDfuCandidates(addresses: Collection<String>): DfuCandidateDecision =
+    when (val unique = addresses.toSet()) {
+        emptySet<String>() -> DfuCandidateDecision.None
+        else -> if (unique.size == 1) DfuCandidateDecision.One(unique.first())
+                else DfuCandidateDecision.Ambiguous
+    }
+
+internal fun preflightDfuClear(addresses: Collection<String>): Boolean = addresses.isEmpty()
+
+internal fun nrfUpdateOfferAllowed(
+    releaseEnabled: Boolean,
+    nrf: NrfBuild?,
+    buildLabel: String,
+    liveLabel: String?,
+    runningVersion: Int?,
+    protocolVersion: Int?,
+): Boolean = releaseEnabled && protocolVersion == DeviceStatus.SUPPORTED_PROTO_VERSION &&
+    nrf != null && nrf.ota && nrf.hasVerifiableImage &&
+    buildLabel.isNotBlank() && buildLabel == liveLabel && runningVersion != null &&
+    nrf.version > runningVersion
+
+internal fun nrfHandoffStatusIsFresh(
+    protoVersion: Int,
+    nrfUpdating: Boolean,
+    statusRevision: Long,
+    triggerRevision: Long,
+    ownerSession: Long?,
+    sourceSession: Long,
+): Boolean = protoVersion == DeviceStatus.SUPPORTED_PROTO_VERSION && nrfUpdating &&
+    statusRevision > triggerRevision &&
+    ownerSession != null && ownerSession == sourceSession
+
+/** Validate an application-only Nordic DFU package and extract its signed inner version. The
+ * detached signature covers the complete zip, while this parser binds that package to the outer
+ * version and refuses any extra firmware section or file. */
+internal fun nrfPackageApplicationVersion(zipBytes: ByteArray): Long? = runCatching {
+    var manifest: ByteArray? = null
+    val entryNames = LinkedHashSet<String>()
+    ZipInputStream(ByteArrayInputStream(zipBytes)).use { zip ->
+        while (true) {
+            val entry = zip.nextEntry ?: break
+            val name = entry.name
+            if (entry.isDirectory || name.isBlank() || name.contains('/') || name.contains('\\') ||
+                !entryNames.add(name) || entry.method != ZipEntry.STORED) {
+                return@runCatching null
+            }
+            if (name == "manifest.json") {
+                if (manifest != null || entry.size > MAX_NRF_MANIFEST_BYTES) {
+                    return@runCatching null
+                }
+                val out = java.io.ByteArrayOutputStream(
+                    if (entry.size in 1..MAX_NRF_MANIFEST_BYTES) entry.size.toInt() else 1024,
+                )
+                val buffer = ByteArray(1024)
+                var total = 0
+                while (true) {
+                    val read = zip.read(buffer)
+                    if (read < 0) break
+                    total += read
+                    if (total > MAX_NRF_MANIFEST_BYTES) return@runCatching null
+                    out.write(buffer, 0, read)
+                }
+                manifest = out.toByteArray()
+            } else {
+                if (entry.size > NrfBuild.MAX_PACKAGE_BYTES) return@runCatching null
+                val buffer = ByteArray(16 * 1024)
+                var total = 0L
+                while (true) {
+                    val read = zip.read(buffer)
+                    if (read < 0) break
+                    total += read
+                    if (total > NrfBuild.MAX_PACKAGE_BYTES) return@runCatching null
+                }
+                if (total == 0L) return@runCatching null
+            }
+        }
+    }
+    val raw = manifest ?: return@runCatching null
+    val packageManifest = org.json.JSONObject(raw.toString(Charsets.UTF_8))
+        .getJSONObject("manifest")
+    if (packageManifest.has("softdevice") || packageManifest.has("bootloader") ||
+        packageManifest.has("softdevice_bootloader")) return@runCatching null
+    val application = packageManifest.getJSONObject("application")
+    val binFile = application.getString("bin_file")
+    val datFile = application.getString("dat_file")
+    if (binFile.isBlank() || datFile.isBlank() || binFile == datFile ||
+        binFile.contains('/') || binFile.contains('\\') ||
+        datFile.contains('/') || datFile.contains('\\') ||
+        entryNames != linkedSetOf("manifest.json", binFile, datFile)) return@runCatching null
+    val init = application.getJSONObject("init_packet_data")
+    if (!init.has("application_version")) return@runCatching null
+    val manifestVersion = init.getLong("application_version")
+        .takeIf { it in 0..0xffff_ffffL } ?: return@runCatching null
+    val initPacket = storedRootZipEntry(
+        zipBytes, datFile, MAX_NRF_INIT_PACKET_BYTES,
+    ) ?: return@runCatching null
+    manifestVersion.takeIf { legacyDfuInitPacketVersion(initPacket) == it }
+}.getOrNull()
+
+private const val MAX_NRF_MANIFEST_BYTES = 64 * 1024L
+private const val MAX_NRF_INIT_PACKET_BYTES = 64 * 1024
+
+/** Legacy Nordic init packets bind application_version as a little-endian UInt32 at bytes 4..7. */
+internal fun legacyDfuInitPacketVersion(bytes: ByteArray): Long? {
+    if (bytes.size !in 8..MAX_NRF_INIT_PACKET_BYTES) return null
+    return (bytes[4].toLong() and 0xffL) or
+        ((bytes[5].toLong() and 0xffL) shl 8) or
+        ((bytes[6].toLong() and 0xffL) shl 16) or
+        ((bytes[7].toLong() and 0xffL) shl 24)
+}
+
+private fun storedRootZipEntry(zipBytes: ByteArray, wanted: String, maxBytes: Int): ByteArray? =
+    try {
+        ZipInputStream(ByteArrayInputStream(zipBytes)).use { zip ->
+            var found: ByteArray? = null
+            while (found == null) {
+                val entry = zip.nextEntry ?: break
+                if (entry.name != wanted) continue
+                if (entry.isDirectory || entry.method != ZipEntry.STORED ||
+                    entry.size > maxBytes) return@use null
+                val out = java.io.ByteArrayOutputStream(
+                    if (entry.size in 1..maxBytes.toLong()) entry.size.toInt() else 64,
+                )
+                val buffer = ByteArray(1024)
+                var total = 0
+                while (true) {
+                    val read = zip.read(buffer)
+                    if (read < 0) break
+                    total += read
+                    if (total > maxBytes) return@use null
+                    out.write(buffer, 0, read)
+                }
+                found = out.toByteArray()
+            }
+            found
+        }
+    } catch (_: Exception) {
+        null
+    }

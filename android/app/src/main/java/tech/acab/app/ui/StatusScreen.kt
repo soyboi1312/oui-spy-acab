@@ -12,6 +12,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -31,6 +32,7 @@ import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -48,6 +50,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
@@ -69,9 +75,15 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 
-/** Status / home: the at-a-glance "how many eyes are on me" view. */
+/** Status / home: the at-a-glance "how many eyes are on me" view.
+ *  [onOpenLogCategory] jumps to the Log tab with the given category filter applied; the
+ *  count tiles call it so a number here is one tap from its rows. */
 @Composable
-fun StatusScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit = {}) {
+fun StatusScreen(
+    ble: AcabBleManager,
+    onSelect: (Detection) -> Unit = {},
+    onOpenLogCategory: (String) -> Unit = {},
+) {
     val detections by ble.detections.collectAsState()
     val status by ble.status.collectAsState()
     val demo by ble.demoMode.collectAsState()
@@ -165,13 +177,17 @@ fun StatusScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit = {}) {
             LinkChip(version = status?.version, demo = demo)
         }
 
+        // OS-level "remove animations": the looping ornaments (dot pulse, radar sweep) park.
+        val reduceMotion = rememberReduceMotion()
+
         Row(verticalAlignment = Alignment.CenterVertically) {
             // the scan dot breathes so the header reads as live, not a static badge;
             // the animated alpha is read inside graphicsLayer (draw phase), so the
             // pulse repaints one dot instead of recomposing the whole screen at 60fps.
             // It only breathes while something is actually listening: a pulse over
             // "RADIOS OFF" is the lie this header exists to not tell.
-            val blink by rememberInfiniteTransition(label = "scanDot").animateFloat(
+            // Null under reduce-motion: no transition even runs, the dot just holds solid.
+            val blink = if (reduceMotion) null else rememberInfiniteTransition(label = "scanDot").animateFloat(
                 initialValue = 1f, targetValue = 0.2f,
                 animationSpec = infiniteRepeatable(tween(800, easing = LinearEasing), RepeatMode.Reverse),
                 label = "scanDotAlpha",
@@ -179,7 +195,7 @@ fun StatusScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit = {}) {
             Box(
                 Modifier
                     .size(7.dp)
-                    .graphicsLayer { alpha = if (scanning) blink else 1f }
+                    .graphicsLayer { alpha = if (scanning) (blink?.value ?: 1f) else 1f }
                     // With WI-FI up and the nRF dead, scanning is still true, so a plain accent
                     // dot pulses identically to a healthy scan while half the detection surface
                     // is dark. Amber is the only thing separating the two at a glance.
@@ -205,23 +221,40 @@ fun StatusScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit = {}) {
         if (syncing) SyncingPill(count = syncCount, total = syncTotal)
 
         // T2: keep the scope from stretching screen-wide on tablets; capped + centered.
-        RadarScope(detections = nearby, scanning = scanning,
+        RadarScope(detections = nearby, scanning = scanning, reduceMotion = reduceMotion,
             modifier = Modifier.align(Alignment.CenterHorizontally).widthIn(max = 420.dp))
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) { PunkLine() }
 
-        // per-category counts: one 6-across strip of compact tiles. Network Cam rides the same
+        // per-category counts: one strip of compact tiles. Network Cam rides the same
         // strip as Log and Map so Status shows every category the other tabs do (netcamTone +
         // CameraOutdoor come from the type's own tone()/icon(), like every other tile here).
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            CountTile(DeviceType.FLOCK_CAMERA, "ALPR",
-                count(DeviceType.FLOCK_CAMERA) + count(DeviceType.FLOCK_RAVEN), Modifier.weight(1f))
-            CountTile(DeviceType.DRONE, "DRONE", count(DeviceType.DRONE), Modifier.weight(1f))
-            CountTile(DeviceType.BODY_CAM, "BODY", count(DeviceType.BODY_CAM), Modifier.weight(1f))
-            CountTile(DeviceType.TRACKER, "TRKR", count(DeviceType.TRACKER), Modifier.weight(1f))
-            CountTile(DeviceType.GLASSES, "GLAS", count(DeviceType.GLASSES), Modifier.weight(1f))
-            CountTile(DeviceType.NETWORK_CAMERA, "NETCAM",
-                count(DeviceType.NETWORK_CAMERA), Modifier.weight(1f))
+        // Each tile deep-links to the Log with that category's filter, so a count is one tap
+        // from its rows. Six-across squeezes to slivers at large font scales, so past 1.5x the
+        // strip wraps to two rows of three.
+        val strip = listOf(
+            StripTile(DeviceType.FLOCK_CAMERA, "ALPR",
+                count(DeviceType.FLOCK_CAMERA) + count(DeviceType.FLOCK_RAVEN), "ALPR"),
+            StripTile(DeviceType.DRONE, "DRONE", count(DeviceType.DRONE), "DRONE"),
+            StripTile(DeviceType.BODY_CAM, "BODY", count(DeviceType.BODY_CAM), "BODY CAM"),
+            StripTile(DeviceType.TRACKER, "TRKR", count(DeviceType.TRACKER), "TRACKER"),
+            StripTile(DeviceType.GLASSES, "GLAS", count(DeviceType.GLASSES), "GLASSES"),
+            StripTile(DeviceType.NETWORK_CAMERA, "NETCAM",
+                count(DeviceType.NETWORK_CAMERA), "CAMERA"),
+        )
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            val perRow = if (maxWidth < 360.dp || LocalDensity.current.fontScale >= 1.5f) 3 else strip.size
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                strip.chunked(perRow).forEach { rowTiles ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        rowTiles.forEach { t ->
+                            CountTile(t.type, t.label, t.n, Modifier.weight(1f)) {
+                                onOpenLogCategory(t.filterKey)
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if (nearest != null) NearestCard(nearest, onSelect)
@@ -231,6 +264,10 @@ fun StatusScreen(ble: AcabBleManager, onSelect: (Detection) -> Unit = {}) {
 
 /** Categories render lowercase, brand-wide ("body cam", "drone"). Mirrors iOS categoryTitle. */
 private fun categoryTitle(cat: String): String = cat.lowercase()
+
+/** One tile of the category strip: glyph/tone source, short caption, live count, and the
+ *  DeviceType.category key the Log filter matches on. */
+private data class StripTile(val type: DeviceType, val label: String, val n: Int, val filterKey: String)
 
 /** The "Beacons" wordmark. */
 @Composable
@@ -251,8 +288,10 @@ private fun BrandMark(size: Int) {
  *  the middle is its size, so the number and the blips can never disagree. The sweep only turns
  *  while [scanning], since a sweeping radar over a dead radio reads as a live all-clear. */
 @Composable
-private fun RadarScope(detections: List<Detection>, scanning: Boolean, modifier: Modifier = Modifier) {
-    val sweep by rememberInfiniteTransition(label = "sweep").animateFloat(
+private fun RadarScope(detections: List<Detection>, scanning: Boolean, reduceMotion: Boolean, modifier: Modifier = Modifier) {
+    // Under reduce-motion no transition runs at all; the wedge still draws, parked, so the
+    // scope keeps its look without the loop.
+    val sweep = if (reduceMotion) null else rememberInfiniteTransition(label = "sweep").animateFloat(
         initialValue = 0f, targetValue = 360f,
         animationSpec = infiniteRepeatable(tween(4500, easing = LinearEasing), RepeatMode.Restart),
         label = "sweepAngle",
@@ -260,14 +299,18 @@ private fun RadarScope(detections: List<Detection>, scanning: Boolean, modifier:
     // Cap at 14 so the scope stays readable when there's a lot around.
     val dots = detections.take(14)
 
-    // NEAR / MID / FAR band labels, fading with distance (45/38/30% text).
+    // NEAR / MID / FAR band labels, fading with distance (45/38/30% text). Ornamental dial
+    // furniture, so the size is divided back out of the font scale: at 2x text these labels
+    // would collide with the rings and the center count, and they carry no information the
+    // caption below does not restate.
+    val fontScale = LocalDensity.current.fontScale
     val measurer = rememberTextMeasurer()
-    val ringLabels = remember(measurer) {
+    val ringLabels = remember(measurer, fontScale) {
         listOf("NEAR" to 0.45f, "MID" to 0.38f, "FAR" to 0.30f).map { (word, alpha) ->
             measurer.measure(
                 AnnotatedString(word),
                 TextStyle(
-                    color = Acab.text.copy(alpha = alpha), fontSize = 7.5.sp,
+                    color = Acab.text.copy(alpha = alpha), fontSize = (7.5f / fontScale).sp,
                     fontFamily = Acab.mono, fontWeight = FontWeight.Medium, letterSpacing = 1.sp,
                 ),
             )
@@ -304,9 +347,10 @@ private fun RadarScope(detections: List<Detection>, scanning: Boolean, modifier:
                 }
 
                 // rotating sweep, a soft crimson wedge. Reading `sweep` inside the branch means
-                // a parked radar also stops re-drawing at 60fps, not just stops lying.
+                // a parked radar also stops re-drawing at 60fps, not just stops lying. With
+                // reduce-motion on, sweep is null and the wedge draws once, parked at 0.
                 if (scanning) {
-                    rotate(sweep, c) {
+                    rotate(sweep?.value ?: 0f, c) {
                         drawArc(
                             brush = Brush.sweepGradient(
                                 0.72f to Color.Transparent,
@@ -342,15 +386,38 @@ private fun RadarScope(detections: List<Detection>, scanning: Boolean, modifier:
                 Text("${detections.size}", color = Acab.text, fontSize = 62.sp, fontWeight = FontWeight.Bold)
                 // "active" makes clear this count is the recently-seen set (already filtered for
                 // staleness), so it reading lower than the full-session Log count is self-explanatory.
-                Kicker("ACTIVE NEARBY")
+                // pinned: the kicker is an ornament under a 62sp number that already scales;
+                // iOS pins it the same way so the dial composition holds at large font scales.
+                Kicker("ACTIVE NEARBY", pinned = true)
             }
         }
 
-        Text(
-            "rings = signal strength · position around the dial means nothing",
-            color = Acab.faint, fontSize = 9.sp, fontFamily = Acab.mono,
-            textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth(),
-        )
+        // The one fact that stops the radar being read as a direction finder, promoted from a
+        // 9sp whisper to a legible pill (parity with iOS doing the same). The line under it
+        // keeps the longer explanation.
+        Column(
+            Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(
+                Modifier
+                    .background(Acab.bg2, RoundedCornerShape(50))
+                    .border(1.dp, Acab.line, RoundedCornerShape(50))
+                    .padding(horizontal = 14.dp, vertical = 7.dp),
+            ) {
+                Text(
+                    "SIGNAL STRENGTH ONLY · NO DIRECTION",
+                    color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+                    fontWeight = FontWeight.Bold, letterSpacing = 1.sp, textAlign = TextAlign.Center,
+                )
+            }
+            Text(
+                "rings = signal strength · position around the dial means nothing",
+                color = Acab.faint, fontSize = 9.5.sp, fontFamily = Acab.mono,
+                textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth(),
+            )
+        }
     }
 }
 
@@ -373,7 +440,7 @@ private fun CoprocFaultPill() {
             tint = Acab.warn, modifier = Modifier.size(12.dp))
         Spacer(Modifier.size(8.dp))
         Text(
-            "nRF radio fault - bluetooth detection offline. trackers, glasses and other bluetooth gear won't be picked up. see Device.",
+            "nRF radio fault - bluetooth detection offline. trackers, glasses and other bluetooth gear won't be picked up. see Beacon.",
             color = Acab.warn, fontSize = 11.sp, fontFamily = Acab.mono,
         )
     }
@@ -396,7 +463,7 @@ private fun CoprocUpdatingPill() {
             modifier = Modifier.size(12.dp))
         Spacer(Modifier.size(8.dp))
         Text(
-            "updating co-processor - bluetooth detection paused. trackers, glasses and other bluetooth gear won't be picked up until it comes back. see Device.",
+            "updating co-processor - bluetooth detection paused. trackers, glasses and other bluetooth gear won't be picked up until it comes back. see Beacon.",
             color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
         )
     }
@@ -408,7 +475,9 @@ private fun CoprocUpdatingPill() {
 @Composable
 private fun SyncingPill(count: Int, total: Int) {
     val shape = RoundedCornerShape(50)
-    val blink by rememberInfiniteTransition(label = "syncDot").animateFloat(
+    // Reduce-motion parks the breathing dot (the text already says syncing is in progress).
+    val reduceMotion = rememberReduceMotion()
+    val blink = if (reduceMotion) null else rememberInfiniteTransition(label = "syncDot").animateFloat(
         initialValue = 1f, targetValue = 0.25f,
         animationSpec = infiniteRepeatable(tween(700, easing = LinearEasing), RepeatMode.Reverse),
         label = "syncDotAlpha",
@@ -424,7 +493,7 @@ private fun SyncingPill(count: Int, total: Int) {
         Box(
             Modifier
                 .size(6.dp)
-                .graphicsLayer { alpha = blink }
+                .graphicsLayer { alpha = blink?.value ?: 1f }
                 .background(Acab.dim, CircleShape),
         )
         Text(
@@ -438,18 +507,37 @@ private fun SyncingPill(count: Int, total: Int) {
     }
 }
 
-/** One compact count tile in the 5-across category strip. */
+/** One compact count tile in the category strip. Tapping deep-links to the Log filtered to
+ *  this category; the click label tells a screen reader that is what the tap does. */
 @Composable
-private fun CountTile(type: DeviceType, label: String, n: Int, modifier: Modifier = Modifier) {
+private fun CountTile(type: DeviceType, label: String, n: Int, modifier: Modifier = Modifier, onClick: () -> Unit = {}) {
     val shape = RoundedCornerShape(Acab.radiusSm)
+    val spokenLabel = when (label) {
+        "ALPR" -> "License plate reader"
+        "DRONE" -> "Drone"
+        "BODY" -> "Body camera"
+        "TRKR" -> "Tracker"
+        "GLAS" -> "Glasses"
+        "NETCAM" -> "Network camera"
+        else -> label
+    }
     Column(
         modifier
+            .minimumInteractiveComponentSize()
+            .clip(shape)
             .background(Acab.bg2, shape)
             .border(1.dp, Acab.line, shape)
+            .clickable(onClickLabel = "show in log", role = Role.Button, onClick = onClick)
+            .semantics(mergeDescendants = true) {
+                contentDescription =
+                    "$spokenLabel, $n detection${if (n == 1) "" else "s"}"
+            }
             .padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(5.dp),
     ) {
-        Icon(type.icon(), contentDescription = label,
+        // null: the tile is ONE merged clickable node and the label Text below already names
+        // it; a contentDescription here made TalkBack read the category twice per tile.
+        Icon(type.icon(), contentDescription = null,
             tint = if (n == 0) Acab.faint else type.tone(), modifier = Modifier.size(14.dp))
         Text("$n", color = if (n == 0) Acab.faint else Acab.text,
             fontSize = 18.sp, fontWeight = FontWeight.Bold)
@@ -499,12 +587,15 @@ private fun NearestCard(d: Detection, onSelect: (Detection) -> Unit) {
     }
 }
 
-/** "they're watching. watch back." */
+/** "they're watching. watch back." Pinned against fontScale (divide by it) like iOS: this is
+ *  brand ornament, not information, and at accessibility sizes it wrapped into the layout's
+ *  budget while carrying nothing a screen reader or low-vision user needs larger. */
 @Composable
 private fun PunkLine() {
+    val fs = LocalDensity.current.fontScale
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("they're watching. ", color = Acab.dim, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-        Text("watch back.", color = Acab.accent, fontSize = 14.sp, fontWeight = FontWeight.Medium,
+        Text("they're watching. ", color = Acab.dim, fontSize = 14.sp / fs, fontWeight = FontWeight.Medium)
+        Text("watch back.", color = Acab.accent, fontSize = 14.sp / fs, fontWeight = FontWeight.Medium,
             fontStyle = FontStyle.Italic)
     }
 }

@@ -13,6 +13,8 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -51,6 +53,7 @@ import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SettingsInputAntenna
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Science
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.CircularProgressIndicator
@@ -62,6 +65,7 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -72,7 +76,9 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -80,7 +86,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -101,7 +114,7 @@ import tech.acab.app.ui.theme.tone
 
 /** Latest published beacon-board firmware; last-resort offline fallback for an unrecognized
  *  board label (known boards read their per-board version from the manifest). Bump on release. */
-private const val LATEST = "2.0.4"
+private const val LATEST = "2.0.5"
 
 /** Which config drawer section is open. Exactly one at a time (proposal 1g). */
 private enum class ConfigSection { NONE, FIRMWARE, RADIOS, DETECTORS, ALERTS, NOTIFY, DRIVE, DESERT, LED }
@@ -195,6 +208,7 @@ fun DeviceScreen(ble: AcabBleManager) {
     var bufferOn by remember { mutableStateOf(status?.bufOn == true) }
     var bufferPending by remember { mutableStateOf(false) }
     var confirmEraseBuffer by remember { mutableStateOf(false) }   // gate the destructive board-buffer erase
+    var confirmPowerOff by remember { mutableStateOf(false) }      // gate the rev-B app-driven power-off
     var lightsOut by remember { mutableStateOf(status?.ledOn == false) }   // LED fully dark
     var ledPending by remember { mutableStateOf(false) }
     var desertOn by remember { mutableStateOf(status?.desertMode == true) }
@@ -231,10 +245,15 @@ fun DeviceScreen(ble: AcabBleManager) {
     }
 
     // --- proposal 1g state: one config section open at a time; firmware + sub-screens ---
-    var openSection by remember { mutableStateOf(ConfigSection.NONE) }
-    var managedOpen by remember { mutableStateOf(false) }
-    var helpOpen by remember { mutableStateOf(false) }
-    var aboutOpen by remember { mutableStateOf(false) }
+    // rememberSaveable, not remember: with the tab shell now preserving per-tab state, the open
+    // drawer/sub-screen must survive a tab switch or rotation like everything else here does.
+    var openSection by rememberSaveable { mutableStateOf(ConfigSection.NONE) }
+    var managedOpen by rememberSaveable { mutableStateOf(false) }
+    var helpOpen by rememberSaveable { mutableStateOf(false) }
+    var aboutOpen by rememberSaveable { mutableStateOf(false) }
+    // The contribution composer's whole flow lives in an activity-scoped ViewModel so a
+    // mid-capture tab switch, back press, resize, or recreation cannot discard the capture.
+    val contribVm: ContributionViewModel = viewModel()
     fun toggleSection(s: ConfigSection) { openSection = if (openSection == s) ConfigSection.NONE else s }
 
     // Firmware: the SAME update-available check FirmwareCard uses (manifest entry vs installed).
@@ -352,9 +371,19 @@ fun DeviceScreen(ble: AcabBleManager) {
                         listOf(0 to "MAX", 3 to "3s", 7 to "7s", 15 to "15s").forEach { (v, label) ->
                             val sel = wifiEco == v
                             Box(
-                                Modifier.weight(1f).clip(CircleShape)
+                                Modifier.weight(1f)
+                                    .minimumInteractiveComponentSize()
+                                    .clip(CircleShape)
                                     .then(if (sel) Modifier.background(Acab.accent) else Modifier.border(1.dp, Acab.line, CircleShape))
-                                    .clickable { wifiEco = v; wifiEcoPending = true; ble.setWifiEco(v) }
+                                    .selectable(
+                                        selected = sel,
+                                        role = Role.RadioButton,
+                                        onClick = {
+                                            wifiEco = v
+                                            wifiEcoPending = true
+                                            ble.setWifiEco(v)
+                                        },
+                                    )
                                     .padding(vertical = 7.dp),
                                 contentAlignment = Alignment.Center,
                             ) {
@@ -373,7 +402,7 @@ fun DeviceScreen(ble: AcabBleManager) {
     val detectorsContent: @Composable () -> Unit = {
         Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Kicker("DETECTORS")
-            ToggleRow("alpr (flock)", "Flock Safety · Raven ALPR cameras",
+            ToggleRow("alpr radio signals", "flock, raven, when they broadcast over bluetooth or 2.4 GHz wifi · many installs now stay silent",
                 checked = flockOn) {
                 flockOn = it; flockPending = true; ble.setFlock(it)
             }
@@ -479,6 +508,7 @@ fun DeviceScreen(ble: AcabBleManager) {
                             color = Acab.accent, fontSize = 10.sp, fontFamily = Acab.mono,
                             fontWeight = FontWeight.Bold, letterSpacing = 1.sp,
                             modifier = Modifier
+                                .minimumInteractiveComponentSize()
                                 .clip(CircleShape)
                                 .border(1.dp, Acab.lineStrong, CircleShape)
                                 .clickable { confirmEraseBuffer = true }
@@ -505,12 +535,15 @@ fun DeviceScreen(ble: AcabBleManager) {
                         confirmButton = {
                             Text("ERASE", color = Acab.accent, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                                 letterSpacing = 0.5.sp, fontFamily = Acab.mono,
-                                modifier = Modifier.clickable { ble.clearBufferLog(); confirmEraseBuffer = false }.padding(8.dp))
+                                modifier = Modifier.minimumInteractiveComponentSize()
+                                    .clickable { ble.clearBufferLog(); confirmEraseBuffer = false }
+                                    .padding(8.dp))
                         },
                         dismissButton = {
                             Text("CANCEL", color = Acab.dim, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                                 letterSpacing = 0.5.sp, fontFamily = Acab.mono,
-                                modifier = Modifier.clickable { confirmEraseBuffer = false }.padding(8.dp))
+                                modifier = Modifier.minimumInteractiveComponentSize()
+                                    .clickable { confirmEraseBuffer = false }.padding(8.dp))
                         },
                     )
                 }
@@ -573,6 +606,7 @@ fun DeviceScreen(ble: AcabBleManager) {
         }
     }
 
+    val subScreenOpen = helpOpen || contribVm.open || managedOpen || aboutOpen
     Box(Modifier.fillMaxSize()) {
         // T2/T5: cap readable content width so tablets/landscape stop stretching one column edge to
         // edge; at phone width the cap is a no-op. BoxWithConstraints scrolls + centers. Below 840dp
@@ -582,6 +616,7 @@ fun DeviceScreen(ble: AcabBleManager) {
         BoxWithConstraints(
             Modifier
                 .fillMaxSize()
+                .then(if (subScreenOpen) Modifier.clearAndSetSemantics { } else Modifier)
                 .verticalScroll(rememberScrollState()),
             contentAlignment = Alignment.TopCenter,
         ) {
@@ -684,6 +719,12 @@ fun DeviceScreen(ble: AcabBleManager) {
                 NavRow(Icons.Filled.Info, Acab.dim, "Help + support",
                     "FAQ · TROUBLESHOOTING · CONTACT") { helpOpen = true }
             }
+            // Field research: contribute a capture of a device the beacon did not identify. The
+            // submission path is manual (see ContributeContent): it starts only after review.
+            val contributeRow: @Composable () -> Unit = {
+                NavRow(Icons.Filled.Science, Acab.dim, "Help improve detection",
+                    "CONTRIBUTE A FIELD OBSERVATION") { contribVm.open = true }
+            }
             val managedRow: @Composable () -> Unit = {
                 NavRow(Icons.Filled.Star, Acab.watchTone, "Managed devices", managedKicker) { managedOpen = true }
             }
@@ -704,25 +745,69 @@ fun DeviceScreen(ble: AcabBleManager) {
                     if (demo) ble.exitDemo() else ble.disconnect()
                 }
             }
+            // rev-B only (gated in `slots`): shut the board down over BLE. Same block styling as
+            // Disconnect and blocked during the combined update for the same reason (a power-off
+            // mid-reboot strands the flow). The board drops the link itself; the manager pre-arms the
+            // expected-teardown flags so that drop is clean.
+            val powerOffSlot: @Composable () -> Unit = {
+                DisconnectButton(label = "Power off beacon", enabled = !combined.isRunning) {
+                    confirmPowerOff = true
+                }
+                if (confirmPowerOff) {
+                    androidx.compose.material3.AlertDialog(
+                        onDismissRequest = { confirmPowerOff = false },
+                        containerColor = Acab.bg2,
+                        titleContentColor = Acab.text,
+                        title = {
+                            Text("Power off the beacon?", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                        },
+                        text = {
+                            Text(
+                                "The beacon shuts down and stops detecting. You'll turn it back on with the " +
+                                    "button on the device (hold about 2 seconds). It can't be powered back on from the app.",
+                                color = Acab.dim, fontSize = 14.sp)
+                        },
+                        confirmButton = {
+                            Text("POWER OFF", color = Acab.accent, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.5.sp, fontFamily = Acab.mono,
+                                modifier = Modifier.minimumInteractiveComponentSize()
+                                    .clickable { ble.powerOff(); confirmPowerOff = false }
+                                    .padding(8.dp))
+                        },
+                        dismissButton = {
+                            Text("CANCEL", color = Acab.dim, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.5.sp, fontFamily = Acab.mono,
+                                modifier = Modifier.minimumInteractiveComponentSize()
+                                    .clickable { confirmPowerOff = false }.padding(8.dp))
+                        },
+                    )
+                }
+            }
             // 5. About collapses to a footer link that pushes the About sub-screen.
             val aboutFooter: @Composable () -> Unit = {
                 Text(
                     "about · made by soyboi",
                     color = Acab.faint, fontSize = 10.sp, fontFamily = Acab.mono, letterSpacing = 1.sp,
-                    modifier = Modifier.fillMaxWidth().clickable { aboutOpen = true }.padding(vertical = 8.dp),
+                    modifier = Modifier.fillMaxWidth().minimumInteractiveComponentSize()
+                        .clickable { aboutOpen = true }.padding(vertical = 8.dp),
                     textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                 )
             }
 
             // Row slots below the hero + firmware: single column (compact) or split two-up (>=840dp).
-            val slots = listOf<Pair<String, @Composable () -> Unit>>(
-                "stats" to statsSlot,
-                "config" to configPanel,
-                "managed" to managedRow,
-                "help" to helpRow,
-                "disconnect" to disconnectSlot,
-                "aboutfooter" to aboutFooter,
-            )
+            // Power-off rides just under Disconnect, and ONLY on rev-B: a rev-A slide board would
+            // re-wake the instant it slept, and absent boardRev (older firmware without the poweroff
+            // handler) it would do nothing - so the button never appears where it can't work.
+            val slots = buildList<Pair<String, @Composable () -> Unit>> {
+                add("stats" to statsSlot)
+                add("config" to configPanel)
+                add("managed" to managedRow)
+                add("contribute" to contributeRow)
+                add("help" to helpRow)
+                add("disconnect" to disconnectSlot)
+                if (!demo && boardRev == "B") add("poweroff" to powerOffSlot)
+                add("aboutfooter" to aboutFooter)
+            }
 
             Column(
                 Modifier
@@ -737,7 +822,9 @@ fun DeviceScreen(ble: AcabBleManager) {
                 // next periodic poll (mirrors iOS).
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                        Text("Device", color = Acab.text, fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
+                        // "Beacon", matching the tab label (Tab.DEVICE renders "Beacon"); the
+                        // header saying "Device" was a leftover from before the tab rename.
+                        Text("Beacon", color = Acab.text, fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
                         Kicker(if (demo) "SAMPLE DATA" else "PAIRED OVER BLE")
                     }
                     StatusRefreshButton { ble.refreshStatus() }
@@ -747,8 +834,13 @@ fun DeviceScreen(ble: AcabBleManager) {
                 // support can tell which board is in the case without asking the owner to open it.
                 // Silent when the board does not report one: an unlabelled board reads as "we were
                 // not told", never as rev-A.
-                val fwWithRev = status?.firmwareLabel?.let {
-                    if (boardRev == "A" || boardRev == "B") "$it · rev-$boardRev" else it
+                val fwWithRev = status?.firmwareLabel?.let { label ->
+                    // The rev-B fw label already ends in "rev-B", so appending the badge there
+                    // prints "... rev-B · rev-B". Only add it when the label does not already name
+                    // this rev (rev-A's label is just "beacon board", so it still gets the badge).
+                    if ((boardRev == "A" || boardRev == "B") &&
+                        !label.lowercase().contains("rev-${boardRev.lowercase()}"))
+                        "$label · rev-$boardRev" else label
                 }
                 DeviceHero(name = name, firmware = fwWithRev, battery = status?.battery,
                     charging = status?.charging == true, connected = !demo && status != null, demo = demo)
@@ -805,7 +897,17 @@ fun DeviceScreen(ble: AcabBleManager) {
         // today's cards verbatim and closes on the back arrow or the system back gesture.
         if (helpOpen) {
             SubScreen(title = "Help + support", onBack = { helpOpen = false }) {
-                HelpScreen()
+                // The "improve detection" support row opens the contribution composer over Help
+                // (Help stays underneath, so backing out of the composer returns here). Same shape
+                // as the iOS NavigationLink from HelpView to ContributeView.
+                HelpScreen(onImproveDetection = { contribVm.open = true })
+            }
+        }
+        if (contribVm.open) {
+            // Back routes through requestExit: with a capture in flight it arms the "Discard this
+            // capture?" confirmation instead of silently dropping the user's field work.
+            SubScreen(title = "Improve detection", onBack = { contribVm.requestExit() }) {
+                ContributeContent(ble, contribVm)
             }
         }
         if (managedOpen) {
@@ -864,7 +966,10 @@ private fun FoldRow(
             .background(if (expanded) Acab.accent.copy(alpha = 0.04f) else Color.Transparent),
     ) {
         Row(
-            Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(Acab.padCard),
+            Modifier.fillMaxWidth().clickable(onClick = onToggle)
+                // Expand/collapse state for TalkBack: the flipping chevron is invisible to it.
+                .semantics { stateDescription = if (expanded) "Expanded" else "Collapsed" }
+                .padding(Acab.padCard),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(glyph, contentDescription = null,
@@ -904,7 +1009,9 @@ private fun FirmwareBanner(
             .background(Acab.accent),
     ) {
         Row(
-            Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(Acab.padCard),
+            Modifier.fillMaxWidth().clickable(onClick = onToggle)
+                .semantics { stateDescription = if (expanded) "Expanded" else "Collapsed" }
+                .padding(Acab.padCard),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -968,7 +1075,8 @@ private fun SubScreen(title: String, onBack: () -> Unit, content: @Composable Co
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             Row(
-                Modifier.fillMaxWidth().clickable(onClick = onBack),
+                Modifier.fillMaxWidth().minimumInteractiveComponentSize()
+                    .clickable(onClick = onBack),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back",
@@ -991,10 +1099,13 @@ private fun hasNotifPermission(context: Context): Boolean =
         ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
         PackageManager.PERMISSION_GRANTED
 
-/** Connected-device hero card. Honest in [demo]: says sample data, never "CONNECTED". */
+/** Connected-device hero card. Honest in [demo]: says sample data, never "CONNECTED".
+ *  At large font scales the name/firmware column stacks UNDER the glyph+battery row instead of
+ *  sharing it: at 2x text the firmware line was ellipsizing into uselessness beside the glyph. */
 @Composable
 private fun DeviceHero(name: String?, firmware: String?, battery: Int?, charging: Boolean, connected: Boolean, demo: Boolean) {
-    Row(Modifier.fillMaxWidth().panel(strong = true), verticalAlignment = Alignment.CenterVertically) {
+    val stacked = LocalDensity.current.fontScale >= 1.5f
+    val glyph: @Composable () -> Unit = {
         Box(
             Modifier
                 .size(width = 52.dp, height = 38.dp)
@@ -1005,8 +1116,9 @@ private fun DeviceHero(name: String?, firmware: String?, battery: Int?, charging
             Box(Modifier.padding(start = 12.dp, top = 10.dp).size(7.dp)
                 .background(if (connected) Acab.accent else Acab.faint, CircleShape))
         }
-        Spacer(Modifier.size(14.dp))
-        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    }
+    val nameBlock: @Composable (Modifier) -> Unit = { m ->
+        Column(m, verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(
                 if (name?.contains("ACAB") == true || name?.contains("beacon") == true) "All Cameras Are Beacons" else (name ?: "ESP32 board"),
                 color = Acab.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 2,
@@ -1014,7 +1126,32 @@ private fun DeviceHero(name: String?, firmware: String?, battery: Int?, charging
             Text(if (demo) "SAMPLE DATA · no live board" else "CONNECTED · ${firmware ?: "beacons"}",
                 color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
         }
-        battery?.let {
+    }
+    if (stacked) {
+        Column(Modifier.fillMaxWidth().panel(strong = true), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                glyph()
+                Spacer(Modifier.weight(1f))
+                HeroBattery(battery, charging)
+                Box(Modifier.size(7.dp).background(if (connected) Acab.accent else Acab.faint, CircleShape))
+            }
+            nameBlock(Modifier.fillMaxWidth())
+        }
+        return
+    }
+    Row(Modifier.fillMaxWidth().panel(strong = true), verticalAlignment = Alignment.CenterVertically) {
+        glyph()
+        Spacer(Modifier.size(14.dp))
+        nameBlock(Modifier.weight(1f))
+        HeroBattery(battery, charging)
+        Box(Modifier.size(7.dp).background(if (connected) Acab.accent else Acab.faint, CircleShape))
+    }
+}
+
+/** The hero's battery read, shared by the stacked and inline layouts. */
+@Composable
+private fun HeroBattery(battery: Int?, charging: Boolean) {
+    battery?.let {
             // while charging, show a bolt + % in the trackerTone (teal) rather than a low-battery
             // crimson draining read; the pack is topping up, not running down.
             if (charging) {
@@ -1029,8 +1166,6 @@ private fun DeviceHero(name: String?, firmware: String?, battery: Int?, charging
             }
             Spacer(Modifier.size(8.dp))
         }
-        Box(Modifier.size(7.dp).background(if (connected) Acab.accent else Acab.faint, CircleShape))
-    }
 }
 
 /** Crimson banner shown only when a dual-radio board reports its nRF co-processor as faulted,
@@ -1252,7 +1387,8 @@ private fun CombinedStatus(
     }
 
     when {
-        combined.isRunning -> CardButton("Cancel", tint = Acab.dim) { onCancel() }
+        combined.isRunning && combined.canCancel -> CardButton("Cancel", tint = Acab.dim) { onCancel() }
+        combined.isRunning -> Unit
         combined.phase == CombinedUpdatePhase.PARTIAL -> {
             // S3 took; the second radio didn't finish. The same primary button re-offers just the
             // nRF leg (the S3 is current now, so a fresh run does the co-processor only).
@@ -1277,13 +1413,16 @@ private fun CheckForUpdatesRow(updateAvailable: Boolean) {
     Row(
         Modifier
             .fillMaxWidth()
+            .minimumInteractiveComponentSize()
             .background(Acab.bg2, RoundedCornerShape(Acab.radiusSm))
             .border(1.dp, Acab.line, RoundedCornerShape(Acab.radiusSm))
             .clickable(enabled = !checking) {
                 scope.launch {
-                    checking = true; justChecked = false
+                    checking = true
+                    justChecked = false
                     FirmwareManifest.getInstance(context).refreshNow()
-                    checking = false; justChecked = true
+                    checking = false
+                    justChecked = true
                     delay(1800)
                     justChecked = false
                 }
@@ -1320,6 +1459,7 @@ private fun CardButton(label: String, tint: Color = Acab.accent, filled: Boolean
     Box(
         Modifier
             .fillMaxWidth()
+            .minimumInteractiveComponentSize()
             .background(if (filled) Acab.accent else Acab.bg2, shape)
             .border(1.dp, if (filled) Color.Transparent else if (tint == Acab.accent) Acab.lineStrong else Acab.line, shape)
             .clickable(onClick = onClick)
@@ -1452,8 +1592,13 @@ private fun AlertModeSegment(label: String, active: Boolean, modifier: Modifier 
     Box(
         modifier
             .fillMaxHeight()
+            .minimumInteractiveComponentSize()
             .background(if (active) Acab.accent else Color.Transparent)
-            .clickable(onClick = onClick)
+            .selectable(
+                selected = active,
+                role = Role.RadioButton,
+                onClick = onClick,
+            )
             .padding(vertical = 9.dp),
         contentAlignment = Alignment.Center,
     ) {
@@ -1486,6 +1631,7 @@ private fun VolumeSlider(
         Slider(
             value = value, onValueChange = onValueChange, onValueChangeFinished = onCommit,
             valueRange = 0f..100f, enabled = !muted,
+            modifier = Modifier.semantics { contentDescription = label },
             colors = SliderDefaults.colors(
                 thumbColor = tone, activeTrackColor = tone, inactiveTrackColor = Acab.line,
             ),
@@ -1493,12 +1639,20 @@ private fun VolumeSlider(
     }
 }
 
-/** Glanceable summary, 2-up: uptime + detections. (Alerts/scanning now live in the fold kickers.) */
+/** Glanceable summary, 2-up: uptime + detections. (Alerts/scanning now live in the fold kickers.)
+ *  Stacks vertically at large font scales so the values never truncate against each other. */
 @Composable
 private fun StatsGrid(uptime: Int?, detections: Int) {
-    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        StatTile("UPTIME", uptime?.let(::uptimeText) ?: "-", Modifier.weight(1f))
-        StatTile("DETECTIONS", detections.toString(), Modifier.weight(1f))
+    if (LocalDensity.current.fontScale >= 1.5f) {
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            StatTile("UPTIME", uptime?.let(::uptimeText) ?: "-", Modifier.fillMaxWidth())
+            StatTile("DETECTIONS", detections.toString(), Modifier.fillMaxWidth())
+        }
+    } else {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            StatTile("UPTIME", uptime?.let(::uptimeText) ?: "-", Modifier.weight(1f))
+            StatTile("DETECTIONS", detections.toString(), Modifier.weight(1f))
+        }
     }
 }
 
@@ -1545,11 +1699,13 @@ private fun IgnoredCard(
                 // "my own AirTag" is the difference between trusting the mute and undoing it.
                 Icon(
                     Icons.Filled.Edit, contentDescription = "Rename", tint = Acab.dim,
-                    modifier = Modifier.size(28.dp).clickable { renaming = dev }.padding(6.dp),
+                    modifier = Modifier.minimumInteractiveComponentSize()
+                        .size(28.dp).clickable { renaming = dev }.padding(6.dp),
                 )
                 Spacer(Modifier.size(4.dp))
                 Box(
                     Modifier
+                        .minimumInteractiveComponentSize()
                         .border(1.dp, Acab.lineStrong, CircleShape)
                         .clickable { onUnmute(dev.mac) }
                         .padding(horizontal = 8.dp, vertical = 8.dp),
@@ -1602,6 +1758,7 @@ private fun WatchedCard(
                 // pencil rides in an explicit >=28dp box so the rename target is hittable
                 Box(
                     Modifier
+                        .minimumInteractiveComponentSize()
                         .size(32.dp)
                         .clip(CircleShape)
                         .clickable { renaming = dev },
@@ -1613,6 +1770,7 @@ private fun WatchedCard(
                 Spacer(Modifier.size(6.dp))
                 Box(
                     Modifier
+                        .minimumInteractiveComponentSize()
                         .border(1.dp, Acab.watchTone.copy(alpha = 0.4f), CircleShape)
                         .clickable { onUnwatch(dev.mac) }
                         .padding(horizontal = 8.dp, vertical = 8.dp),
@@ -1664,12 +1822,14 @@ private fun RenameWatchedDialog(initial: String, onDismiss: () -> Unit, onSave: 
         confirmButton = {
             Text("SAVE", color = Acab.accent, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                 letterSpacing = 0.5.sp, fontFamily = Acab.mono,
-                modifier = Modifier.clickable { onSave(text.trim()) }.padding(8.dp))
+                modifier = Modifier.minimumInteractiveComponentSize()
+                    .clickable { onSave(text.trim()) }.padding(8.dp))
         },
         dismissButton = {
             Text("CANCEL", color = Acab.dim, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                 letterSpacing = 0.5.sp, fontFamily = Acab.mono,
-                modifier = Modifier.clickable(onClick = onDismiss).padding(8.dp))
+                modifier = Modifier.minimumInteractiveComponentSize()
+                    .clickable(onClick = onDismiss).padding(8.dp))
         },
     )
 }
@@ -1693,16 +1853,19 @@ private fun AboutCard(showColonel: Boolean, onSoyboi: () -> Unit, onHowItDetects
             AboutLink("Colonel Panic", "colonelpanic.tech · OUI-Spy hardware", onColonel)
         }
         HorizontalDivider(color = Acab.line)
-        AboutLink("Privacy", "no data leaves your device", onPrivacy)
+        // Not "no data leaves your device": explicit export and contribution exist, and the
+        // privacy promise has to survive contact with the share sheet. Uploads: never automatic.
+        AboutLink("Privacy", "nothing is uploaded automatically", onPrivacy)
         Text("made by soyboi", color = Acab.faint, fontSize = 10.sp, fontFamily = Acab.mono,
-            modifier = Modifier.fillMaxWidth().clickable(onClick = onMadeBy).padding(top = 4.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+            modifier = Modifier.fillMaxWidth().minimumInteractiveComponentSize()
+                .clickable(onClick = onMadeBy).padding(top = 4.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
     }
 }
 
 @Composable
 private fun AboutLink(title: String, sub: String, onClick: () -> Unit) {
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick),
+        Modifier.fillMaxWidth().minimumInteractiveComponentSize().clickable(onClick = onClick),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -1723,7 +1886,17 @@ private fun ToggleRow(
     enabled: Boolean = true, modifier: Modifier = Modifier,
     onChange: (Boolean) -> Unit,
 ) {
-    Row(modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        modifier.fillMaxWidth().minimumInteractiveComponentSize()
+            .toggleable(
+                value = checked,
+                enabled = enabled,
+                role = Role.Switch,
+                onValueChange = onChange,
+            )
+            .semantics(mergeDescendants = true) {},
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(name, color = Acab.text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
@@ -1735,7 +1908,7 @@ private fun ToggleRow(
             Text(sub, color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
         }
         Switch(
-            checked = checked, onCheckedChange = onChange, enabled = enabled,
+            checked = checked, onCheckedChange = null, enabled = enabled,
             colors = SwitchDefaults.colors(
                 checkedThumbColor = Acab.onAccent, checkedTrackColor = tint,
                 uncheckedThumbColor = Acab.dim, uncheckedTrackColor = Acab.bg3,
@@ -1751,6 +1924,7 @@ private fun ToggleRow(
 private fun StatusRefreshButton(onClick: () -> Unit) {
     Box(
         Modifier
+            .minimumInteractiveComponentSize()
             .size(38.dp)
             .clip(CircleShape)
             .background(Acab.bg2)
@@ -1769,6 +1943,7 @@ private fun DisconnectButton(label: String = "Disconnect", enabled: Boolean = tr
     Box(
         Modifier
             .fillMaxWidth()
+            .minimumInteractiveComponentSize()
             .alpha(if (enabled) 1f else 0.5f)
             .background(Acab.bg2, RoundedCornerShape(Acab.radius))
             .border(1.dp, Acab.lineStrong, RoundedCornerShape(Acab.radius))

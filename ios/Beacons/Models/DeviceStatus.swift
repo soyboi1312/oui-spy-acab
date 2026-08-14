@@ -50,7 +50,7 @@ struct DeviceStatus: Equatable {
 
     /// The newest contract this build knows how to parse. Raise it in the SAME commit that teaches
     /// the app that contract, never ahead of it.
-    static let supportedProtoVersion = 1
+    static let supportedProtoVersion = 2
 
     /// True when the BOARD speaks a newer contract than this app understands. The honest response
     /// is to say so and stop trusting the parse, rather than keep reading fields whose meaning may
@@ -68,6 +68,9 @@ struct DeviceStatus: Equatable {
 extension DeviceStatus: Decodable {
     enum CodingKeys: String, CodingKey {
         case fw, up, total, ble, wifi, wifiEco, flock, drone, axon, tracker, glasses, buzzer, gps
+        case bodycam     // clearer alias for `axon` (ble-protocol.md prefers it); today's firmware
+                         // still EMITS only `axon`, so read bodycam first and fall back, exactly
+                         // as Android does, so a firmware-side rename cannot strand this app
         case droui       // drone vendor-OUI fallback enabled; absent = off (the default)
         case ncam        // network-camera detector enabled; absent = off (the default)
         case vol         // firmware sends "vol"; we call it `volume`
@@ -100,7 +103,8 @@ extension DeviceStatus: Decodable {
         flock    = (try? k.decode(Bool.self, forKey: .flock)) ?? true   // default on, absent = on like glasses
         drone    = (try? k.decode(Bool.self, forKey: .drone)) ?? true   // default on, absent = on like glasses
         droui    = (try? k.decode(Bool.self, forKey: .droui)) ?? false  // default OFF, absent = off like axon
-        axon     = (try? k.decode(Bool.self, forKey: .axon)) ?? false
+        axon     = (try? k.decode(Bool.self, forKey: .bodycam))
+                ?? (try? k.decode(Bool.self, forKey: .axon)) ?? false
         tracker  = (try? k.decode(Bool.self, forKey: .tracker)) ?? false
         glasses  = (try? k.decode(Bool.self, forKey: .glasses)) ?? true   // default on, like the body-cam detector
         ncam     = (try? k.decode(Bool.self, forKey: .ncam)) ?? false  // default OFF, absent = off like droui
@@ -131,12 +135,12 @@ extension DeviceStatus {
     /// firmware manifest (see FirmwareManifestStore); bump this on a beacon-board release so the
     /// offline path still matches. The Colonel Panic single-board builds (oui-spy / mesh-detect)
     /// track a separate line now that the beacon board has moved ahead - see colonelLatestVersion.
-    static let latestVersion = "2.0.4"
+    static let latestVersion = "2.0.5"
 
     /// Latest firmware for the Colonel Panic single-board builds, which stayed on the shared
     /// acab_version.h default when the beacon board diverged. Offline fallback only; bump on a
     /// Colonel Panic release.
-    static let colonelLatestVersion = "2.0.4"
+    static let colonelLatestVersion = "2.0.5"
 
     /// Just the version number out of `fw` ("ACAB-ouispy 0.1.0" -> "0.1.0").
     var version: String { firmware.split(separator: " ").last.map(String.init) ?? firmware }

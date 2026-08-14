@@ -8,12 +8,18 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
@@ -40,7 +46,7 @@ import tech.acab.app.ui.theme.Acab
  * is open) is identical.
  */
 @Composable
-fun HelpScreen(scrollToId: String? = null) {
+fun HelpScreen(scrollToId: String? = null, onImproveDetection: (() -> Unit)? = null) {
     val context = LocalContext.current
     val faq = remember { FaqContent.get(context) }
     var query by remember { mutableStateOf("") }
@@ -52,7 +58,9 @@ fun HelpScreen(scrollToId: String? = null) {
     val results = remember(query) { faq.search(query) }
 
     Column(
-        Modifier.fillMaxWidth().padding(horizontal = 14.dp),
+        Modifier.fillMaxWidth()
+            .then(if (tourOpen) Modifier.clearAndSetSemantics { } else Modifier)
+            .padding(horizontal = 14.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         // ---- search ----------------------------------------------------------------------
@@ -62,29 +70,34 @@ fun HelpScreen(scrollToId: String? = null) {
                 .clip(RoundedCornerShape(Acab.radius))
                 .background(Acab.bg2)
                 .border(1.dp, Acab.line, RoundedCornerShape(Acab.radius))
-                .padding(horizontal = 12.dp, vertical = 10.dp),
+                .padding(horizontal = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text("?", color = Acab.faint, fontSize = 13.sp, fontFamily = Acab.mono)
             Spacer(Modifier.width(9.dp))
-            Box(Modifier.weight(1f)) {
-                if (query.isEmpty()) {
-                    Text("search help", color = Acab.faint, fontSize = 13.sp, fontFamily = Acab.mono)
-                }
-                BasicTextField(
-                    value = query,
-                    onValueChange = { query = it },
-                    singleLine = true,
-                    textStyle = TextStyle(color = Acab.text, fontSize = 13.sp, fontFamily = Acab.mono),
-                    cursorBrush = SolidColor(Acab.accent),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
+            BasicTextField(
+                value = query,
+                onValueChange = { query = it },
+                singleLine = true,
+                textStyle = TextStyle(color = Acab.text, fontSize = 13.sp, fontFamily = Acab.mono),
+                cursorBrush = SolidColor(Acab.accent),
+                modifier = Modifier.weight(1f).minimumInteractiveComponentSize()
+                    .semantics { contentDescription = "Search help" },
+                decorationBox = { inner ->
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                        if (query.isEmpty()) {
+                            Text("search help", color = Acab.faint, fontSize = 13.sp,
+                                fontFamily = Acab.mono)
+                        }
+                        inner()
+                    }
+                },
+            )
             if (query.isNotEmpty()) {
                 Text(
                     "clear",
                     color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
-                    modifier = Modifier.clickable { query = "" },
+                    modifier = Modifier.minimumInteractiveComponentSize().clickable { query = "" },
                 )
             }
         }
@@ -132,18 +145,22 @@ fun HelpScreen(scrollToId: String? = null) {
             verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
             Kicker("SUPPORT")
-            faq.support.forEachIndexed { i, row ->
+            // The "improve detection" row opens the contribution composer, which lives on the
+            // Beacon tab. When Help is shown somewhere that cannot reach it (a dossier's related
+            // help passes no handler), drop the row rather than render a dead one.
+            val rows = faq.support.filter { it.action != "improveDetection" || onImproveDetection != null }
+            rows.forEachIndexed { i, row ->
                 SupportRow(row) {
                     when {
-                        // The only in-app route today. Kept as a named action rather than a URL so
-                        // the JSON never has to know about navigation.
+                        // Named actions, not URLs, so the JSON never has to know about navigation.
+                        row.action == "improveDetection" -> onImproveDetection?.invoke()
                         row.action == "firstRunTour" -> tourOpen = true
                         row.url != null -> runCatching {
                             context.startActivity(Intent(Intent.ACTION_VIEW, row.url.toUri()))
                         }
                     }
                 }
-                if (i < faq.support.size - 1) Hairline()
+                if (i < rows.size - 1) Hairline()
             }
         }
 
@@ -155,7 +172,12 @@ fun HelpScreen(scrollToId: String? = null) {
 
 @Composable
 private fun QuestionRow(q: FaqQuestion, sectionKicker: String?, open: Boolean, onToggle: () -> Unit) {
-    Column(Modifier.fillMaxWidth().clickable { onToggle() }.padding(vertical = 10.dp)) {
+    Column(Modifier.fillMaxWidth().minimumInteractiveComponentSize()
+        .clickable(role = Role.Button) { onToggle() }
+        .semantics(mergeDescendants = true) {
+            stateDescription = if (open) "expanded" else "collapsed"
+        }
+        .padding(vertical = 10.dp)) {
         Row(verticalAlignment = Alignment.Top) {
             Column(Modifier.weight(1f)) {
                 // Search results carry their section so an answer found out of context still says
@@ -167,7 +189,8 @@ private fun QuestionRow(q: FaqQuestion, sectionKicker: String?, open: Boolean, o
                 Text(q.q, color = Acab.text, fontSize = 13.5.sp, lineHeight = 18.sp, fontFamily = Acab.display)
             }
             Spacer(Modifier.width(10.dp))
-            Text(if (open) "−" else "+", color = Acab.faint, fontSize = 14.sp, fontFamily = Acab.mono)
+            Text(if (open) "−" else "+", color = Acab.faint, fontSize = 14.sp,
+                fontFamily = Acab.mono, modifier = Modifier.clearAndSetSemantics { })
         }
         if (open) {
             Spacer(Modifier.height(8.dp))

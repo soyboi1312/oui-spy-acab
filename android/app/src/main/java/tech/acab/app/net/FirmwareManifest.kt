@@ -10,15 +10,50 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * One firmware build's entry from the manifest. Keys mirror the JSON at
- * https://soyboi.tech/firmware/firmware-latest.json under builds[<fw label>].
- */
+/** Read an HTTP body with both declared-length and streaming ceilings. Null means refusal. */
+internal fun readBoundedManifestBody(
+    input: InputStream,
+    declaredLength: Long,
+    maxBytes: Int,
+): ByteArray? {
+    if (declaredLength > maxBytes || maxBytes <= 0) return null
+    val out = ByteArrayOutputStream(
+        if (declaredLength in 1..maxBytes.toLong()) declaredLength.toInt() else minOf(maxBytes, 16 * 1024),
+    )
+    val buf = ByteArray(8 * 1024)
+    var total = 0
+    while (true) {
+        val read = input.read(buf)
+        if (read < 0) break
+        total += read
+        if (total > maxBytes) return null
+        out.write(buf, 0, read)
+    }
+    return out.toByteArray()
+}
+
+/** Firmware artifacts are intentionally confined to the product's exact HTTPS origin. */
+internal fun trustedFirmwareArtifactUrl(raw: String): URL? = runCatching {
+    URL(raw).takeIf { url ->
+        url.protocol.equals("https", ignoreCase = true) &&
+            url.host.equals("soyboi.tech", ignoreCase = true) &&
+            url.userInfo == null && url.ref == null && url.port in setOf(-1, 443)
+    }
+}.getOrNull()
+
+/** Redirects are refused even when their destination would otherwise be trusted. */
+internal fun firmwareArtifactResponseAllowed(initial: URL, final: URL, statusCode: Int): Boolean =
+    statusCode == HttpURLConnection.HTTP_OK &&
+        trustedFirmwareArtifactUrl(initial.toExternalForm()) != null &&
+        trustedFirmwareArtifactUrl(final.toExternalForm()) != null &&
+        initial.toExternalForm() == final.toExternalForm()
+
 /**
  * The co-processor half of a build entry, from builds[<label>].nrf. The nRF52840 runs the
  * Adafruit/Seeed bootloader, which speaks LEGACY Nordic DFU (service 0x1530), so what the
@@ -34,13 +69,21 @@ data class NrfBuild(
     val size: Long,
     val sig: String,
 ) {
-    /** Same bar as the S3 image: a download URL, a published hash, a real size, and a
-     *  signature. The board verifies the detached ECDSA signature before it commits, so an
-     *  unsigned package would be refused anyway and must never start an update. */
+    /** Same publication bar as the S3 image: a download URL, a published hash, a bounded size,
+     *  and a signature. The app verifies the detached signature because the stock nRF bootloader
+     *  cannot, so an unsigned package must never reach the hardware. */
     val hasVerifiableImage: Boolean get() =
-        zipUrl.isNotEmpty() && sha256.isNotEmpty() && size > 0 && sig.isNotEmpty()
+        zipUrl.isNotEmpty() && sha256.isNotEmpty() && size in 1L..MAX_PACKAGE_BYTES && sig.isNotEmpty()
+
+    companion object {
+        const val MAX_PACKAGE_BYTES = 4L * 1024 * 1024
+    }
 }
 
+/**
+ * One firmware build's entry from the manifest. Keys mirror the JSON at
+ * https://soyboi.tech/firmware/firmware-latest.json under builds[<fw label>].
+ */
 data class FirmwareBuild(
     val version: String,
     val ota: Boolean,
@@ -52,6 +95,8 @@ data class FirmwareBuild(
     val notes: String,
     /** null when the entry publishes no co-processor package (every non-beacon board). */
     val nrf: NrfBuild? = null,
+    /** Exact builds-map key that selected this image. Empty only for the non-OTA fallback. */
+    val manifestLabel: String = "",
 ) {
     /** True when the entry carries a downloadable, verifiable image: a non-empty download
      *  URL, a non-empty hash, a real size, and a non-empty ECDSA signature (hex DER over the
@@ -163,6 +208,7 @@ class FirmwareManifest private constructor(context: Context) {
         private const val KEY_JSON = "manifestJson"
         private const val KEY_FETCHED_AT = "manifestFetchedAt"
         private const val TTL_MS = 6L * 60 * 60 * 1000   // ~6 hours
+        private const val MAX_MANIFEST_BYTES = 256 * 1024
 
         @Volatile private var INSTANCE: FirmwareManifest? = null
 
@@ -183,19 +229,26 @@ class FirmwareManifest private constructor(context: Context) {
             updated = "",
             builds = mapOf(
                 "beacon board" to FirmwareBuild(
-                    version = "2.0.4", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.5", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi.tech/flash.html", notes = "",
                 ),
+                // rev-B rides the beacon version line but flashes from its own page: its image
+                // must never land on rev-A hardware, so the fallback must not point it at
+                // flash.html. Matches the iOS fallback.
+                "beacon board rev-B" to FirmwareBuild(
+                    version = "2.0.5", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    flasher = "https://soyboi.tech/flash-revb.html", notes = "",
+                ),
                 "ACAB-ouispy" to FirmwareBuild(
-                    version = "2.0.4", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.5", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
                 "mesh-detect-ACAB" to FirmwareBuild(
-                    version = "2.0.4", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.5", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
                 "mesh-detect-ACAB-ch1" to FirmwareBuild(
-                    version = "2.0.4", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.5", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
             ),
@@ -234,6 +287,7 @@ class FirmwareManifest private constructor(context: Context) {
                             sig     = n.optString("sig", "").lowercase(),
                         )
                     },
+                    manifestLabel = label,
                 )
             }
             require(builds.isNotEmpty()) { "manifest carries no builds" }
@@ -255,7 +309,10 @@ class FirmwareManifest private constructor(context: Context) {
                     setRequestProperty("Accept", "application/json")
                 }
                 if (conn.responseCode != HttpURLConnection.HTTP_OK) return null
-                conn.inputStream.bufferedReader().use(BufferedReader::readText)
+                val bytes = conn.inputStream.use { input ->
+                    readBoundedManifestBody(input, conn.contentLengthLong, MAX_MANIFEST_BYTES)
+                } ?: return null
+                bytes.toString(Charsets.UTF_8)
             } catch (_: Exception) {
                 null
             } finally {

@@ -23,7 +23,11 @@ enum ACABTheme {
     // Text
     static let text  = Color(hex: 0xF4EEF0)
     static let dim   = Color(red: 240/255, green: 224/255, blue: 226/255).opacity(0.60)
-    static let faint = Color(red: 240/255, green: 224/255, blue: 226/255).opacity(0.33)
+    // 0.52, not the original 0.33: faint carries real instructions and privacy copy, and at 0.33
+    // it measured ~2.5:1 against bg (WCAG AA wants 4.5:1 for text). 0.52 lands 4.69:1 on bg,
+    // 4.67:1 on bg2 and 4.55:1 on bg3 while staying below dim (0.60, ~5.9:1), so the three-step
+    // faint < dim < text hierarchy survives. Verified by compositing the tint over each surface.
+    static let faint = Color(red: 240/255, green: 224/255, blue: 226/255).opacity(0.52)
 
     // Accent (crimson) + amber
     static let accent     = Color(hex: 0xEE4034)

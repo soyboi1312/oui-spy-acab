@@ -4,16 +4,18 @@
 
 It runs on the beacon (our own two-radio board) and on the **Colonel Panic OUI-Spy** and **Mesh-Detect** boards (tiny Seeed XIAO ESP32-S3 dev boards). Plug it in and it listens for the radio signals that cameras, sensors, and drones are already shouting into the air. When it detects one, it tells you.
 
-> **Important** this only ever *listens*. It does not jam,
-> spoof, or interfere with anything. It is the radio equivalent of noticing a
-> camera on a pole and writing it down. Mapping surveillance gear in public is a
-> long-standing privacy practice (the folks at deflock.me have been at it a while).
+> **Important** detection of nearby devices is passive. It does not probe, jam,
+> spoof, control, or interfere with those devices. The board's encrypted bluetooth
+> link reports results and receives settings only from your phone. It is the radio
+> equivalent of noticing a camera on a pole and writing it down. Mapping surveillance
+> gear in public is a long-standing privacy practice (the folks at deflock.me have
+> been at it a while).
 
 ## the beacon
 
 the beacon is a pocket detector, about the size of an airpods case, that quietly maps the surveillance broadcasting around you. flip it on, drop it in a bag, and everything it hears shows up live on your phone.
 
-it is a **passive listener** on two bands, WiFi and bluetooth. surveillance gear announces itself over the air to do its job; the beacon recognizes those broadcasts and puts them on your map. it never transmits, jams, or spoofs. it is a detector, not a weapon.
+it is a **passive detector** on two bands, WiFi and bluetooth. surveillance gear announces itself over the air to do its job; the beacon recognizes those broadcasts and puts them on your map. it never probes, jams, or spoofs nearby devices; its encrypted bluetooth link exchanges results and settings only with your phone. it is a detector, not a weapon.
 
 **what it catches**
 - flock / ALPR license-plate cameras, plus flock's raven audio sensors
@@ -31,7 +33,7 @@ it is a **passive listener** on two bands, WiFi and bluetooth. surveillance gear
 - ships pre-flashed and ready to pair, nothing to set up out of the box
 - USB-C powered (the battery model recharges over the same port). when new firmware lands the app flags it and installs it over-the-air over bluetooth, no cable and no toolchain; you can also flash from your browser in one click at [soyboi.tech/flash](https://soyboi.tech/flash.html)
 
-**free app, paid hardware.** the iOS and android apps are free and open source, and so is the firmware, read every line before you trust it. the beacon hardware is what we sell. buy the beacon, own the data: no accounts, no cloud, no telemetry, every detection stays on your device.
+**free app, paid hardware.** the iOS and android apps are free and open source, and so is the firmware, read every line before you trust it. the beacon hardware is what we sell. buy the beacon, own the data: no accounts, no cloud, no telemetry, and no automatic detection uploads. detections stay on your beacon and phone unless you explicitly export or send them.
 
 **get one.** everything about the beacon lives at [soyboi.tech](https://soyboi.tech). preorder on [tindie](https://www.tindie.com/stores/soyboitech/).
 
@@ -41,15 +43,15 @@ it is a **passive listener** on two bands, WiFi and bluetooth. surveillance gear
 
 | What | How it's spotted | Notes |
 |---|---|---|
-| **Flock cameras** (automated license-plate readers) | Bluetooth + WiFi | very reliable |
+| **Flock cameras** (automated license-plate readers) | Bluetooth (+ WiFi when a unit is provisioning) | reliable over Bluetooth; the WiFi path depends on a camera scanning for a network, which units on cellular backhaul may never do |
 | **Flock Raven** (their audio / gunshot sensor) | Bluetooth | very reliable |
 | **Drones** broadcasting FAA Remote ID | Bluetooth + WiFi | very reliable. a separate opt-in fallback, off by default, flags DJI, Parrot, Skydio, Autel and Yuneec hardware when Remote ID is silent; that one means vendor gear nearby, which may be a controller rather than an aircraft |
 | **Axon body cameras** | Bluetooth | field-validated June 2026; on by default |
 | **BLE item trackers** (AirTag / Find My, Tile, Samsung SmartTag) | Bluetooth | off by default, flip it on from the app; the buzzer holds quiet for a tracker's first minute in range, so one you walk past never sounds, while the sighting still reaches the app straight away |
-| **Smart / recording glasses** (Ray-Ban / Oakley Meta, Snap Spectacles, Vuzix) | Bluetooth | on by default; capture-pending, reports as "possible glasses" since the Meta signature can also be a VR headset |
-| **Network cameras** (branded IP cameras: Hikvision, Dahua, Amcrest, Axis, Reolink) | WiFi | opt-in, off by default; the board never joins a network, it listens promiscuously and matches camera-brand OUIs in frames already on the air, at 65-88 confidence (an OUI match is 65, or 75 field-validated; an Arlo base station naming itself in its SSID is 88); known brands only, cannot find every camera, never a hidden-camera claim. now 62 vendor blocks including Ring, Wyze and Anker/eufy, where a hit may be another product from the same maker |
+| **Smart / recording glasses** (Ray-Ban / Oakley Meta, Snap Spectacles, Vuzix) | Bluetooth | on by default; one field capture behind it, with the Quest discriminator still capture-pending; reports as "possible glasses" since the Meta signature can also be a VR headset |
+| **Network cameras** (branded IP cameras: Hikvision, Dahua, Amcrest, Axis, Reolink) | WiFi | opt-in, off by default; the board never joins a network, it listens promiscuously and matches camera-brand OUIs in frames already on the air, at 65-88 confidence (an OUI match is 65, or 75 field-validated; an Arlo base station naming itself in its SSID is 88); known brands only, cannot find every camera, never a hidden-camera claim. now 180 vendor blocks including Ring, Wyze and Anker/eufy, where a hit may be another product from the same maker |
 
-Flock and Raven detection is built from publicly documented signatures, the IEEE OUI registry, Bluetooth SIG assigned numbers, and independent Flock research, all mapped out in [docs/signatures.md](docs/signatures.md). Drone detection reads the public FAA / ASTM Remote ID broadcast via the open-source [OpenDroneID](https://github.com/opendroneid/opendroneid-core-c) decoder, with a secondary hardware-signature fallback for DJI, Parrot, Skydio, Autel, and Yuneec when a craft isn't broadcasting Remote ID. BLE tracker detection is opt-in; Axon body-cam detection is field-validated (notes in [docs/axon.md](docs/axon.md)). Smart/recording-glasses detection keys off Bluetooth SIG company IDs and is capture-pending (notes in [docs/glasses.md](docs/glasses.md)).
+Flock and Raven detection is built from publicly documented signatures, the IEEE OUI registry, Bluetooth SIG assigned numbers, and independent Flock research, all mapped out in [docs/signatures.md](docs/signatures.md). Drone detection reads the public FAA / ASTM Remote ID broadcast via the open-source [OpenDroneID](https://github.com/opendroneid/opendroneid-core-c) decoder, with a secondary hardware-signature fallback for DJI, Parrot, Skydio, Autel, and Yuneec when a craft isn't broadcasting Remote ID. BLE tracker detection is opt-in; Axon body-cam detection is field-validated (notes in [docs/axon.md](docs/axon.md)). Smart/recording-glasses detection keys off Bluetooth SIG company IDs and has one field capture behind it, with the Quest discriminator still capture-pending (notes in [docs/glasses.md](docs/glasses.md)).
 
 ## How reliable is it?
 
@@ -119,7 +121,7 @@ pio run -e mesh-detect -t upload    # the Meshtastic version
 pio device monitor -b 115200        # watch what it's finding, live
 ```
 
-Changed the firmware? Rebuild the browser flasher images with `./web/build-flasher.sh`, push, and the hosted page updates itself.
+Changed the firmware? Rebuild the browser flasher images with `./web/build-flasher.sh` (add `--unsigned-usb-only` if you don't hold the OTA signing key), push, and the hosted page updates itself.
 
 ## Two flavors, same detector
 

@@ -22,10 +22,12 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.location.Location
+import android.location.LocationListener
 import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
 import android.os.ParcelUuid
+import android.os.Looper
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -66,12 +68,13 @@ import tech.acab.app.model.methodLabel
 import tech.acab.app.model.sourceLabel
 import tech.acab.app.net.FirmwareBuild
 import tech.acab.app.net.FirmwareManifest
+import tech.acab.app.net.firmwareArtifactResponseAllowed
+import tech.acab.app.net.trustedFirmwareArtifactUrl
 import tech.acab.app.widget.BeaconsWidgetProvider
 import java.time.LocalDate
 import java.time.ZoneId
 import java.io.File
 import java.net.HttpURLConnection
-import java.net.URL
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.time.Instant
@@ -142,6 +145,57 @@ data class FoundBoard(val device: BluetoothDevice, val name: String, val rssi: I
  *  never sees a torn category/timestamp pair. */
 data class NewestLive(val category: String, val at: Long)
 
+/** One indivisible Stop result for the contribution composer. [capturedAtById] and [csv]
+ *  are derived while holding the same store snapshot, so a live update or eviction cannot land
+ *  between the membership decision and the row serialization. The CSV is deliberately
+ *  unredacted; review-time policy switches redact this frozen text without touching the store. */
+data class ContributionWindowSnapshot(
+    val capturedAtById: Map<String, Long>,
+    val csv: String,
+)
+
+/** Immutable input for a normal Log CSV/GPX export. Membership, visible row values, time basis,
+ * and observer coordinate are all frozen before IO, so a scope change, resume, or live publish
+ * cannot alter the file after the user taps Export. */
+internal data class DetectionExportRowSnapshot(
+    val detection: Detection,
+    val firstSeenMs: Long?,
+    val timeBasis: TimeBasis,
+    val observerCoord: Pair<Double, Double>?,
+)
+
+internal data class DetectionExportSnapshot(val rows: List<DetectionExportRowSnapshot>)
+
+/** Process-level location ownership rule. A visible READY link may use the Activity's
+ * while-in-use grant; background Drive mode may use it only after its foreground service is
+ * actually active. Keeping this pure pins the lifecycle matrix without an Android runtime. */
+internal fun shouldOwnLocation(
+    locationGranted: Boolean,
+    state: ConnState,
+    appForegrounded: Boolean,
+    driveMode: Boolean,
+    driveServiceActive: Boolean,
+): Boolean = locationGranted && state == ConnState.READY &&
+    (appForegrounded || (driveMode && driveServiceActive))
+
+/** NEW-lens membership from frozen first-seen values, never from manager side maps that may have
+ * evicted these ids after Pause. The two watermark axes intentionally match [newIdSet]. */
+internal fun frozenNewIdSet(
+    rows: List<DetectionExportRowSnapshot>,
+    seenWatermark: Long,
+    approxWatermark: Long,
+): Set<String> = buildSet {
+    for (row in rows) {
+        val fs = row.firstSeenMs
+        val isNew = fs == null || if (fs <= AcabBleManager.HIST_PSEUDO_BASE) {
+            fs < approxWatermark
+        } else {
+            fs > seenWatermark
+        }
+        if (isNew) add(row.detection.id)
+    }
+}
+
 /** What the app knows about a buffered row's time: how the stamp was arrived at, and the key
  *  the log orders it by. The two are deliberately separate. A bracketed or unbounded record
  *  carries the seq-derived pseudo stamp, which sits near 2001, so sorting on the stamp buries
@@ -172,6 +226,57 @@ data class OtaProgress(
     val message: String = "",    // human copy for FAILED, else a short status line
     val targetVersion: String = "",
 )
+
+/** Current firmware replies carry no wire session token. This is the minimum ownership gate every
+ * S3 OTA reply must pass before its phase-specific checks run. */
+internal fun otaReplyBelongsToArmedSession(
+    armed: Boolean,
+    ownerConnectGen: Int,
+    currentConnectGen: Int,
+): Boolean = armed && ownerConnectGen >= 0 && ownerConnectGen == currentConnectGen
+
+internal enum class OtaPostRebootDecision { CONFIRM, LABEL_MISMATCH, ROLLED_BACK, UNKNOWN }
+
+internal fun isNumericFirmwareVersion(value: String): Boolean {
+    val core = value.substringBefore("-")
+    // ASCII digits ONLY. Char.isDigit() is Unicode-aware (accepts fullwidth, Arabic-Indic,
+    // Devanagari...) and String.toInt() parses those same characters via Character.digit(), so
+    // neither half of the old conjunction rejected them. The running-version string comes off the
+    // board's Status frame, attacker-influenced under this product's threat model, and a spoofed
+    // "numeric" version reaching CONFIRM disarms bootloader rollback. Fields are capped at 4
+    // digits: the firmware packs 10-bit fields (max 1023), so longer is malformed on its face.
+    return core.isNotEmpty() && core.split(".").all { field ->
+        field.isNotEmpty() && field.length <= 4 && field.all { it in '0'..'9' }
+    }
+}
+
+internal fun isFirmwareVersionAtLeast(have: String, want: String): Boolean {
+    if (!isNumericFirmwareVersion(have) || !isNumericFirmwareVersion(want)) return false
+    val a = have.substringBefore("-").split(".").map(String::toInt)
+    val b = want.substringBefore("-").split(".").map(String::toInt)
+    for (i in 0 until maxOf(a.size, b.size)) {
+        val x = a.getOrElse(i) { 0 }
+        val y = b.getOrElse(i) { 0 }
+        if (x != y) return x > y
+    }
+    return true
+}
+
+internal fun decideOtaPostReboot(
+    runningVersion: String,
+    runningLabel: String,
+    targetVersion: String,
+    targetLabel: String,
+): OtaPostRebootDecision = when {
+    !isNumericFirmwareVersion(runningVersion) || !isNumericFirmwareVersion(targetVersion) ->
+        OtaPostRebootDecision.UNKNOWN
+    runningLabel != targetLabel -> OtaPostRebootDecision.LABEL_MISMATCH
+    isFirmwareVersionAtLeast(runningVersion, targetVersion) -> OtaPostRebootDecision.CONFIRM
+    else -> OtaPostRebootDecision.ROLLED_BACK
+}
+
+internal fun otaDoneCanAdvance(phase: OtaPhase, imageEnded: Boolean): Boolean =
+    phase == OtaPhase.SENDING && imageEnded
 
 /** A device the user has chosen to silence (a whitelist entry). */
 data class IgnoredDevice(val mac: String, val label: String)
@@ -231,12 +336,16 @@ class AcabBleManager(private val context: Context) {
             adapter = adapter,
             scope = scope,
             sendTrigger = { writeConfig(JSONObject().put("nrfdfu", true)) },
+            requestStatus = { readStatus() },
             statusProvider = { _status.value },
             // Never let a co-processor DFU start on top of a live S3 OTA (both drive the radio).
             otaInProgress = {
                 val p = _otaProgress.value.phase
                 p != OtaPhase.IDLE && p != OtaPhase.DONE && p != OtaPhase.FAILED
             },
+            linkSessionProvider = { connectGen.toLong() },
+            linkReady = { gatt != null && _state.value == ConnState.READY },
+            statusRevisionProvider = { statusRevision.get() },
         )
     }
     val nrfDfuProgress: StateFlow<NrfDfuProgress> get() = nrfDfu.progress
@@ -245,8 +354,8 @@ class AcabBleManager(private val context: Context) {
     fun cancelNrfUpdate() = nrfDfu.cancel()
     fun dismissNrfUpdate() = nrfDfu.dismiss()
 
-    // One-click combined update: a single "Update" flow that runs the S3 OTA first, then, when it
-    // applies, the nRF co-processor DFU, merging their two progress streams onto one 0..1 bar. It
+    // One-click combined update: a single "Update" flow that runs the nRF leg first while the
+    // physical-start authorization is live, then S3, merging both progress streams onto one bar. It
     // COMPOSES the two engines above (it re-implements no transfer) and holds the foreground service
     // across BOTH legs (HOLD_COMBINED), since the S3 OTA releases its own hold on its DONE.
     private val combined by lazy {
@@ -257,6 +366,7 @@ class AcabBleManager(private val context: Context) {
             otaCapable = _otaCapable.asStateFlow(),
             startS3 = { startOta(it) },
             cancelS3 = { cancelOta() },
+            canCancelS3 = { otaCancellableNow() },
             dismissS3 = { clearOtaResult() },
             startNrf = { nrfDfu.startUpdate(it) },
             cancelNrf = { nrfDfu.cancel() },
@@ -322,6 +432,14 @@ class AcabBleManager(private val context: Context) {
     private val _offlineSyncBanner = MutableStateFlow<Int?>(null)
     val offlineSyncBanner: StateFlow<Int?> = _offlineSyncBanner.asStateFlow()
 
+    // One-shot beside the banner: records the board PROMISED ({"hist":"begin","n"}) but never
+    // SENT ({"hist":"end","n"}). A record past notifyCap() is consumed from the ring and skipped
+    // without incrementing the sent count, so it is gone and no retry can refill it (the doc's
+    // "replay check needs all three numbers"). Disclosure, not resync: surfaced in the banner,
+    // cleared with it. ble-protocol.md, "Why the replay check needs all three numbers".
+    private val _offlineSyncUnreplayed = MutableStateFlow(0)
+    val offlineSyncUnreplayed: StateFlow<Int> = _offlineSyncUnreplayed.asStateFlow()
+
     // Bumped whenever histTime changes for rows already on screen, which is the end of a drain,
     // where bracketing turns a pile of "time unknown" rows into bounded ones. timeBasis() is a
     // plain map read, so a screen holding one has no way to learn it went stale; this gives it a
@@ -361,6 +479,26 @@ class AcabBleManager(private val context: Context) {
 
     private val locationManager: LocationManager? by lazy {
         context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+    }
+
+    /** Location is process-owned because Drive mode deliberately outlives MainActivity. The old
+     * Activity ViewModel listener was removed with its task, leaving the foreground service alive
+     * but every fix after two minutes rejected as stale. Registration is now need-gated: a visible
+     * live link, or a Drive service that has actually entered the foreground. */
+    @Volatile private var locationPermissionGranted = hasLocationPermission()
+    @Volatile private var locationUpdatesRegistered = false
+    @Volatile private var driveServiceActive = false
+    private val ownedLocationListener = object : LocationListener {
+        override fun onLocationChanged(location: Location) {
+            val age = SystemClock.elapsedRealtimeNanos() - location.elapsedRealtimeNanos
+            if (age in 0..FIX_MAX_AGE_NANOS && validCoord(location.latitude, location.longitude)) {
+                setLocation(location.latitude, location.longitude)
+            }
+        }
+        override fun onProviderEnabled(provider: String) { syncLocationOwnership() }
+        override fun onProviderDisabled(provider: String) {}
+        @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
     }
 
     // Short-lived cache of the platform's last known fix (see freshSelfCoord).
@@ -415,6 +553,10 @@ class AcabBleManager(private val context: Context) {
     }
 
     private fun onRadioOn() {
+        if (!hasScanPermission() || !hasConnectPermission()) {
+            teardownForBluetoothPermissionRevocation()
+            return
+        }
         // Radio's back. A reconnect that was pending when it died is re-armed first, mirroring
         // iOS centralManagerDidUpdateState's .poweredOn reconnectTarget branch; without this a
         // Bluetooth toggle or airplane-mode hop mid-chase left the app at DISCONNECTED until a
@@ -434,7 +576,7 @@ class AcabBleManager(private val context: Context) {
             // gave up while the radio was off, or connectGatt returned null on a dead adapter):
             // no callback will ever fire, so recover to the scan screen here.
             _state.value = ConnState.DISCONNECTED
-            if (appForegrounded && hasScanPermission()) startScan()
+            if (appForegrounded && hasScanPermission() && hasConnectPermission()) startScan()
             return
         }
         if (_state.value != ConnState.POWERED_OFF) return
@@ -442,14 +584,17 @@ class AcabBleManager(private val context: Context) {
         // Foreground only, and debounced: a background radio flap must not light up a
         // LOW_LATENCY scan nobody is looking at, and rapid toggles must not burn the
         // platform's 5-scan-starts-per-30s budget.
-        if (appForegrounded && hasScanPermission() &&
+        if (appForegrounded && hasScanPermission() && hasConnectPermission() &&
             SystemClock.elapsedRealtime() - lastScanStartAt > SCAN_RESTART_DEBOUNCE_MS) startScan()
     }
 
     /** Resting (not-connected) state for the current radio: the scan screen when it's on, the
      *  "Bluetooth is off" screen when it isn't. */
     private fun restingState(): ConnState =
-        if (adapter?.isEnabled == true) ConnState.DISCONNECTED else ConnState.POWERED_OFF
+        if (!hasScanPermission() || !hasConnectPermission()) ConnState.DISCONNECTED
+        else if (runCatching { adapter?.isEnabled == true }.getOrDefault(false)) {
+            ConnState.DISCONNECTED
+        } else ConnState.POWERED_OFF
 
     /** Whether we hold the permission a scan needs (SCAN on 12+, else fine location), so an
      *  auto-rescan on radio-recovery never trips a SecurityException. */
@@ -460,6 +605,19 @@ class AcabBleManager(private val context: Context) {
         else
             ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION) ==
                 PackageManager.PERMISSION_GRANTED
+
+    private fun hasConnectPermission(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            ContextCompat.checkSelfPermission(context, android.Manifest.permission.BLUETOOTH_CONNECT) ==
+                PackageManager.PERMISSION_GRANTED
+
+    /** BluetoothDevice getters became permission-gated on Android 12. They are best-effort display
+     * metadata, so a revocation race must not crash a scan or reconnect callback. */
+    private fun safeDeviceName(device: BluetoothDevice): String? =
+        runCatching { device.name }.getOrNull()
+
+    private fun safeDeviceAddress(device: BluetoothDevice): String? =
+        runCatching { device.address }.getOrNull()
 
     init {
         loadIgnored()
@@ -482,7 +640,10 @@ class AcabBleManager(private val context: Context) {
             IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
             ContextCompat.RECEIVER_EXPORTED,
         )
-        if (adapter?.isEnabled != true) _state.value = ConnState.POWERED_OFF
+        if (hasConnectPermission() &&
+            !runCatching { adapter?.isEnabled == true }.getOrDefault(false)) {
+            _state.value = ConnState.POWERED_OFF
+        }
     }
 
     // Background scope for the coalesced detection-feed publisher. Survives the link's
@@ -548,10 +709,12 @@ class AcabBleManager(private val context: Context) {
             scanPausedInBackground = true
             runCatching { scanner?.stopScan(scanCb) }
         }
+        syncLocationOwnership()
     }
 
     private fun onAppForeground() {
         if (scanPausedInBackground && _state.value == ConnState.SCANNING) beginScan()
+        syncLocationOwnership()
     }
 
     // Coalesced detection-feed emission. A Desert-mode firehose can file hundreds of records
@@ -567,6 +730,7 @@ class AcabBleManager(private val context: Context) {
     private val lastSeenAt = HashMap<String, Long>()
     private val rssiHistory = HashMap<String, MutableList<Int>>()
     private val capturedLoc = HashMap<String, Pair<Double, Double>>()
+    private val contributionCapture = ContributionCaptureLedger()
     // Best (strongest) RSSI seen for each capturedLoc pin. RSSI is a distance proxy, so a
     // stronger later sighting is a better position estimate than the first: the pin migrates to
     // closest approach and this is the bar it has to beat (with hysteresis). Keyed/locked like
@@ -679,6 +843,9 @@ class AcabBleManager(private val context: Context) {
     private var otaTotalBytes = 0
     // The version we're flashing, held across the reboot so the reconnect can confirm it.
     private var otaTargetVersion: String = ""
+    // Exact firmware/product label that selected the manifest entry. Rev-A and rev-B use distinct
+    // images, so version alone must never disarm rollback after a wrong-target image boots.
+    private var otaTargetFwLabel: String = ""
     // Set once the board reboots after a good "done"; the next READY checks the fw version and
     // sends confirm (or reports a rollback). Cleared when consumed.
     @Volatile private var otaAwaitingConfirm = false
@@ -694,6 +861,14 @@ class AcabBleManager(private val context: Context) {
     @Volatile private var otaRebootGen = -1
     // Bumps whenever the OTA session changes; a stale stall-watchdog checks this to bail out.
     @Volatile private var otaSessionId = 0
+    // The exact encrypted GATT generation that owns the current board OTA controls. OTA replies do
+    // not carry a wire session id, so accepting them across a reconnect would let an old board
+    // session drive a new app attempt.
+    @Volatile private var otaOwnerConnectGen = -1
+    @Volatile private var otaBoardSessionArmed = false
+    // A cancelled/failed board-touched session can still have ready/prog/err notifies queued on the
+    // same link. Retry only after reconnecting, which flushes the controller and changes connectGen.
+    @Volatile private var otaQuarantinedConnectGen = -1
     // Wall-clock of the last progress signal from the board ("ready"/"prog"), for the stall watchdog.
     @Volatile private var otaLastProgressAt = 0L
     // True while we're actively pushing chunks, so a mid-stream disconnect can offer a retry.
@@ -729,6 +904,7 @@ class AcabBleManager(private val context: Context) {
     // Gen guard for the fresh-connect watchdog in connect(): bumped by STATE_CONNECTED and by
     // cleanup() so a stale 15 s timeout can't tear down a later session (same idea as scanGen).
     @Volatile private var connectGen = 0
+    private val statusRevision = AtomicLong(0L)
     // True once THIS session reached READY (set in finishReady, cleared in cleanup). The
     // unexpected-drop auto-reconnect requires it: a connect that NEVER succeeded (a stale scan
     // row for a powered-off board, ~30 s status-133) must fail to the resting screen, not arm a
@@ -789,8 +965,16 @@ class AcabBleManager(private val context: Context) {
     // Explicitly typed: onScanFailed's retry references scanCb from inside the initializer.
     private val scanCb: ScanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            if (!hasScanPermission() || !hasConnectPermission()) {
+                teardownForBluetoothPermissionRevocation()
+                return
+            }
             val dev = result.device
-            val name = result.scanRecord?.deviceName ?: dev.name ?: "ACAB"
+            val address = safeDeviceAddress(dev) ?: run {
+                teardownForBluetoothPermissionRevocation()
+                return
+            }
+            val name = result.scanRecord?.deviceName ?: safeDeviceName(dev) ?: "ACAB"
             // Firmware version rides our 0xACAB scan-response manufacturer data (matches the iOS
             // parse). It arrives a callback or two after the first advert, so keep the last-seen
             // value if this frame doesn't carry it.
@@ -809,16 +993,16 @@ class AcabBleManager(private val context: Context) {
             // not the bucket this prints. 01 = resolvable private, 11 = static random or public,
             // 00 = non-resolvable or public.
             if (SCAN_ADDR_DEBUG) {
-                val b0 = dev.address.substringBefore(':').toIntOrNull(16) ?: 0
+                val b0 = address.substringBefore(':').toIntOrNull(16) ?: 0
                 val kind = when (b0 shr 6) {
                     0b01 -> "RESOLVABLE-PRIVATE (rotates)"
                     0b11 -> "static-random"
                     0b00 -> "non-resolvable-private"
                     else -> "PUBLIC (not private)"
                 }
-                android.util.Log.d("ACAB-scan", "board $name addr=${dev.address} type=$kind rssi=${result.rssi}")
+                android.util.Log.d("ACAB-scan", "board $name addr=$address type=$kind rssi=${result.rssi}")
             }
-            val prev = _found.value.firstOrNull { it.device.address == dev.address }
+            val prev = _found.value.firstOrNull { safeDeviceAddress(it.device) == address }
             val board = FoundBoard(dev, name, result.rssi, fw ?: prev?.firmware, now)
             // Drop entries not heard from recently. Keying on address is still right (it is what
             // distinguishes two real boards from each other), but with address privacy on, an
@@ -826,12 +1010,16 @@ class AcabBleManager(private val context: Context) {
             // duplicate of the same physical unit. A board advertises many times a second, so a
             // few seconds of silence means gone, not quiet.
             _found.value = (_found.value
-                .filterNot { it.device.address == dev.address }
+                .filterNot { safeDeviceAddress(it.device) == address }
                 .filter { it.seenAt == 0L || now - it.seenAt < FOUND_STALE_MS } + board)
                 .sortedByDescending { it.rssi }
         }
 
         override fun onScanFailed(errorCode: Int) {
+            if (!hasScanPermission() || !hasConnectPermission()) {
+                teardownForBluetoothPermissionRevocation()
+                return
+            }
             // Registration failures arrive ONLY here; without this override every one is
             // silent and the UI sits on a "scanning" that isn't. ALREADY_STARTED means a live
             // registration still delivers results - tearing down would kill a working scan.
@@ -849,7 +1037,8 @@ class AcabBleManager(private val context: Context) {
                     // the user's back. _state stays SCANNING across a background pause (that's
                     // how the resume works), so state alone can't tell the two apart.
                     if (gen == scanGen && _state.value == ConnState.SCANNING && appForegrounded &&
-                        adapter?.isEnabled == true && hasScanPermission()) {
+                        hasScanPermission() && hasConnectPermission() &&
+                        runCatching { adapter?.isEnabled == true }.getOrDefault(false)) {
                         runCatching { scanner?.stopScan(scanCb) }
                         beginScan()
                     }
@@ -874,6 +1063,10 @@ class AcabBleManager(private val context: Context) {
     @Volatile private var scanPausedInBackground = false
 
     fun startScan() {
+        if (!hasScanPermission() || !hasConnectPermission()) {
+            _state.value = ConnState.DISCONNECTED
+            return
+        }
         // Already scanning: a re-tap must not clear the board list or double-register the
         // callback (the platform rejects the second registration with ALREADY_STARTED anyway).
         if (_state.value == ConnState.SCANNING) return
@@ -884,7 +1077,15 @@ class AcabBleManager(private val context: Context) {
     /** Register (or re-register) the platform scan. Split from startScan so the background
      *  pause/resume and the too-frequent retry can restart the radio without clearing _found. */
     private fun beginScan() {
-        val s = scanner ?: return
+        if (!hasScanPermission() || !hasConnectPermission()) {
+            scanPausedInBackground = false
+            _state.value = ConnState.DISCONNECTED
+            return
+        }
+        val s = runCatching { scanner }.getOrNull() ?: run {
+            _state.value = restingState()
+            return
+        }
         val gen = ++scanGen
         scanPausedInBackground = false
         lastScanStartAt = SystemClock.elapsedRealtime()
@@ -895,7 +1096,11 @@ class AcabBleManager(private val context: Context) {
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
-        s.startScan(listOf(filter), settings, scanCb)
+        val started = runCatching { s.startScan(listOf(filter), settings, scanCb) }.isSuccess
+        if (!started) {
+            _state.value = ConnState.DISCONNECTED
+            return
+        }
         // A LOW_LATENCY scan left running is a multi-percent-per-hour battery cost, and until
         // now nothing but connect() ever stopped it. Bound the window: past it, fall back to
         // the resting screen ( _found keeps any boards already seen, still tappable).
@@ -910,7 +1115,7 @@ class AcabBleManager(private val context: Context) {
         scanGen++
         scanTimeoutJob?.cancel(); scanTimeoutJob = null
         scanPausedInBackground = false
-        scanner?.stopScan(scanCb)
+        runCatching { scanner?.stopScan(scanCb) }
         if (_state.value == ConnState.SCANNING) _state.value = ConnState.DISCONNECTED
     }
 
@@ -926,6 +1131,10 @@ class AcabBleManager(private val context: Context) {
     val connectHint: StateFlow<String?> = _connectHint.asStateFlow()
 
     fun connect(board: FoundBoard) {
+        if (!hasConnectPermission() || !hasScanPermission()) {
+            _state.value = ConnState.DISCONNECTED
+            return
+        }
         _connectHint.value = null   // fresh attempt: drop any stale hint from the last one
         // In-flight guard: two fast taps on the same board row (the recomposition to
         // ConnectingRow lags a frame) must not open two parallel clients feeding one callback
@@ -968,7 +1177,8 @@ class AcabBleManager(private val context: Context) {
                     _deviceName.value = null
                     _state.value = ConnState.DISCONNECTED
                     if (!sessionWasReady) _connectHint.value = PAIR_WINDOW_HINT
-                    if (appForegrounded && adapter?.isEnabled == true && hasScanPermission()) startScan()
+                    if (appForegrounded && hasScanPermission() && hasConnectPermission() &&
+                        runCatching { adapter?.isEnabled == true }.getOrDefault(false)) startScan()
                 }
             }
         }
@@ -983,7 +1193,18 @@ class AcabBleManager(private val context: Context) {
             persistLoadJob?.join()
             withContext(Dispatchers.Main) {
                 if (target !== dev) return@withContext   // a teardown or a newer connect() superseded this one
-                gatt = dev.connectGatt(context, false, gattCb, BluetoothDevice.TRANSPORT_LE)
+                if (!hasConnectPermission()) {
+                    teardownForBluetoothPermissionRevocation()
+                    return@withContext
+                }
+                gatt = runCatching {
+                    dev.connectGatt(context, false, gattCb, BluetoothDevice.TRANSPORT_LE)
+                }.getOrNull()
+                if (gatt == null) {
+                    target = null
+                    _deviceName.value = null
+                    _state.value = ConnState.DISCONNECTED
+                }
             }
         }
     }
@@ -1010,7 +1231,7 @@ class AcabBleManager(private val context: Context) {
         // Gate on the STATE, not the autoReconnecting flag: after the 120 s watchdog gives up
         // the flag is already false while the pending client stays armed.
         val neverLinked = _state.value == ConnState.CONNECTING || _state.value == ConnState.BONDING
-        gatt?.disconnect()
+        runCatching { gatt?.disconnect() }
         if (neverLinked) { cleanup(); userInitiatedDisconnect = false }
     }
 
@@ -1022,12 +1243,16 @@ class AcabBleManager(private val context: Context) {
     fun startDriveMode() {
         if (_driveMode.value) return
         _driveMode.value = true
-        AcabLinkService.start(context)
+        if (!AcabLinkService.start(context)) {
+            _driveMode.value = false
+            syncLocationOwnership()
+        }
     }
 
     fun endDriveMode() {
         if (!_driveMode.value) return
         _driveMode.value = false
+        syncLocationOwnership()
         AcabLinkService.stop(context)
     }
 
@@ -1121,9 +1346,13 @@ class AcabBleManager(private val context: Context) {
     }
 
     private fun cleanup(forAutoReconnect: Boolean = false) {
+        val endedConnectGen = connectGen
+        nrfDfu.onLinkTeardown(endedConnectGen.toLong())
+        otaBoardSessionArmed = false
+        otaOwnerConnectGen = -1
         connectGen++   // retire any pending fresh-connect watchdog; this session is over
         stopStatusPolling()   // no live link -> stop the ~5 s status-read fallback
-        gatt?.close()
+        runCatching { gatt?.close() }
         gatt = null
         target = null
         // Drop any in-flight GATT ops; the slot is meaningless without a connection.
@@ -1169,7 +1398,14 @@ class AcabBleManager(private val context: Context) {
         // "Reconnecting…"), and Drive mode must stay up so its notification and the home-screen
         // widget resync to connected the moment the board comes back. The two branches below are
         // the ordinary end-of-session teardown.
-        if (forAutoReconnect) return
+        if (forAutoReconnect) {
+            // No live detections can arrive while the link is being chased. Move the state before
+            // re-evaluating process location ownership so Drive mode does not keep GPS running
+            // through the reconnect window.
+            _state.value = ConnState.CONNECTING
+            syncLocationOwnership()
+            return
+        }
         // A plain teardown (user disconnect, radio off, or give-up): any armed auto-reconnect is
         // being torn down with it, so clear the guard or a stale 'true' would block the next arm.
         autoReconnecting = false
@@ -1179,13 +1415,20 @@ class AcabBleManager(private val context: Context) {
         // drain + Android 14's FGS-without-device policy): if the board drops for good, end Drive
         // mode so the counter stops cleanly instead of a perpetual, non-reconnecting "Reconnecting…".
         if (_driveMode.value) endDriveMode()
+        syncLocationOwnership()
     }
 
     // Bond before discovering services - the board insists on an encrypted link.
     private val bondReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
+            if (!hasConnectPermission()) {
+                teardownForBluetoothPermissionRevocation()
+                return
+            }
             val dev = intent.getParcelableExtraCompat(BluetoothDevice.EXTRA_DEVICE)
-            if (dev?.address != target?.address) return
+            val devAddress = dev?.let(::safeDeviceAddress) ?: return
+            val targetAddress = target?.let(::safeDeviceAddress) ?: return
+            if (devAddress != targetAddress) return
             when (intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1)) {
                 BluetoothDevice.BOND_BONDED -> {
                     // Bonding just upgraded the link to encrypted. On Android 11 the freshly-bonded
@@ -1201,8 +1444,16 @@ class AcabBleManager(private val context: Context) {
                         gatt = null
                         scope.launch(Dispatchers.Main) {
                             delay(600)                       // let the stack release the closed link
-                            if (target === d && _state.value == ConnState.BONDING)
-                                gatt = d.connectGatt(context, false, gattCb, BluetoothDevice.TRANSPORT_LE)
+                            if (target === d && _state.value == ConnState.BONDING) {
+                                if (!hasConnectPermission()) {
+                                    teardownForBluetoothPermissionRevocation()
+                                    return@launch
+                                }
+                                gatt = runCatching {
+                                    d.connectGatt(context, false, gattCb, BluetoothDevice.TRANSPORT_LE)
+                                }.getOrNull()
+                                if (gatt == null) cleanup()
+                            }
                         }
                     }
                 }
@@ -1240,8 +1491,18 @@ class AcabBleManager(private val context: Context) {
         )
     }
 
+    private fun rejectGattCallbackWithoutPermission(): Boolean {
+        if (hasConnectPermission()) return false
+        teardownForBluetoothPermissionRevocation()
+        return true
+    }
+
     private val gattCb = object : android.bluetooth.BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+            if (rejectGattCallbackWithoutPermission()) return
+            // A closed client can deliver its final callback after a reconnect has installed a new
+            // BluetoothGatt. It must not clean up or advance the replacement session.
+            if (g !== gatt) return
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 // A pending auto-reconnect (or OTA reconnect) just landed: disarm the guard so its
                 // stall watchdog no-ops and a later drop can arm a fresh attempt. The pending
@@ -1250,11 +1511,11 @@ class AcabBleManager(private val context: Context) {
                 reconnectClientArmed = false
                 connectGen++
                 // Already bonded? Go straight to discovery. Otherwise bond first.
-                if (g.device.bondState == BluetoothDevice.BOND_BONDED) {
-                    g.discoverServices()
+                if (runCatching { g.device.bondState == BluetoothDevice.BOND_BONDED }.getOrDefault(false)) {
+                    runCatching { g.discoverServices() }
                 } else {
                     _state.value = ConnState.BONDING
-                    g.device.createBond()
+                    runCatching { g.device.createBond() }
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 // Hold the target/name across cleanup so an OTA reboot OR an unexpected drop can
@@ -1282,7 +1543,8 @@ class AcabBleManager(private val context: Context) {
                 // sessionWasReady: only chase a board we actually had; see its declaration.
                 val doAutoReconnect = !reconnectForOta && !userDisconnect && !midOta &&
                     !autoReconnecting && sessionWasReady && wasTarget != null &&
-                    adapter?.isEnabled == true
+                    hasConnectPermission() &&
+                    runCatching { adapter?.isEnabled == true }.getOrDefault(false)
                 // Treat the OTA reboot-reconnect like an auto-reconnect for teardown: skip the
                 // scan-screen state reset + Drive-mode end, since reconnectAfterOta is about to chase
                 // the same board (else Drive mode dies and the UI flashes the scan screen mid-reboot).
@@ -1322,10 +1584,15 @@ class AcabBleManager(private val context: Context) {
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) g.requestMtu(512) else g.disconnect()
+            if (rejectGattCallbackWithoutPermission()) return
+            if (g !== gatt) return
+            if (status == BluetoothGatt.GATT_SUCCESS) runCatching { g.requestMtu(512) }
+            else runCatching { g.disconnect() }
         }
 
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            if (rejectGattCallbackWithoutPermission()) return
+            if (g !== gatt) return
             // Remember the negotiated ATT MTU so the OTA stream can use (mtu - 3)-byte chunks.
             // If the request was refused we keep the 23-byte default (20-byte chunks, slower).
             if (status == BluetoothGatt.GATT_SUCCESS && mtu >= 23) negotiatedMtu = mtu
@@ -1333,6 +1600,8 @@ class AcabBleManager(private val context: Context) {
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
+            if (rejectGattCallbackWithoutPermission()) return
+            if (g !== gatt) return
             onGattOpComplete()   // CCCD write done - free the slot before queuing the next ops
             val cccdFor = d.characteristic.uuid
             if (status != BluetoothGatt.GATT_SUCCESS) {
@@ -1380,6 +1649,8 @@ class AcabBleManager(private val context: Context) {
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            if (rejectGattCallbackWithoutPermission()) return
+            if (g !== gatt) return
             onGattOpComplete()   // a config or OTA-chunk write finished - free the slot
             // A finished OTA-image chunk is our back-pressure signal: the controller accepted
             // the last packet, so queue the next one. A non-success status means the buffer
@@ -1400,22 +1671,32 @@ class AcabBleManager(private val context: Context) {
         // API 33+ passes the value in; older versions read it off characteristic.value.
         override fun onCharacteristicChanged(
             g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray,
-        ) = ingest(c.uuid, value)
+        ) {
+            if (rejectGattCallbackWithoutPermission()) return
+            if (g !== gatt) return
+            ingest(c.uuid, value)
+        }
 
         @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
+            if (rejectGattCallbackWithoutPermission()) return
+            if (g !== gatt) return
             @Suppress("DEPRECATION") ingest(c.uuid, c.value ?: ByteArray(0))
         }
 
         override fun onCharacteristicRead(
             g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray, status: Int,
         ) {
+            if (rejectGattCallbackWithoutPermission()) return
+            if (g !== gatt) return
             onGattOpComplete()   // a queued read finished - free the slot before parsing
             if (status == BluetoothGatt.GATT_SUCCESS) ingest(c.uuid, value)
         }
 
         @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
         override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            if (rejectGattCallbackWithoutPermission()) return
+            if (g !== gatt) return
             onGattOpComplete()   // a queued read finished - free the slot before parsing
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 @Suppress("DEPRECATION") ingest(c.uuid, c.value ?: ByteArray(0))
@@ -1538,6 +1819,7 @@ class AcabBleManager(private val context: Context) {
         sessionWasReady = true   // this session earned an unexpected-drop auto-reconnect
         _connectHint.value = null   // link is usable; the hint no longer applies
         _state.value = ConnState.READY
+        syncLocationOwnership()
         // Prime the Status characteristic once the CCCD chain is fully written (all queued
         // descriptor writes have drained by now), so this read can't collide with an in-flight
         // OTA CCCD write. A Status notify also arrives on connect, so this is just a fast first
@@ -1597,13 +1879,21 @@ class AcabBleManager(private val context: Context) {
     /** Kick off an in-app update to [build]. No-op if one is already running or the board isn't
      *  OTA-capable. Downloads + hashing happen off the main thread. */
     fun startOta(build: FirmwareBuild) {
+        val currentPhase = _otaProgress.value.phase
+        if (currentPhase != OtaPhase.IDLE && currentPhase != OtaPhase.DONE &&
+            currentPhase != OtaPhase.FAILED) return
         if (otaJob?.isActive == true) return
         if (!_otaCapable.value) {
             setOtaPhase(OtaPhase.FAILED, message = "This board can't update over Bluetooth. Reflash it in your browser.")
             return
         }
-        if (!build.hasVerifiableImage) {
+        if (!build.ota || !build.hasVerifiableImage) {
             setOtaPhase(OtaPhase.FAILED, message = "No verified image is published for this board yet.")
+            return
+        }
+        if (!isNumericFirmwareVersion(build.version)) {
+            setOtaPhase(OtaPhase.FAILED,
+                message = "The published update has an invalid version, so it was not installed.")
             return
         }
         // Fail fast with no live link (iOS startFirmwareUpdate's otaLink guard). Without it a
@@ -1614,11 +1904,37 @@ class AcabBleManager(private val context: Context) {
             setOtaPhase(OtaPhase.FAILED, message = "The board isn't connected. Reconnect and try again.")
             return
         }
+        if (otaQuarantinedConnectGen == connectGen) {
+            setOtaPhase(OtaPhase.FAILED,
+                message = "Reconnect to the beacon before retrying the board update. This clears any delayed update replies from the previous attempt.")
+            return
+        }
+        val ownerConnectGen = connectGen
+        val liveStatus = _status.value
+        if (liveStatus?.needsNewerApp != false) {
+            setOtaPhase(OtaPhase.FAILED,
+                message = "This board needs a newer version of the app before it can be updated safely.")
+            return
+        }
+        val liveFwLabel = liveStatus.firmwareLabel
+        if (liveFwLabel.isNullOrBlank()) {
+            setOtaPhase(OtaPhase.FAILED,
+                message = "The board didn't report which firmware image it uses. Refresh its status and try again.")
+            return
+        }
+        if (build.manifestLabel.isBlank() || build.manifestLabel != liveFwLabel) {
+            setOtaPhase(OtaPhase.FAILED,
+                message = "This update image does not match the connected board. Refresh its status and try again.")
+            return
+        }
         otaTargetVersion = build.version
+        otaTargetFwLabel = build.manifestLabel
         otaAwaitingConfirm = false
         otaRebootGen = -1        // fresh run: no generation pinned until "done" arms one
         otaStreaming = false
         otaEnded = false
+        otaBoardSessionArmed = false
+        otaOwnerConnectGen = ownerConnectGen
         val session = ++otaSessionId
         setOtaPhase(OtaPhase.DOWNLOADING, pct = 0, message = "Downloading firmware…")
         otaJob = scope.launch {
@@ -1645,7 +1961,7 @@ class AcabBleManager(private val context: Context) {
             // midOta teardown (the phase is DOWNLOADING/VERIFYING, not CHECKING/SENDING), which
             // used to leave this job arming a null gatt. Re-check the link before touching the
             // board, like iOS beginTransfer.
-            if (gatt == null) {
+            if (gatt == null || connectGen != ownerConnectGen || _state.value != ConnState.READY) {
                 failOta("The board isn't connected. Reconnect and try again.")
                 return@launch
             }
@@ -1655,6 +1971,8 @@ class AcabBleManager(private val context: Context) {
             // 4) open the session on the board (begin rides the Config char). The image
             //    signature goes first as its own small control message, so the board has it
             //    staged before begin; both land in order through the serialized GATT queue.
+            otaOwnerConnectGen = ownerConnectGen
+            otaBoardSessionArmed = true
             setOtaPhase(OtaPhase.CHECKING, pct = 0, message = "Preparing the board…")
             otaLastProgressAt = System.currentTimeMillis()
             sendSig(build.sig)
@@ -1670,9 +1988,9 @@ class AcabBleManager(private val context: Context) {
      *  the confirm handshake (otaAwaitingConfirm outliving its session) and then contradict
      *  itself when the reconnect landed "Updated" over "Update cancelled." */
     fun cancelOta() {
-        val phase = _otaProgress.value.phase
-        if (phase == OtaPhase.IDLE || phase == OtaPhase.DONE) return
-        if (phase == OtaPhase.REBOOTING || phase == OtaPhase.CONFIRMING) return
+        if (!otaCancellableNow()) return
+        val touchedBoard = otaBoardSessionArmed
+        val ownerGen = otaOwnerConnectGen
         otaSessionId++            // invalidate the running job + watchdog
         otaJob?.cancel(); otaJob = null
         otaStreaming = false
@@ -1683,8 +2001,16 @@ class AcabBleManager(private val context: Context) {
         otaAwaitingConfirm = false
         // Best-effort: if we still have a link, ask the board to tear down its session.
         if (gatt != null) writeConfig(JSONObject().put("ota", JSONObject().put("abort", true)))
+        if (touchedBoard && ownerGen >= 0) otaQuarantinedConnectGen = ownerGen
         clearOtaStreamState()
         setOtaPhase(OtaPhase.FAILED, message = "Update cancelled.")
+    }
+
+    /** Once the end control is queued, the image may already be committing even before the board's
+     * done reply changes phase. Keep that narrow interval non-cancellable too. */
+    private fun otaCancellableNow(): Boolean = !otaEnded && when (_otaProgress.value.phase) {
+        OtaPhase.CHECKING, OtaPhase.DOWNLOADING, OtaPhase.VERIFYING, OtaPhase.SENDING -> true
+        else -> false
     }
 
     /** After a good "done", the board reboots and the link drops. Wait for it to come back up,
@@ -1712,6 +2038,10 @@ class AcabBleManager(private val context: Context) {
                 while (session == otaSessionId && otaAwaitingConfirm &&
                        SystemClock.elapsedRealtime() < deadline) {
                     withContext(Dispatchers.Main) {
+                        if (!hasConnectPermission()) {
+                            teardownForBluetoothPermissionRevocation()
+                            return@withContext
+                        }
                         // The board is already bonded, so onConnectionStateChange goes straight to
                         // discovery -> the confirm check in finishReady(); if the user removed the
                         // pairing mid-wait, createBond runs and the process-lifetime bondReceiver
@@ -1722,9 +2052,11 @@ class AcabBleManager(private val context: Context) {
                         runCatching { gatt?.close() }
                         gatt = null
                         target = device
-                        _deviceName.value = _deviceName.value ?: device.name
+                        _deviceName.value = _deviceName.value ?: safeDeviceName(device)
                         _state.value = ConnState.CONNECTING
-                        gatt = device.connectGatt(context, false, gattCb, BluetoothDevice.TRANSPORT_LE)
+                        gatt = runCatching {
+                            device.connectGatt(context, false, gattCb, BluetoothDevice.TRANSPORT_LE)
+                        }.getOrNull()
                     }
                     delay(RECONNECT_ATTEMPT_MS)
                     // If we reached READY (state left CONNECTING), the confirm path has it now.
@@ -1777,18 +2109,30 @@ class AcabBleManager(private val context: Context) {
         // Re-entrancy guard: a pending client that briefly connects and drops again, or a burst of
         // DISCONNECTED callbacks, must not each open their own connectGatt. One armed attempt only.
         if (autoReconnecting) return
+        if (!hasConnectPermission()) {
+            teardownForBluetoothPermissionRevocation()
+            return
+        }
         autoReconnecting = true
         val gen = ++autoReconnectGen
         target = device
         reconnectClientArmed = true   // the iOS reconnectTarget analog; onRadioOff reads this
-        _deviceName.value = name ?: device.name
+        _deviceName.value = name ?: safeDeviceName(device)
         _state.value = ConnState.CONNECTING   // the service + widget read this as "Reconnecting…"
         // Close any prior client before arming a new pending one, or we leak a GATT interface toward
         // the ~30-client ceiling that ends in 133s (same discipline as reconnectAfterOta). The board
         // is already bonded, so STATE_CONNECTED goes straight to discovery; bondReceiver is
         // process-lifetime, so a bond the user removed mid-wait still lands its BOND_BONDED here.
         runCatching { gatt?.close() }
-        gatt = device.connectGatt(context, /* autoConnect = */ true, gattCb, BluetoothDevice.TRANSPORT_LE)
+        gatt = runCatching {
+            device.connectGatt(context, /* autoConnect = */ true, gattCb, BluetoothDevice.TRANSPORT_LE)
+        }.getOrNull()
+        if (gatt == null) {
+            autoReconnecting = false
+            reconnectClientArmed = false
+            cleanup()
+            return
+        }
         // Bound the "Reconnecting…" window like the iOS Live Activity's ~120s auto-end, so a board
         // that never returns (powered off and pocketed while Drive mode is on) doesn't hold a
         // device-less connectedDevice foreground service open forever. A successful reconnect clears
@@ -1927,35 +2271,33 @@ class AcabBleManager(private val context: Context) {
         val s = _status.value ?: return          // wait for a status frame to land (30 s cap)
         otaAwaitingConfirm = false
         val have = s.version
+        val haveLabel = s.firmwareLabel
         // Confirm only on a PARSEABLE a.b[.c] version that is at least the target. A non-numeric
         // string (e.g. a fallback "ESP32") zeroed through isVersionAtLeast and landed in the
         // rollback branch, reporting a confident "rolled back ... running as before" for a board
         // that may well be RUNNING the new firmware with an unreadable version string. Neither
         // confirming nor claiming a rollback is honest there; iOS decideRebootOutcome draws the
         // same three-way line.
-        when {
-            isNumericVersion(have) && isVersionAtLeast(have, otaTargetVersion) -> {
+        when (decideOtaPostReboot(have, haveLabel, otaTargetVersion, otaTargetFwLabel)) {
+            OtaPostRebootDecision.CONFIRM -> {
+                otaOwnerConnectGen = connectGen
+                otaBoardSessionArmed = true
                 setOtaPhase(OtaPhase.CONFIRMING, pct = 100, message = "Confirming the update…")
                 writeConfig(JSONObject().put("ota", JSONObject().put("confirm", true)))
-                // The board replies "ok" on the OTA char -> handleOtaNotify moves us to DONE. As a
-                // belt-and-braces fallback (the board also self-heals ~20 s after a healthy boot),
-                // settle to DONE shortly even if the "ok" notify is missed.
-                val session = otaSessionId
-                scope.launch {
-                    delay(CONFIRM_SETTLE_MS)
-                    if (session == otaSessionId && _otaProgress.value.phase == OtaPhase.CONFIRMING) {
-                        setOtaPhase(OtaPhase.DONE, pct = 100, message = "Updated to v$otaTargetVersion.")
-                        clearOtaStreamState()
-                    }
-                }
+                awaitDurableOtaConfirmation(otaSessionId)
             }
-            isNumericVersion(have) -> {
+            OtaPostRebootDecision.LABEL_MISMATCH -> {
+                setOtaPhase(OtaPhase.FAILED,
+                    message = "The board came back identifying as $haveLabel instead of $otaTargetFwLabel, so rollback was left armed for safety. Reconnect and install the correct firmware for this board.")
+                clearOtaStreamState()
+            }
+            OtaPostRebootDecision.ROLLED_BACK -> {
                 // Came back on the previous firmware: the board's boot-attempt rollback reverted it.
                 setOtaPhase(OtaPhase.FAILED,
                     message = "The board came back on its previous firmware, so it stayed safe. The update didn't take; try again.")
                 clearOtaStreamState()
             }
-            else -> {
+            OtaPostRebootDecision.UNKNOWN -> {
                 // Came back but didn't report a version we can trust; leave rollback armed.
                 setOtaPhase(OtaPhase.FAILED,
                     message = "The board came back but didn't report the new version, so rollback was left armed for safety. Reconnect to check its firmware.")
@@ -1964,9 +2306,28 @@ class AcabBleManager(private val context: Context) {
         }
     }
 
+    /** Retry confirm until the firmware says its product-health gate was durably committed. A
+     *  provisional health-wait is not success: rollback remains armed until an actual ok. */
+    private fun awaitDurableOtaConfirmation(session: Int) {
+        scope.launch {
+            val deadline = System.currentTimeMillis() + CONFIRM_TIMEOUT_MS
+            while (session == otaSessionId && _otaProgress.value.phase == OtaPhase.CONFIRMING) {
+                delay(CONFIRM_RETRY_MS)
+                if (session != otaSessionId || _otaProgress.value.phase != OtaPhase.CONFIRMING) return@launch
+                if (System.currentTimeMillis() >= deadline) {
+                    failOta("The new firmware is running, but the board did not confirm that rollback was disarmed. Keep it powered for a moment, then reconnect and check its firmware.")
+                    return@launch
+                }
+                writeConfig(JSONObject().put("ota", JSONObject().put("confirm", true)))
+            }
+        }
+    }
+
     /** Fail the current run with a reason and drop stream state. Board-side is left to its own
      *  abort/rollback (we don't force-write if the reason is a lost link). */
     private fun failOta(reason: String) {
+        val touchedBoard = otaBoardSessionArmed
+        val ownerGen = otaOwnerConnectGen
         otaSessionId++
         otaStreaming = false
         otaJob?.cancel(); otaJob = null
@@ -1975,6 +2336,7 @@ class AcabBleManager(private val context: Context) {
             (_otaProgress.value.phase == OtaPhase.SENDING || _otaProgress.value.phase == OtaPhase.CHECKING)) {
             writeConfig(JSONObject().put("ota", JSONObject().put("abort", true)))
         }
+        if (touchedBoard && ownerGen >= 0) otaQuarantinedConnectGen = ownerGen
         clearOtaStreamState()
         setOtaPhase(OtaPhase.FAILED, message = reason)
     }
@@ -1985,6 +2347,8 @@ class AcabBleManager(private val context: Context) {
         otaTotalBytes = 0
         otaStreaming = false
         otaEnded = false
+        otaBoardSessionArmed = false
+        otaOwnerConnectGen = -1
     }
 
     // ---- OTA foreground-service hold ----
@@ -2026,20 +2390,18 @@ class AcabBleManager(private val context: Context) {
      *  manifest's declared size so a misconfigured/compromised server can't OOM the app before
      *  the size + SHA gate runs. */
     private fun downloadImage(url: String, expectedSize: Long): ByteArray {
-        // Refuse anything but plain https: a cleartext or otherwise-schemed URL could let a
-        // network attacker swap the image. The signature gate would still reject a tampered
-        // image, but we never open the connection in the first place. Mirrors the iOS client.
-        val parsed = URL(url)
-        if (!parsed.protocol.equals("https", ignoreCase = true))
-            throw java.io.IOException("firmware URL must be https")
+        val parsed = trustedFirmwareArtifactUrl(url)
+            ?: throw java.io.IOException("firmware URL is not on the trusted host")
         val conn = (parsed.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 15_000
             readTimeout = 20_000
+            instanceFollowRedirects = false
         }
         try {
-            if (conn.responseCode != HttpURLConnection.HTTP_OK)
-                throw java.io.IOException("HTTP ${conn.responseCode}")
+            val responseCode = conn.responseCode
+            if (!firmwareArtifactResponseAllowed(parsed, conn.url, responseCode))
+                throw java.io.IOException("HTTP $responseCode or redirect refused")
             // Read at most the declared size (+ a hard 8 MB ceiling); a longer stream is rejected
             // before it can exhaust memory. The exact size is re-checked against the manifest after.
             val cap = expectedSize.coerceIn(1L, 8L * 1024 * 1024)
@@ -2067,29 +2429,6 @@ class AcabBleManager(private val context: Context) {
     /** Standard zlib/PKZIP CRC-32 over the whole image, matching the firmware's crc32_update. */
     private fun zlibCrc32(bytes: ByteArray): Long =
         CRC32().apply { update(bytes) }.value   // already the reflected poly 0xEDB88420
-
-    /** True for a plain dotted-numeric version like "2", "1.7", "2.0.0" (optionally a trailing
-     *  "-suffix"). Rejects a non-numeric fw string BEFORE a version compare, so a degraded
-     *  zeroed compare can't turn a garbage version report into a confident verdict either way.
-     *  Mirrors iOS isNumericVersion. */
-    private fun isNumericVersion(s: String): Boolean {
-        val core = s.substringBefore("-")
-        if (core.isEmpty()) return false
-        return core.split(".").all { f -> f.isNotEmpty() && f.all { it.isDigit() } }
-    }
-
-    /** True when [have] is the same as or newer than [want], compared dotted-field numerically.
-     *  Used post-reboot: a board reporting the target (or higher) confirms the flash took.
-     *  Callers gate on [isNumericVersion] first; a non-numeric field still zeroes defensively. */
-    private fun isVersionAtLeast(have: String, want: String): Boolean {
-        val a = have.split(".").map { it.toIntOrNull() ?: 0 }
-        val b = want.split(".").map { it.toIntOrNull() ?: 0 }
-        for (i in 0 until maxOf(a.size, b.size)) {
-            val x = a.getOrElse(i) { 0 }; val y = b.getOrElse(i) { 0 }
-            if (x != y) return x > y
-        }
-        return true   // equal counts as "at least"
-    }
 
     private fun ingest(uuid: java.util.UUID, bytes: ByteArray) {
         val json = runCatching { JSONObject(String(bytes, Charsets.UTF_8)) }.getOrNull() ?: return
@@ -2141,8 +2480,10 @@ class AcabBleManager(private val context: Context) {
             AcabProfile.STATUS -> {
                 val s = DeviceStatus.fromJson(json)
                 _status.value = s
+                val revision = statusRevision.incrementAndGet()
+                nrfDfu.handleStatusUpdate(s, connectGen.toLong(), revision)
                 reconcileBuzzer(s)
-                reconcileDesert(s)   // Desert has no NVS: a board reboot ends it behind our back
+                reconcileDesert(s)   // rare since firmware persists Desert; still needed for older boards / NVS wipe
                 // Reconcile the whitelist: if the board reports fewer ignore entries than we
                 // hold (a reboot dropped them, say), re-push so the two converge.
                 // Reconcile against what the board CAN hold, never against our raw size: the
@@ -2174,8 +2515,26 @@ class AcabBleManager(private val context: Context) {
      *  cancelled run (a late "ready" streamed the chunk list cancelOta had just cleared) or
      *  clobbered its "Update cancelled." terminal copy. */
     private fun handleOtaNotify(json: JSONObject) {
+        val kind = json.optString("ota")
+        if (kind == "nrf-ready") { nrfDfu.handleArmReply(true, connectGen.toLong()); return }
+        if (kind == "nrf-denied") { nrfDfu.handleArmReply(false, connectGen.toLong()); return }
+        if (json.optString("pwr") == "off") {
+            // The board is deep-sleeping on purpose (a physical button-hold or an app power-off). Flag
+            // the coming STATE_DISCONNECTED as a deliberate teardown so onConnectionStateChange runs
+            // cleanup(forAutoReconnect=false) with no error banner and no reconnect loop. Arming HERE,
+            // on the board's own confirmation rather than in powerOff(), means a board that never
+            // actually powers off never sends this and so never mis-flags a later unrelated drop.
+            userInitiatedDisconnect = true
+            autoReconnecting = false
+            return
+        }
+        // The current protocol has no S3 OTA session id on replies. Bind every reply to the exact
+        // encrypted GATT generation that sent begin/confirm, and require an armed app-side session.
+        // Failed/cancelled board-touched runs are additionally quarantined until reconnect.
+        if (!otaReplyBelongsToArmedSession(
+                otaBoardSessionArmed, otaOwnerConnectGen, connectGen)) return
         val phase = _otaProgress.value.phase
-        when (json.optString("ota")) {
+        when (kind) {
             "ready" -> {
                 // begin accepted: the board opened its OTA slot. Start streaming the image.
                 // Only meaningful while THIS run is waiting on it.
@@ -2197,9 +2556,11 @@ class AcabBleManager(private val context: Context) {
             "done" -> {
                 // Image validated and set as the boot slot; the board reboots ~250 ms later.
                 // Arm the post-reboot confirm and let the existing reconnect logic take over.
-                // Guarded like ready/prog: a done landing after a cancel must not resurrect it.
-                if (phase != OtaPhase.SENDING && phase != OtaPhase.CHECKING) return
+                // Require this run to have handed its complete image to the board. A delayed done
+                // from an earlier same-board session must not reboot-confirm a new partial run.
+                if (!otaDoneCanAdvance(phase, otaEnded)) return
                 otaStreaming = false
+                otaBoardSessionArmed = false
                 otaAwaitingConfirm = true
                 // The board has NOT rebooted yet (~250 ms away) and this link is still up, so pin
                 // the generation: no frame from it may decide the outcome. See otaRebootGen.
@@ -2214,6 +2575,11 @@ class AcabBleManager(private val context: Context) {
                         message = "Updated to v$otaTargetVersion.")
                     clearOtaStreamState()
                 }
+            }
+            "health-wait" -> {
+                // Provisional reply. The bounded confirmation loop keeps asking until the board
+                // has durably disarmed rollback and answers ok.
+                if (phase != OtaPhase.CONFIRMING) return
             }
             "abort" -> {
                 // The board tore its session down. Only report it while a run is still LIVE:
@@ -2254,40 +2620,60 @@ class AcabBleManager(private val context: Context) {
 
     /** A live detection: timestamp is now, and a fresh sighting may buzz the phone. */
     private fun fileLive(d: Detection) {
-        val now = System.currentTimeMillis()
-        val firstTime = synchronized(storeLock) {
+        synchronized(storeLock) {
+            // Read the clock only after acquiring the same lock Stop freezes under. Whichever
+            // operation wins the lock defines the boundary, so a callback cannot carry a
+            // pre-Stop timestamp while filing after the frozen snapshot.
+            val observedAt = System.currentTimeMillis()
+            // One observer read and one wall-clock instant describe this exact sighting. The
+            // capture-local sample is independent of capturedLoc's session-global closest pin.
+            val observer = freshSelfCoord()
             val first = !firstSeenAt.containsKey(d.id)
             if (first) {
-                firstSeenAt[d.id] = now
+                firstSeenAt[d.id] = observedAt
                 // Stamp the hit with the phone's position only when the phone's fix is actually
                 // fresh. lastLat/lastLon are a LAST-SEEN value with no expiry: once the platform
                 // stops delivering (activity gone, permission revoked mid-drive) they hold their
                 // final value forever, and a frozen coordinate is not a missing coordinate - it
                 // pins the rest of the drive on the driveway, in the map and in the CSV both.
                 // validCoord can't catch this: a two-hour-old coordinate is a valid coordinate.
-                val self = freshSelfCoord()
-                if (d.lat == null && self != null) {
+                val self = observer
+                if (self != null) {
+                    // capturedLoc is always the OBSERVER PHONE's position. A drone's d.lat/d.lon
+                    // is its aircraft position, but the contribution export has independent
+                    // approx_lat/lon and drone_lat/lon columns and must be able to populate both.
                     capturedLoc[d.id] = self
-                    bestRssi[d.id] = d.rssi   // the bar a later, closer sighting has to beat
+                    if (d.lat == null) {
+                        bestRssi[d.id] = d.rssi   // the bar a later, closer sighting has to beat
+                    }
                 }
             }
-            lastSeenAt[d.id] = now
+            lastSeenAt[d.id] = observedAt
             // Only a bucket the drive surface actually lists may name its "last ..." line.
-            if (d.type.onDriveSurface) _newestLive = NewestLive(d.type.category, now)
-            file(d, now)   // appends this sample to rssiHistory, so the smoothing below sees it
-            // Closest-approach pin migration. First sighting is the WORST position estimate (a
-            // device we can just barely hear); a later sighting >= 4 dB stronger is closer, so
-            // move the pin there. The 4 dB is hysteresis vs RSSI wobble. Own-broadcast coords
-            // (d.lat, e.g. drones) are authoritative and never overridden. Also seeds the capture
-            // if the FIRST sighting had no fix (bestRssi absent) and one arrived later.
-            if (!first && d.lat == null) {
-                val prevBest = bestRssi[d.id]
+            if (d.type.onDriveSurface) _newestLive = NewestLive(d.type.category, observedAt)
+            file(d, observedAt)   // appends this sample to rssiHistory, so smoothing sees it
+            // Record only after the live row is filed. History uses fileHistory and can never
+            // enter this ledger, so a replay-only bracketed row cannot be relabeled `exact` by a
+            // capture merely because it arrived between Start and Stop.
+            contributionCapture.record(d, observedAt, observer)
+            // Seed a missing observer fix on any later sighting, INCLUDING a drone: its own
+            // aircraft coordinate does not fill the separate observer columns. For devices
+            // without an authoritative broadcast coordinate, later sightings also migrate the
+            // phone pin at a >= 4 dB stronger closest approach (hysteresis vs RSSI wobble).
+            if (!first) {
                 val smoothed = rssiHistory[d.id]?.takeLast(3)?.average()?.roundToInt() ?: d.rssi
-                if (prevBest == null || smoothed - prevBest >= 4) {
-                    val self = freshSelfCoord()
-                    if (self != null) {
+                if (capturedLoc[d.id] == null) {
+                    observer?.let { self ->
                         capturedLoc[d.id] = self
-                        bestRssi[d.id] = smoothed
+                        if (d.lat == null) bestRssi[d.id] = smoothed
+                    }
+                } else if (d.lat == null) {
+                    val prevBest = bestRssi[d.id]
+                    if (prevBest == null || smoothed - prevBest >= 4) {
+                        observer?.let { self ->
+                            capturedLoc[d.id] = self
+                            bestRssi[d.id] = smoothed
+                        }
                     }
                 }
             }
@@ -2295,7 +2681,7 @@ class AcabBleManager(private val context: Context) {
             // position, gated by time AND distance so a stationary stakeout doesn't stack crumbs
             // on one spot. Session-scoped, in-memory (like drone tracks).
             if (d.type == DeviceType.TRACKER) {
-                val self = freshSelfCoord()
+                val self = observer
                 if (self != null) {
                     val crumbs = crumbHistory.getOrPut(d.id) { mutableListOf() }
                     val last = crumbs.lastOrNull()
@@ -2304,19 +2690,18 @@ class AcabBleManager(private val context: Context) {
                         Location.distanceBetween(last.first, last.second, self.first, self.second, out)
                         out[0] >= 25f
                     }
-                    if (last == null || (now - (lastCrumbAt[d.id] ?: 0L) >= 60_000L && moved)) {
+                    if (last == null || (observedAt - (lastCrumbAt[d.id] ?: 0L) >= 60_000L && moved)) {
                         crumbs.add(self)
                         // Only when absent: this is the START of the crumb window and must never
                         // advance. putIfAbsent semantics spelled out rather than assumed, because
                         // a stray unconditional write here would silently collapse every scored
                         // duration to zero and refuse every tag on the clock-sanity test.
-                        if (!firstCrumbAt.containsKey(d.id)) firstCrumbAt[d.id] = now
-                        lastCrumbAt[d.id] = now
+                        if (!firstCrumbAt.containsKey(d.id)) firstCrumbAt[d.id] = observedAt
+                        lastCrumbAt[d.id] = observedAt
                         if (crumbs.size > 120) crumbs.subList(0, crumbs.size - 120).clear()
                     }
                 }
             }
-            first
         }
         // The only thing that puts a live session on disk. See checkpointDetections.
         checkpointDetections()
@@ -2689,10 +3074,17 @@ class AcabBleManager(private val context: Context) {
         // Drain finished cleanly. Drop the "syncing" pill, and, only when the board actually
         // buffered records while we were away, raise the one-shot count banner. n == 0 (an
         // ordinary reconnect with nothing buffered, or a first connect) raises nothing.
+        // Third number: begin.n promised vs end.n sent. A shortfall is a record the board
+        // consumed from the ring and skipped (over-MTU), so it is gone and a re-drain cannot
+        // refill it; disclose it in the banner instead of passing a received==end.n check off
+        // as complete. promised == 0 means the begin sentinel never landed, so no judgement.
+        val promised = _offlineSyncTotal.value
+        val unreplayed = if (promised > 0) (promised - n).coerceAtLeast(0) else 0
         _syncingOfflineLog.value = false
         _offlineSyncCount.value = 0
         _offlineSyncTotal.value = 0
-        if (n > 0) _offlineSyncBanner.value = n
+        _offlineSyncUnreplayed.value = unreplayed
+        if (n > 0 || unreplayed > 0) _offlineSyncBanner.value = n
     }
 
     // ---- config writes ----
@@ -2755,6 +3147,18 @@ class AcabBleManager(private val context: Context) {
 
     /** Turn the board's offline detection buffer on or off (firmware default off). */
     fun setBuffer(on: Boolean) = writeConfig(JSONObject().put("buffer", on))
+
+    /** Ask the beacon to power off (rev-B). The board deep-sleeps and drops the link ITSELF. We do
+     *  NOT arm the expected-teardown flags here: the board confirms with a {"pwr":"off"} notify only
+     *  when it is really about to drop, and handleOtaNotify arms userInitiatedDisconnect / stops
+     *  autoReconnecting on THAT. Arming on the confirmation, not on this request, keeps a board that
+     *  ignores the key (older firmware still reporting rev "B", or a write lost on the wire) from
+     *  leaving a stale flag that would silently eat the next genuine unexpected drop. Once off, only a
+     *  physical ~2 s button hold wakes it; the UI confirm says so and only offers this on rev-B. */
+    fun powerOff() {
+        if (gatt == null) return
+        writeConfig(JSONObject().put("poweroff", true))
+    }
 
     // The alert mode that was active before Desert mode muted the board, so disabling Desert
     // can restore it instead of leaving the board permanently silent. Null when Desert isn't
@@ -2827,7 +3231,7 @@ class AcabBleManager(private val context: Context) {
     }
 
     /** Dismiss the offline-sync count banner (view tapped, dismissed, or the user navigated). */
-    fun clearOfflineSyncBanner() { _offlineSyncBanner.value = null }
+    fun clearOfflineSyncBanner() { _offlineSyncBanner.value = null; _offlineSyncUnreplayed.value = 0 }
 
     /** Pick how sightings get announced. VIBRATE and SILENT both mute the board's
      *  buzzer, for when a chirp would give you away; VIBRATE buzzes this phone instead. */
@@ -2888,13 +3292,21 @@ class AcabBleManager(private val context: Context) {
 
     /** Restore the pre-Desert alert mode when Desert ends WITHOUT going through setDesert(false).
      *
-     *  Desert is the one toggle with no NVS backing (desert_detect.cpp: a plain `static bool`), so
-     *  any board reboot comes back with it off. The Device screen's toggle just follows the status
-     *  frame (DeviceScreen.kt: `desertOn = s.desertMode`), which means the restore branch in
-     *  setDesert never ran for the single most common way Desert ends. The board's Silent IS
-     *  persisted (buzz=false in its NVS), so the result was a board left permanently mute after a
-     *  power cycle, which reads as "my starred device stopped beeping" and is not a detection
-     *  fault. Mirrors iOS reconcileDesert(). */
+     *  HISTORY, because the rationale changed under this code. Desert USED TO BE the one toggle
+     *  with no NVS backing (desert_detect.cpp held a plain `static bool`), so any board reboot came
+     *  back with it off. The Device screen's toggle only follows the status frame (DeviceScreen.kt:
+     *  `desertOn = s.desertMode`), so the restore branch in setDesert never ran for the single most
+     *  common way Desert ended, and because the board's Silent IS persisted (buzz=false in its NVS)
+     *  the board was left permanently mute after a power cycle. That reads as "my starred device
+     *  stopped beeping" and is not a detection fault.
+     *
+     *  Firmware from 2026-08-08 PERSISTS Desert (desertRestoreEnabled), so a reboot no longer ends
+     *  it behind our back and that specific bug cannot recur on current firmware. Kept deliberately
+     *  and NOT to be deleted as dead code: boards already in the field still run the non-persisting
+     *  build and this app pairs with them, a factory reset still clears it, and Desert can still end
+     *  without passing through setDesert(false) from another client. The condition it guards,
+     *  "Desert stopped and we are not the ones who stopped it", is unchanged; only how often it
+     *  fires changed. Mirrors iOS reconcileDesert(). */
     private fun reconcileDesert(s: DeviceStatus) {
         if (s.desertMode) { desertSeenOn = true; return }
         if (!desertSeenOn) return              // never saw it on: nothing to restore
@@ -3024,6 +3436,11 @@ class AcabBleManager(private val context: Context) {
      *  Cached briefly: this runs on the BLE callback thread once per new device, and a Desert-mode
      *  flood would otherwise fire a binder call per record. A second of lag is centimetres. */
     private fun freshSelfCoord(): Pair<Double, Double>? {
+        if (!locationOwnershipNeeded()) {
+            fixCacheAt = 0L
+            fixCache = null
+            return null
+        }
         val nowNanos = SystemClock.elapsedRealtimeNanos()
         if (nowNanos - fixCacheAt < FIX_CACHE_NANOS) return fixCache
         fixCacheAt = nowNanos
@@ -3055,6 +3472,93 @@ class AcabBleManager(private val context: Context) {
             PackageManager.PERMISSION_GRANTED ||
         ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_COARSE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED
+
+    /** MainActivity reports every resume/result edge. A revoked Bluetooth grant must retire a
+     * retained READY shell immediately instead of leaving dead GATT controls that fail silently or
+     * throw on a later direct disconnect. Location is independent and merely re-evaluates the
+     * process-owned listener. */
+    fun onPermissionsChanged(bluetoothGranted: Boolean, locationGranted: Boolean) {
+        locationPermissionGranted = locationGranted && hasLocationPermission()
+        if (!bluetoothGranted && !_demoMode.value) teardownForBluetoothPermissionRevocation()
+        syncLocationOwnership()
+    }
+
+    /** Called only after AcabLinkService successfully enters the foreground. Merely setting the
+     * Drive toggle is not enough: requesting background fixes before the foreground promotion can
+     * itself violate Android's while-in-use location rules. */
+    fun onLinkServiceStarted() {
+        driveServiceActive = true
+        syncLocationOwnership()
+    }
+
+    /** The service can be stopped by the system as well as by endDriveMode. Never let a stale
+     * in-memory Drive flag keep the process location listener registered without its FGS owner. */
+    fun onLinkServiceStopped() {
+        driveServiceActive = false
+        if (_driveMode.value) _driveMode.value = false
+        syncLocationOwnership()
+    }
+
+    private fun locationOwnershipNeeded(): Boolean = shouldOwnLocation(
+        locationPermissionGranted,
+        _state.value,
+        appForegrounded,
+        _driveMode.value,
+        driveServiceActive,
+    )
+
+    /** Register GPS and network on the main looper so this is safe when a GATT binder callback is
+     * the transition that made the link READY. One listener owns both providers; removeUpdates
+     * retires both atomically. */
+    @Synchronized
+    @SuppressLint("MissingPermission")
+    private fun syncLocationOwnership() {
+        val lm = locationManager ?: return
+        if (!locationOwnershipNeeded()) {
+            if (locationUpdatesRegistered) runCatching { lm.removeUpdates(ownedLocationListener) }
+            locationUpdatesRegistered = false
+            fixCacheAt = 0L
+            fixCache = null
+            return
+        }
+        if (locationUpdatesRegistered) return
+        var registered = false
+        for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+            runCatching {
+                lm.getLastKnownLocation(provider)?.let(ownedLocationListener::onLocationChanged)
+                lm.requestLocationUpdates(
+                    provider, LOCATION_INTERVAL_MS, LOCATION_MIN_DISTANCE_M,
+                    ownedLocationListener, Looper.getMainLooper(),
+                )
+                registered = true
+            }
+        }
+        locationUpdatesRegistered = registered
+    }
+
+    /** Permission loss can happen while Settings covers a retained READY Activity. All platform
+     * calls are best-effort because the grant is already gone; the important guarantee is that
+     * internal state, reconnect intent, service ownership, and the UI all leave the live session. */
+    private fun teardownForBluetoothPermissionRevocation() {
+        val liveState = _state.value == ConnState.SCANNING ||
+            _state.value == ConnState.CONNECTING || _state.value == ConnState.BONDING ||
+            _state.value == ConnState.READY || gatt != null
+        scanGen++
+        scanTimeoutJob?.cancel(); scanTimeoutJob = null
+        scanPausedInBackground = false
+        runCatching { scanner?.stopScan(scanCb) }
+        if (!liveState) {
+            _state.value = ConnState.DISCONNECTED
+            return
+        }
+        userInitiatedDisconnect = true
+        autoReconnecting = false
+        otaReconnecting = false
+        runCatching { gatt?.disconnect() }
+        cleanup()
+        userInitiatedDisconnect = false
+        _state.value = ConnState.DISCONNECTED
+    }
 
     private var lastGpsSent = 0L
     /** Feed in the phone's location: geotag non-drone detections locally, and push it
@@ -3148,19 +3652,163 @@ class AcabBleManager(private val context: Context) {
      *  everything. Callers pass the filter the user is already looking at in the log, so export
      *  means "give me what is on screen" rather than silently handing over the whole history.
      *  Mirrors iOS writeDetections(_:category:). */
-    fun detectionsCsv(category: String? = null): String {
+    /** A contribution CSV: the detection log with location redacted per the three policy switches.
+     *  Redacts the EXPORTED copy only (redactCsvColumns is pure over its input); the app's own log
+     *  is never mutated. Defaults match the composer: observer location OUT, drone aircraft
+     *  broadcast IN, operator broadcast OUT (it can point at a person on the ground). */
+    fun contributionCsv(includeObserverLocation: Boolean = false,
+                        includeDroneLocation: Boolean = true,
+                        includeOperatorLocation: Boolean = false): String =
+        redactCsvColumns(detectionsCsv(null),
+            contributionBlankColumns(includeObserverLocation, includeDroneLocation, includeOperatorLocation))
+
+    /** A BOUNDED contribution CSV from the immutable ID -> in-window timestamp map frozen when
+     *  Stop was tapped, with location redacted per policy. This preserves membership but does not
+     *  atomically freeze changing row fields; UI Stop paths must use [freezeContributionWindow]. */
+    @Deprecated("Use freezeContributionWindow at Stop so membership and row content are atomic")
+    fun windowedContributionCsv(capturedAtById: Map<String, Long>,
+                                includeObserverLocation: Boolean = false,
+                                includeDroneLocation: Boolean = true,
+                                includeOperatorLocation: Boolean = false): String =
+        redactCsvColumns(detectionsCsv(detectedAtOverrides = capturedAtById),
+            contributionBlankColumns(includeObserverLocation, includeDroneLocation, includeOperatorLocation))
+
+    /** Freeze the capture-local live ledger and render it in one critical section. History replay
+     *  never enters this ledger, and each row carries one latest Detection, phone-clock instant,
+     *  and optional observer fix from the same live callback. */
+    fun freezeContributionWindow(startMs: Long, stopMs: Long): ContributionWindowSnapshot =
+        synchronized(storeLock) {
+            val live = contributionCapture.finish(startMs, stopMs)
+            val times = live.associate { it.detection.id to it.observedAtMs.coerceIn(startMs, stopMs) }
+            val observerSamples = live.associate { it.detection.id to it.observer }
+            ContributionWindowSnapshot(
+                times,
+                detectionsCsv(
+                    detectedAtOverrides = times,
+                    observerCoordOverrides = observerSamples,
+                    // The ledger iterates oldest latest-sighting first; explicit renderer inputs
+                    // are already in output order, so reverse once here to keep newest first.
+                    detectionOverrides = live.asReversed().map { it.detection },
+                ),
+            )
+        }
+
+    /** Arm capture-local sampling and return its exact Start instant without an unarmed gap. */
+    fun beginContributionCapture(): Long = synchronized(storeLock) {
+        val startedAt = System.currentTimeMillis()
+        contributionCapture.begin(startedAt)
+        startedAt
+    }
+
+    /** Drop capture-local samples when a capture is discarded before Stop. */
+    fun cancelContributionCapture() = synchronized(storeLock) {
+        contributionCapture.cancel()
+    }
+
+    /** Device ID -> last in-window sighting, snapshotted exactly once at Stop. Frozen keys prevent
+     *  post-Stop membership changes; frozen values keep detected_at inside the capture instead of
+     *  printing a first-ever session sighting. This does not freeze row content by itself. */
+    @Deprecated("Use freezeContributionWindow at Stop so membership and row content are atomic")
+    fun windowObservationTimes(startMs: Long, stopMs: Long): Map<String, Long> = synchronized(storeLock) {
+        buildMap {
+            for (d in store.values) {
+                val first = firstSeenAt[d.id]
+                val last = lastSeenAt[d.id]
+                if (inCaptureWindow(first, last, startMs, stopMs)) {
+                    captureTimestamp(last, startMs, stopMs)?.let { put(d.id, it) }
+                }
+            }
+        }
+    }
+
+    /** Live count while capturing. Review uses the frozen timestamp map captured at Stop. */
+    fun windowObservationCount(startMs: Long, stopMs: Long): Int = synchronized(storeLock) {
+        contributionCapture.count(startMs, stopMs)
+    }
+
+    private fun freezeDetectionExportLocked(rows: List<Detection>): DetectionExportSnapshot =
+        DetectionExportSnapshot(rows.map { d ->
+            DetectionExportRowSnapshot(
+                detection = d,
+                firstSeenMs = firstSeenAt[d.id],
+                timeBasis = histTime[d.id]?.basis ?: TimeBasis.Exact,
+                observerCoord = mapCoordForExport(d),
+            )
+        })
+
+    /** Freeze exactly the rows currently visible in the Log lens, in their current order. */
+    internal fun freezeLogExport(rows: List<Detection>): DetectionExportSnapshot =
+        synchronized(storeLock) { freezeDetectionExportLocked(rows.toList()) }
+
+    /** Freeze the manager's current Compose-sized feed and every evictable side field in one
+     * store critical section. Pause uses this rather than the last coalesced StateFlow emission:
+     * at STORE_CAP a UI row can be evicted between that emission and the tap, taking firstSeen,
+     * time basis and captured location with it. Tap-time current data is the honest pause point. */
+    internal fun freezeFeedExport(): DetectionExportSnapshot = synchronized(storeLock) {
+        val rows = store.values.toList().asReversed().let { newestFirst ->
+            if (newestFirst.size > FEED_CAP) newestFirst.take(FEED_CAP) else newestFirst
+        }
+        freezeDetectionExportLocked(rows)
+    }
+
+    /** The destructive Clear sheet's escape hatch intentionally snapshots the complete store. */
+    internal fun freezeWholeLogExport(category: String? = null): DetectionExportSnapshot =
+        synchronized(storeLock) {
+            val rows = store.values.asSequence()
+                .filter { category == null || it.type.category == category }
+                .toList()
+                .asReversed()
+            freezeDetectionExportLocked(rows)
+        }
+
+    internal fun renderDetectionsCsv(snapshot: DetectionExportSnapshot): String =
+        detectionsCsv(
+            detectionOverrides = snapshot.rows.map { it.detection },
+            firstSeenOverrides = snapshot.rows.associate { it.detection.id to it.firstSeenMs },
+            timeBasisOverrides = snapshot.rows.associate { it.detection.id to it.timeBasis },
+            observerCoordOverrides = snapshot.rows.associate { it.detection.id to it.observerCoord },
+        )
+
+    /** [detectedAtOverrides], when set, restricts export to its frozen keys and writes its in-window
+     *  phone-clock values as detected_at. Null (the default) preserves full-history semantics. */
+    fun detectionsCsv(
+        category: String? = null,
+        detectedAtOverrides: Map<String, Long>? = null,
+        observerCoordOverrides: Map<String, Pair<Double, Double>?>? = null,
+        detectionOverrides: List<Detection>? = null,
+        firstSeenOverrides: Map<String, Long?>? = null,
+        timeBasisOverrides: Map<String, TimeBasis>? = null,
+    ): String {
         val rows = StringBuilder(
             // `maker` is appended LAST so an existing parser keyed on column order still reads
             // every field it knew about. Byte-identical to iOS's, which is why it moves in the
             // same commit or not at all: the UI now names a manufacturer, and the evidence file
             // has to be able to say the same thing.
-            "detected_at,time_basis,time_precision_s,type,mac,rssi,source,matched_on,confidence,sightings,approx_lat,approx_lon,company_id,uas_id,drone_lat,drone_lon,altitude_m,speed_ms,heading_deg,height_agl_m,operator_lat,operator_lon,operator_alt_m,rid_status,maker")
+            detectionCsvRow(
+                listOf(
+                    "detected_at", "time_basis", "time_precision_s", "type", "mac", "rssi",
+                    "source", "matched_on", "confidence", "sightings", "approx_lat", "approx_lon",
+                    "company_id", "uas_id", "drone_lat", "drone_lon", "altitude_m", "speed_ms",
+                    "heading_deg", "height_agl_m", "operator_lat", "operator_lon", "operator_alt_m",
+                    "rid_status", "maker",
+                ),
+                ::csvSafe,
+            ))
         fun iStr(v: Int?): String = v?.toString() ?: ""
         // Export the full store (newest first), not the bounded live feed, so nothing is lost.
         // Snapshot the values under storeLock so the export can't collide with the BLE callback
         // thread mutating the shared map mid-iteration; build the CSV rows outside the lock.
-        val snapshot = synchronized(storeLock) { store.values.toList() }.asReversed()
-            .filter { category == null || it.type.category == category }
+        // The category and frozen-time filters only read immutable Detection fields but run inside
+        // the lock with the store snapshot so there is one atomic membership decision. Null
+        // detectedAtOverrides (the default) exports the full store, unchanged.
+        val selectedRows = synchronized(storeLock) {
+            (detectionOverrides ?: store.values).filter { d ->
+                (category == null || d.type.category == category) &&
+                    (detectedAtOverrides == null || d.id in detectedAtOverrides)
+            }.toList()
+        }
+        // Store values are oldest-first; explicit snapshots already carry the exact UI order.
+        val snapshot = if (detectionOverrides == null) selectedRows.asReversed() else selectedRows
         for (d in snapshot) {
             // Approx records (buffered before the board had a clock) carry only a synthetic
             // sort-time near epoch, not a real capture time. Leave the column blank rather than
@@ -3171,17 +3819,29 @@ class AcabBleManager(private val context: Context) {
             // Going on the row alone there exports the pseudo stamp as a real 2001 date, in the
             // one file that gets handed over as evidence. isApproxTime is the arbiter for every
             // other printed stamp, so it has to be for this one too.
-            val fs = firstSeen(d.id)   // storeLock-guarded accessor; mapCoord below locks internally too
+            val capturedAt = detectedAtOverrides?.get(d.id)
+            val fs = capturedAt ?: if (firstSeenOverrides != null && d.id in firstSeenOverrides) {
+                firstSeenOverrides[d.id]
+            } else firstSeen(d.id)
             // A reader of this file has to be able to tell a clock reading from a reconstruction,
             // so detected_at never travels alone: time_basis says how it was arrived at and
             // time_precision_s how wide it could be. A bracketed row has no single time at all,
             // so it exports the ISO 8601 interval instead of a point, and the unbounded end of a
             // one-sided bracket is ".." (the open-interval form).
-            val basis = timeBasis(d.id)
+            val basis = when {
+                capturedAt != null -> TimeBasis.Exact
+                timeBasisOverrides != null && d.id in timeBasisOverrides ->
+                    timeBasisOverrides.getValue(d.id)
+                else -> timeBasis(d.id)
+            }
             val whenAt: String
             val basisName: String
             var precision = ""
             when {
+                capturedAt != null -> {
+                    whenAt = csvInstant(capturedAt)
+                    basisName = TimeBasis.Exact.csvName
+                }
                 basis is TimeBasis.Reconstructed -> {
                     whenAt = csvInstant(basis.atMs)
                     basisName = basis.csvName
@@ -3200,7 +3860,7 @@ class AcabBleManager(private val context: Context) {
                 // replaced by a live, non-approx one. Going on the row alone there exports the
                 // pseudo stamp as a real 2001 date, in the one file that gets handed over as
                 // evidence. Blank beats a bogus date either way.
-                basis is TimeBasis.Unknown || d.approx || isApproxTime(fs) -> {
+                basis is TimeBasis.Unknown || d.approx || isApproxTime(fs) || fs == null -> {
                     whenAt = ""
                     basisName = TimeBasis.Unknown.csvName
                 }
@@ -3213,7 +3873,11 @@ class AcabBleManager(private val context: Context) {
             // to the detection's own wire lat/lon, which on a drone row is the AIRCRAFT's Remote ID
             // broadcast (ble-protocol.md line 88). Ungated it exported the aircraft as the observer
             // and made approx_lat identical to drone_lat. Matches iOS buildCSV.
-            val coord = mapCoordForExport(d)
+            val coord = if (observerCoordOverrides != null && d.id in observerCoordOverrides) {
+                observerCoordOverrides[d.id]
+            } else {
+                mapCoordForExport(d)
+            }
             val lat = coord?.let { f6(it.first) } ?: ""
             val lon = coord?.let { f6(it.second) } ?: ""
             // Drone Remote ID telemetry, blank for a non-drone row. approx_lat/lon is the PHONE's
@@ -3242,14 +3906,19 @@ class AcabBleManager(private val context: Context) {
             val plo = if (isDrone) d.pilotLon else null
             val opLat = if (pla != null && plo != null && validCoord(pla, plo)) f6(pla) else ""
             val opLon = if (pla != null && plo != null && validCoord(pla, plo)) f6(plo) else ""
-            rows.append('\n').append(
-                listOf(whenAt, basisName, precision, csvSafe(d.type.label), d.mac, d.rssi.toString(),
+            val externalText = detectionCsvExternalText(d.rid, d.maker)
+            rows.append('\n').append(detectionCsvRow(
+                // spreadsheetSafeText on mac: it is decoded off the wire as a free string, so an
+                // impostor board can put "=cmd(...)" in it. A real MAC ("aa:bb:...") is untouched.
+                listOf(whenAt, basisName, precision, d.type.label, spreadsheetSafeText(d.mac), d.rssi.toString(),
                     d.sourceLabel, d.methodLabel, d.confidence.toString(),
                     d.count.toString(), lat, lon, d.companyIdHex ?: "",
-                    csvSafe(d.rid ?: ""), dLat, dLon,
+                    externalText.uasId, dLat, dLon,
                     iStr(d.altitude), iStr(d.speedH), iStr(d.heading), iStr(d.heightAGL),
-                    opLat, opLon, iStr(d.pilotAlt), csvSafe(d.ridStatusLabel ?: ""),
-                    csvSafe(d.maker ?: "")).joinToString(","))
+                    opLat, opLon, iStr(d.pilotAlt), d.ridStatusLabel ?: "",
+                    externalText.maker),
+                ::csvSafe,
+            ))
         }
         return rows.toString()
     }
@@ -3286,7 +3955,10 @@ class AcabBleManager(private val context: Context) {
      *  reads the live store. Extracting a pure builder (snapshot -> String), the way iOS already
      *  has, is the prerequisite - the JSON fixtures in ExportTests.swift are written to be reused
      *  here verbatim when that lands. Treat any change on this side as unguarded until then. */
-    fun detectionsGpx(category: String? = null): String {
+    fun detectionsGpx(category: String? = null): String =
+        renderDetectionsGpx(freezeWholeLogExport(category))
+
+    internal fun renderDetectionsGpx(snapshot: DetectionExportSnapshot): String {
         val out = StringBuilder(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
             "<gpx version=\"1.1\" creator=\"beacons\" xmlns=\"http://www.topografix.com/GPX/1/1\">")
@@ -3304,11 +3976,10 @@ class AcabBleManager(private val context: Context) {
             out.append("\n  </wpt>")
         }
 
-        val snapshot = synchronized(storeLock) { store.values.toList() }.asReversed()
-            .filter { category == null || it.type.category == category }
-        for (d in snapshot) {
-            val fs = firstSeen(d.id)
-            val basis = timeBasis(d.id)
+        for (row in snapshot.rows) {
+            val d = row.detection
+            val fs = row.firstSeenMs
+            val basis = row.timeBasis
             // A single instant, or null when the row is bracketed/unknown (see wpt above).
             var stamp: String? = null
             val basisNote: String
@@ -3344,7 +4015,7 @@ class AcabBleManager(private val context: Context) {
             // overload that produced the CSV bug. Using it here would label the aircraft's
             // position "Position is where the PHONE was", the exact inversion of the honesty rule
             // this writer exists to enforce. A drone's real position gets its own waypoint below.
-            val heard = mapCoordForExport(d)
+            val heard = row.observerCoord
             if (heard != null) {
                 wpt(heard.first, heard.second, "Heard: $label",
                     "Position is where the PHONE was, not the device. Audible from here only. " +
@@ -3370,9 +4041,12 @@ class AcabBleManager(private val context: Context) {
         return out.toString()
     }
 
-    private fun csvSafe(s: String): String =
-        if (s.contains(',') || s.contains('"') || s.contains('\n'))
-            "\"" + s.replace("\"", "\"\"") + "\"" else s
+    // NOT composed with spreadsheetSafeText: this transform runs on EVERY cell of a row, and the
+    // neutralizer prefixes a leading '-', which would corrupt every negative numeric cell (rssi
+    // "-58", altitudes, vertical speed). Formula neutralization is applied at the source to the
+    // cells that carry radio-sourced TEXT: rid/maker via detectionCsvExternalText, and mac at the
+    // row emitter.
+    private fun csvSafe(s: String): String = csvField(s)
 
     // ---- whitelist (ignored devices) ----
 
@@ -3565,6 +4239,17 @@ class AcabBleManager(private val context: Context) {
             .apply()
     }
 
+    /** First-run baseline for the "new" dots. The first time the log is ever opened normally,
+     *  treat whatever is already stored as seen, so a fresh install (or a first offline backlog)
+     *  does not paint a red dot on every row. Once-only, guarded by a persisted flag; from then on
+     *  the watermark advances each time the user leaves the Log tab (see MainScreen's Tab.LOG
+     *  onDispose), so a dot always means "arrived since you last looked". Mirrors iOS. */
+    fun seedSeenWatermarkOnce() {
+        if (prefs.getBoolean("seenWatermarkSeeded", false)) return
+        markAllSeen()
+        prefs.edit().putBoolean("seenWatermarkSeeded", true).apply()
+    }
+
     /** True when this detection was first heard after the "mark all seen" watermark. */
     fun isNewSinceWatermark(d: Detection): Boolean {
         val fs = synchronized(storeLock) { firstSeenAt[d.id] } ?: return true
@@ -3589,6 +4274,10 @@ class AcabBleManager(private val context: Context) {
         }
         return out
     }
+
+    /** Paused equivalent: current watermarks applied to first-seen values frozen at Pause. */
+    internal fun newIdSet(snapshot: DetectionExportSnapshot): Set<String> =
+        frozenNewIdSet(snapshot.rows, _seenWatermark.value, approxWatermark)
 
     private fun loadIgnored() {
         val raw = prefs.getString("ignored", null) ?: return
@@ -3668,8 +4357,9 @@ class AcabBleManager(private val context: Context) {
             // "moto" is present so the tour shows the Motorola sub-toggle. Omitting it would make
             // the demo board look like pre-split firmware and hide the control the tour exists to
             // introduce. "axon":true so the parent category is on and the sub-row is not dimmed.
-            """{"fw":"beacon board 2.0.3","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"buzzer":true,"vol":70,"gps":true,"bat":82}"""))
+            """{"fw":"beacon board 2.0.5","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"buzzer":true,"vol":70,"gps":true,"bat":82}"""))
         _state.value = ConnState.READY
+        syncLocationOwnership()
         // placeDemoDetections clears + repopulates the same maps the async startup reload fills, so
         // wait for that reload before seeding, to avoid a concurrent mutation of the non-synchronized
         // maps. The join is instant in practice; the READY flip stays synchronous above so the UI
@@ -3745,6 +4435,7 @@ class AcabBleManager(private val context: Context) {
         _status.value = null
         _deviceName.value = null
         _state.value = ConnState.DISCONNECTED
+        syncLocationOwnership()
         // Re-read the real log the demo was covering up. Published as persistLoadJob, exactly like
         // the startup load, so a re-entered demo or an instant connect joins it instead of racing
         // the reload as it repopulates the non-synchronized maps.
@@ -4144,7 +4835,7 @@ class AcabBleManager(private val context: Context) {
         private const val KEY_ALIAS = "acab.buf.wrap"
         // A fixed point safely in the past that approx-time history counts down from, so a
         // seq-ordered replay lands strictly before "now" and keeps its relative order.
-        private const val HIST_PSEUDO_BASE = 1_000_000_000_000L   // ~2001-09, far below any real wall clock
+        internal const val HIST_PSEUDO_BASE = 1_000_000_000_000L   // ~2001-09, far below any real wall clock
         // The board's crystal is specified to roughly +/-20 ppm, so a reconstructed stamp carried
         // back across E seconds of uptime can be off by E * this. See precisionFor.
         private const val CRYSTAL_DRIFT = 0.00002
@@ -4178,6 +4869,9 @@ class AcabBleManager(private val context: Context) {
         private const val FIX_MAX_AGE_NANOS = 120_000L * 1_000_000L
         // How long a last-known-fix read is reused (see freshSelfCoord).
         private const val FIX_CACHE_NANOS = 1_000L * 1_000_000L
+        // Process-owned location cadence. Same values the old Activity listener used.
+        private const val LOCATION_INTERVAL_MS = 5_000L
+        private const val LOCATION_MIN_DISTANCE_M = 10f
         // The firmware accepts up to 256 ignore-list entries.
         private const val IGNORE_CAP = 256
         // The firmware accepts up to 256 watchlist entries, same as the ignore list.
@@ -4212,9 +4906,10 @@ class AcabBleManager(private val context: Context) {
         // (the version report checkPostRebootConfirm needs) before reporting the indeterminate
         // outcome. 30 s on both platforms; see armPostRebootStatusCap.
         private const val POST_REBOOT_STATUS_CAP_MS = 30_000L
-        // Belt-and-braces: if the board's "ok" reply to confirm is missed, settle to DONE anyway
-        // after this long (the board self-heals ~20 s after a healthy boot regardless).
-        private const val CONFIRM_SETTLE_MS = 5_000L
+        // Fresh firmware normally satisfies its product-health gate at 20 s. Keep retrying long
+        // enough for that durable acknowledgement, but never synthesize success without "ok".
+        private const val CONFIRM_RETRY_MS = 2_000L
+        private const val CONFIRM_TIMEOUT_MS = 35_000L
 
         // How long the unexpected-drop auto-reconnect shows "Reconnecting…" before Drive mode's
         // foreground service is released. Matches the iOS "Reconnecting…" Live Activity's ~120 s

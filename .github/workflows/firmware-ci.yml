@@ -5,9 +5,7 @@ name: Firmware CI
 # provably missed a real crash; this is the equivalent gate for the side where a regression is
 # both least visible and least recoverable.
 #
-# Deliberately NOT here: iOS. `xcodebuild` without signing is doable but needs macOS runners,
-# which is the one item in this file with a real recurring cost. Add it if the app side starts
-# breaking; today it never has.
+# iOS has its own macOS test and unsigned Release-build gate in ios-ci.yml.
 
 on:
   push:
@@ -55,6 +53,14 @@ jobs:
       # A drift watcher that only runs when someone remembers to run it is not a watcher.
       - name: Signature + vendored-copy drift
         run: python3 firmware/tools/check-signature-drift.py
+
+      # The release-tooling suite (descriptor parsing, rev-B staging, signature-over-staged-bytes,
+      # nRF version binding) was runnable only by hand, so nothing gated it. The one
+      # sibling-repo-dependent case skips itself when soyboi.tech is absent, so this stays green
+      # on a bare checkout.
+      - name: Release tooling tests
+        working-directory: firmware/tools
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
   # The repo has a public/private split (firmware/nrf-ble-scan/, firmware/OTA.md and the whole
   # hardware/ tree are gitignored), which is precisely the condition that produces links pointing

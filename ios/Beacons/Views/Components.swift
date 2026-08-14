@@ -66,11 +66,23 @@ struct LinkChip: View {
 struct ScanDot: View {
     var color: Color = ACABTheme.accent
     @State private var on = true
+    // Reduce Motion parks the blink: the dot stays lit (state is still conveyed by colour +
+    // the kicker text beside it), it just stops pulsing.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         Circle().fill(color).frame(width: 7, height: 7)
             .opacity(on ? 1 : 0.25)
             .shadow(color: color.opacity(0.5), radius: 3)
-            .onAppear { withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { on = false } }
+            .onAppear(perform: updateAnimation)
+            .onChange(of: reduceMotion) { _, _ in updateAnimation() }
+    }
+
+    private func updateAnimation() {
+        var parked = Transaction(animation: nil)
+        parked.disablesAnimations = true
+        withTransaction(parked) { on = true }
+        guard !reduceMotion else { return }
+        withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { on = false }
     }
 }
 
@@ -163,12 +175,23 @@ struct RadarScope: View {
                     // "ACTIVE" is load-bearing: this count is filtered to recently-seen
                     // devices, so it reads lower than the Log's whole-session total. Saying
                     // "active" tells the user why Status < Log instead of looking like a bug.
-                    Kicker("ACTIVE NEARBY")
+                    // Fixed size, NOT ACABTheme.mono: the caption anchor roughly quadruples at
+                    // accessibility sizes and this label lives inside the scope's fixed
+                    // geometry, where it collided with the count. The count itself (real
+                    // content) keeps scaling; the whole scope carries a spoken summary below.
+                    Text("ACTIVE NEARBY")
+                        .font(Font.custom("JetBrainsMono-Medium", fixedSize: 10.5))
+                        .tracking(1.6)
+                        .foregroundStyle(ACABTheme.faint)
                 }
             }
             .frame(width: s, height: s)
             .frame(maxWidth: .infinity)
         }
+        // One spoken element for the whole instrument: the dots and rings are positional
+        // decoration a screen reader cannot use, so say what the scope actually knows.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(count) active device\(count == 1 ? "" : "s") nearby. Radar shows signal strength only, not direction.")
     }
 }
 
@@ -178,6 +201,9 @@ struct RadarScope: View {
 private struct SweepBeam: View {
     let size: CGFloat
     @State private var sweep = 0.0
+    // Reduce Motion holds the beam still: the gradient stays visible (so "scanning" still
+    // reads as distinct from a parked scope), it just does not rotate forever.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         Circle()
             .fill(AngularGradient(gradient: Gradient(stops: [
@@ -188,18 +214,27 @@ private struct SweepBeam: View {
             .frame(width: size, height: size)
             .rotationEffect(.degrees(sweep))
             .blendMode(.screen)
-            .onAppear {
-                withAnimation(.linear(duration: 4.5).repeatForever(autoreverses: false)) { sweep = 360 }
-            }
+            .onAppear(perform: updateAnimation)
+            .onChange(of: reduceMotion) { _, _ in updateAnimation() }
+    }
+
+    private func updateAnimation() {
+        var parked = Transaction(animation: nil)
+        parked.disablesAnimations = true
+        withTransaction(parked) { sweep = 0 }
+        guard !reduceMotion else { return }
+        withAnimation(.linear(duration: 4.5).repeatForever(autoreverses: false)) { sweep = 360 }
     }
 }
 
 /// "they're watching - watch back."
 struct PunkLine: View {
     var body: some View {
+        // Ornamental brand copy, so it is pinned at its design size: at accessibility text
+        // sizes every point it grows is a point stolen from the content around it.
         (Text("they're watching. ").foregroundStyle(ACABTheme.dim)
          + Text("watch back.").foregroundStyle(ACABTheme.accent).italic())
-            .font(ACABTheme.display(14, weight: .medium))
+            .font(Font.custom("SpaceGrotesk-Medium", fixedSize: 14))
     }
 }
 

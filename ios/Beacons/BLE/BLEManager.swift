@@ -68,6 +68,11 @@ struct WatchedDevice: Codable, Identifiable, Equatable {
 struct OfflineSyncSummary: Identifiable, Equatable {
     let id = UUID()
     let count: Int
+    /// Records the board PROMISED ({"hist":"begin","n"}) but never SENT ({"hist":"end","n"}).
+    /// A record past notifyCap() is consumed from the ring and skipped without being counted,
+    /// so it is gone and no retry can refill it. Disclosure, not resync: rides the banner.
+    /// ble-protocol.md, "Why the replay check needs all three numbers".
+    var unreplayed: Int = 0
 }
 
 /// How alerts reach you: board buzzer, phone haptics, or nothing.
@@ -150,7 +155,13 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
     private let alertModeBeforeDesertKey = "acab.alertModeBeforeDesert"
-    @Published private(set) var driveModeOn = false   // Live Activity (Drive mode) running
+    @Published private(set) var driveModeOn = false   // Live Activity (Drive mode) actually RUNNING
+    /// The user's PERSISTED Drive-mode INTENT (mirror of DriveModeState.wanted, default ON), kept
+    /// @Published so the settings toggle observes it. This is what the toggle must reflect, NOT
+    /// driveModeOn: the activity only starts once foregrounded + a board is ready, and it drops on
+    /// a disconnect, so binding the toggle to driveModeOn read OFF by default and flipped OFF on
+    /// every dropout. Every write to DriveModeState.wanted routes through setDriveModeWanted().
+    @Published private(set) var driveModeWanted = DriveModeState.wanted
     /// True while a pending auto-reconnect is armed after an UNEXPECTED drop (board unplugged /
     /// power-cycled). Distinct from a fresh scan-connect (which is also .connecting but has no
     /// reconnectTarget): ConnectView uses this to offer a foreground escape from the otherwise
@@ -166,7 +177,11 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    private var central: CBCentralManager!
+    // Creating CBCentralManager is itself the first Bluetooth access and may display the system
+    // prompt. Defer it on a never-asked install so ConnectView's rationale is genuinely visible
+    // first; already-authorized installs still initialize immediately for background recovery.
+    private var central: CBCentralManager?
+    private var scanWhenCentralIsReady = false
     private var peripheral: CBPeripheral?
     private var configChar: CBCharacteristic?
     private var otaChar: CBCharacteristic?
@@ -183,10 +198,11 @@ final class BLEManager: NSObject, ObservableObject {
     private var reconnectTarget: CBPeripheral? {
         didSet { isReconnecting = (reconnectTarget != nil) }   // single source of truth for the UI escape
     }
-    /// Set by disconnect() so didDisconnectPeripheral knows the drop was intentional and must NOT
-    /// arm an auto-reconnect. Consumed (cleared) once that disconnect is handled. Internal (not
-    /// private) so the OTA extension's otaHandleDisconnect can honor a user teardown mid-reboot.
-    var userDisconnect = false
+    /// Identifies the exact peripheral whose disconnect is intentional and must NOT arm an
+    /// auto-reconnect. A global Boolean is unsafe because CoreBluetooth can deliver callbacks from
+    /// a retired peripheral after a replacement session has started. Internal so the OTA extension
+    /// can honor a user teardown during its reboot window.
+    var intentionalDisconnectID: UUID?
 
     /// True once THIS session actually reached ready: the Detections CCCD subscribe succeeded, so
     /// the buffer handshake could run. Gates the unexpected-drop auto-reconnect. A connect that
@@ -243,6 +259,13 @@ final class BLEManager: NSObject, ObservableObject {
 
     /// Live OTA session context, non-nil only while an update is running. Reset on finish.
     var otaSession: OTASession?
+    /// Board and generation that own the asynchronous S3 update. The download must never hand
+    /// verified bytes to whichever board happens to be current later.
+    var otaOwnerPeripheralID: UUID?
+    var otaGeneration: UInt64 = 0
+    /// A cancelled/failed S3 transfer may leave delayed replies in the current GATT session.
+    /// Do not arm another run on that same link; a disconnect flushes the protocol boundary.
+    var otaQuarantinedPeripheralID: UUID?
     /// The background download+verify Task, held so cancelFirmwareUpdate() can actually stop it.
     /// otaSession only exists after beginTransfer, so a cancel during download/verify needs this.
     var otaDownloadTask: Task<Void, Never>?
@@ -250,6 +273,11 @@ final class BLEManager: NSObject, ObservableObject {
     var otaStallTimer: Timer?
     /// After we reboot the board we reconnect and confirm; this holds the target while we wait.
     var otaAwaitingReboot: OTARebootWait?
+    /// Generation of the current post-reboot link attempt. Unlike otaGeneration (one whole
+    /// update), this changes on every disconnect and successful reconnect so timers from an older
+    /// link cannot fail or confirm a newer one.
+    var otaPostRebootAttempt: UInt64 = 0
+    var otaPostRebootConnected = false
     /// True once a Status frame has decoded since the last OTA reboot reconnect. The post-reboot
     /// version check keys on it: the OTA reboot path deliberately skips the normal disconnect
     /// teardown, so `status` (and currentFwVersion) still hold PRE-reboot values at reconnect,
@@ -262,8 +290,17 @@ final class BLEManager: NSObject, ObservableObject {
     @Published var nrfDfuState: NrfDfuState = .idle
     /// The live flasher (its own CBCentralManager), non-nil only while a co-proc DFU runs.
     var nrfFlasher: NrfDfuFlasher?
+    /// Pre-trigger scan that proves no nearby legacy DFU advertiser was already present.
+    var nrfBaselineScanner: NrfDfuBaselineScanner?
     /// The background download+verify Task for the co-proc zip; held so a cancel can stop it.
     var nrfDownloadTask: Task<Void, Never>?
+    /// Board and generation that own the asynchronous co-processor update.
+    var nrfOwnerPeripheralID: UUID?
+    var nrfDfuGeneration: UInt64 = 0
+    /// Once this Config session has sent a legacy-DFU trigger, do not arm another. The request and
+    /// reply protocol has no session token, so reconnecting is the boundary that retires delays.
+    var nrfQuarantinedPeripheralID: UUID?
+    var nrfPackageURL: URL?
     /// nRF version we expect after the flash; the confirm step polls status.nrfVersion for it.
     var nrfConfirmTarget: Int?
 
@@ -300,6 +337,19 @@ final class BLEManager: NSObject, ObservableObject {
     private var trackHistory: [String: [CLLocationCoordinate2D]] = [:]   // drone flight paths
     private var firstSeenAt: [String: Date] = [:]
     private var capturedLoc: [String: CLLocationCoordinate2D] = [:]
+    /// Latest LIVE sighting captured specifically during the currently armed contribution window.
+    /// This ledger, not the coalesced UI projection or the session-wide store, defines bounded
+    /// membership. Replay/history rows never enter it, while a device first heard before Start
+    /// enters as soon as it produces a new live sighting. Keeping row fields, one clock instant,
+    /// and the phone fix together makes `.exact` truthful and prevents session-old observer GPS
+    /// from being paired with an in-window timestamp.
+    private struct ContributionLiveSample {
+        let detection: Detection
+        let observedAtMs: Int64
+        let coordinate: CLLocationCoordinate2D?
+    }
+    private var contributionCaptureStartMs: Int64?
+    private var contributionLiveSamples: [String: ContributionLiveSample] = [:]
     /// Strongest RSSI seen so far for a no-GPS device, the reference the closest-approach pin
     /// migrates against. RSSI is a distance proxy (stronger = closer), so first sighting is the
     /// WORST place estimate (edge of range); capturedLoc chases the best sample instead. Paired
@@ -350,6 +400,7 @@ final class BLEManager: NSObject, ObservableObject {
     private let ignoreKey = "acab.ignoredDevices"
     private let watchKey = "acab.watchedDevices"
     private let watermarkKey = "acab.seenWatermark"   // "mark all seen" baseline
+    private let seenWatermarkSeededKey = "acab.seenWatermarkSeeded"   // first-open baseline set once
     /// Second "mark all seen" baseline, for the PSEUDO-TIME band (undateable buffered rows).
     /// Those rows' near-epoch stamps are ordering keys that get renumbered on every clean drain
     /// end (resolveBracketedHistory), so a stamp-value watermark there would go stale on the next
@@ -422,6 +473,9 @@ final class BLEManager: NSObject, ObservableObject {
     private static let hapticCooldown: TimeInterval = 600   // 10 min, matches DetectionNotifier
 
     private let locationManager = CLLocationManager()
+    /// Published permission state gives SwiftUI an explicit, live model for denied/restricted
+    /// recovery instead of relying on an unrelated BLE publication to refresh the screen.
+    @Published private(set) var locationAuthorizationStatus: CLAuthorizationStatus = .notDetermined
     /// The whole CLLocation, not just its coordinate, because the coordinate alone can't be tested
     /// for freshness even in principle. See freshCoord.
     private var lastFix: CLLocation?
@@ -506,7 +560,7 @@ final class BLEManager: NSObject, ObservableObject {
             // guards on `activity?.id == id`. That is exactly what makes it safe to clear the
             // persisted intent here: a user dismissing the activity means OFF and must not
             // resurrect, while the willTerminate teardown leaves the intent standing.
-            DriveModeState.wanted = false
+            self?.setDriveModeWanted(false)
             self?.driveModeOn = false
             self?.stopLocationIfIdle()   // Drive mode was the only thing holding location, disconnected
         }
@@ -540,7 +594,7 @@ final class BLEManager: NSObject, ObservableObject {
             // work directly but LEAVE connectionState == .scanning as the resume flag; the
             // foreground observer below re-issues the scan. Auto-reconnect is unaffected: it
             // rides a parked central.connect, not a scan.
-            if self?.connectionState == .scanning { self?.central.stopScan() }
+            if self?.connectionState == .scanning { self?.central?.stopScan() }
         }
         // Resume the parked connect scan when the user comes back to it.
         NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification,
@@ -550,6 +604,17 @@ final class BLEManager: NSObject, ObservableObject {
             // grants it in iOS Settings mid-session would otherwise stay silently unauthorized for
             // the whole process, with green toggles over a dead feature.
             self.notifier.refreshAuthorization()
+            self.locationAuthorizationStatus = self.locationManager.authorizationStatus
+            // If permission changed in Settings while the first-use manager was deferred, create
+            // it now without requiring a relaunch. Denied/restricted remain an actionable state.
+            if self.central == nil {
+                switch CBManager.authorization {
+                case .allowedAlways: self.initializeCentral()
+                case .denied, .restricted: self.connectionState = .unauthorized
+                case .notDetermined: self.connectionState = .idle
+                @unknown default: self.connectionState = .unknown
+                }
+            }
             guard self.connectionState == .scanning else { return }
             self.startScan()
         }
@@ -557,16 +622,67 @@ final class BLEManager: NSObject, ObservableObject {
         notifier.refreshAuthorization()   // trust the system's answer, not our own last request
         alertMode = AlertMode(rawValue: UserDefaults.standard.string(forKey: alertModeKey) ?? "") ?? .buzzer
         if alertMode == .vibrate { requestFocusAuthIfNeeded() }
-        central = CBCentralManager(delegate: self, queue: nil)
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
         locationManager.activityType = .automotiveNavigation   // what this actually is: tagging hits from a moving car
-        locationManager.requestWhenInUseAuthorization()   // just for tagging the log; fine to deny
+        locationAuthorizationStatus = locationManager.authorizationStatus
+        switch CBManager.authorization {
+        case .allowedAlways:
+            initializeCentral()   // returning user: preserve normal reconnect/background startup
+        case .denied, .restricted:
+            connectionState = .unauthorized
+        case .notDetermined:
+            connectionState = .idle   // rationale + user CTA appear before CBCentralManager exists
+        @unknown default:
+            connectionState = .unknown
+        }
     }
 
     // MARK: - Intent
 
+    private func initializeCentral() {
+        guard central == nil else { return }
+        connectionState = .unknown
+        central = CBCentralManager(delegate: self, queue: nil)
+    }
+
+    /// The only first-use path. ConnectView calls this from the rationale's primary button, so
+    /// both Bluetooth and Location prompts follow an explicit, informed action. Either permission
+    /// may be denied; Bluetooth is required to scan, while Location only affects observer pins.
+    func startScanFromUser() {
+        requestLocationAccessIfNeeded()
+        guard central == nil else { startScan(); return }
+        switch CBManager.authorization {
+        case .denied, .restricted:
+            connectionState = .unauthorized
+        case .allowedAlways, .notDetermined:
+            scanWhenCentralIsReady = true
+            initializeCentral()
+        @unknown default:
+            connectionState = .unknown
+        }
+    }
+
+    /// Location is optional and is requested only after ConnectView has explained its use and the
+    /// user asks to scan. Existing grants simply begin updates when a connected session needs them.
+    func requestLocationAccessIfNeeded() {
+        locationAuthorizationStatus = locationManager.authorizationStatus
+        if locationManager.authorizationStatus == .notDetermined {
+            locationManager.requestWhenInUseAuthorization()
+        } else {
+            startLocationIfNeeded()
+        }
+    }
+
     func startScan() {
+        guard let central else {
+            // Automatic resume is allowed only for a previously-granted install. Never create the
+            // first manager (and therefore a prompt) outside startScanFromUser().
+            guard CBManager.authorization == .allowedAlways else { return }
+            scanWhenCentralIsReady = true
+            initializeCentral()
+            return
+        }
         guard central.state == .poweredOn else { return }
         discovered.removeAll()
         lastAdvertAt.removeAll()   // freshness stamps belong to the list they describe
@@ -594,11 +710,17 @@ final class BLEManager: NSObject, ObservableObject {
 
     func stopScan() {
         scanTimeoutTimer?.invalidate(); scanTimeoutTimer = nil
-        central.stopScan()
+        central?.stopScan()
         if connectionState == .scanning { connectionState = .idle }
     }
 
     func connect(_ device: DiscoveredDevice) {
+        guard let central else { return }
+        cancelUpdatesForLinkTeardown(
+            reason: "The prior update was stopped before connecting to another board.")
+        // A fresh user-selected session can never inherit teardown intent from a prior handle whose
+        // terminal callback was suppressed by a radio reset.
+        intentionalDisconnectID = nil
         connectHint = nil   // fresh attempt: drop any stale recovery hint from the last one
         central.stopScan()
         scanTimeoutTimer?.invalidate(); scanTimeoutTimer = nil   // the window closes with the scan
@@ -615,56 +737,86 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     /// The fresh connect never resolved: cancel it and go back to scanning, so the stale row
-    /// only re-lists if the board is really still advertising. NOT flagged as userDisconnect:
-    /// a cancelled never-established connect yields no didDisconnect to consume the flag, and
-    /// a stale true would wrongly suppress the auto-reconnect after the NEXT real drop.
+    /// only re-lists if the board is really still advertising. It gets no intentional-disconnect
+    /// target: a cancelled never-established connect yields no didDisconnect callback to consume it.
     private func connectTimedOut() {
         connectTimeoutTimer = nil
         guard connectionState == .connecting, reconnectTarget == nil,
               otaAwaitingReboot == nil, let pending = peripheral else { return }
-        central.cancelPeripheralConnection(pending)
+        cancelUpdatesForLinkTeardown(reason: "The board connection timed out during the update.")
+        central?.cancelPeripheralConnection(pending)
         peripheral = nil
-        connectionState = (central.state == .poweredOn) ? .idle : .unknown
-        if central.state == .poweredOn { startScan() }
+        connectionState = (central?.state == .poweredOn) ? .idle : .unknown
+        if central?.state == .poweredOn { startScan() }
     }
 
     func disconnect() {
-        // A user-initiated disconnect must NOT auto-reconnect. Flag it so didDisconnectPeripheral
-        // tears down cleanly instead of arming a pending reconnect.
-        userDisconnect = true
+        let pendingOtaReconnect = otaAwaitingReboot != nil ? peripheral : nil
+        cancelUpdatesForLinkTeardown(
+            reason: "Update cancelled because you disconnected from the board.")
         connectTimeoutTimer?.invalidate(); connectTimeoutTimer = nil
         if let target = reconnectTarget {
             // We were already holding a pending auto-reconnect from an earlier unexpected drop.
             // Cancelling a pending (never-established) connect yields NO didDisconnect callback, so
             // settle the UI + widget here rather than waiting for one that won't arrive.
-            central.cancelPeripheralConnection(target)
+            central?.cancelPeripheralConnection(target)
             reconnectTarget = nil
-            userDisconnect = false   // consumed: this branch handled the teardown itself
-            connectionState = (central.state == .poweredOn) ? .idle : .unknown
+            intentionalDisconnectID = nil
+            connectionState = (central?.state == .poweredOn) ? .idle : .unknown
             // This pending reconnect came from an earlier unexpected drop, which ran
             // driveModeLinkLost(): the Live Activity is sitting on "Reconnecting…" with the 120s
-            // grace armed. Cancelling a pending connect fires no didDisconnect, so the userDisconnect
-            // branch there never runs - end Drive mode right here, exactly as that branch does, or the
+            // grace armed. Cancelling a pending connect fires no didDisconnect, so the intentional
+            // branch there never runs. End Drive mode here or the
             // stale counter lingers on the Lock Screen for two minutes after the user disconnected.
-            if driveModeOn { endDriveMode() }
+            if driveModeOn { suspendDriveModeForLinkEnd() }
             writeWidgetSummary(force: true)
+            return
+        }
+        // During the OTA reboot wait CoreBluetooth holds a pending connect while the public state
+        // intentionally remains connected. Cancelling that request may produce didFailToConnect,
+        // didDisconnect, or no terminal callback. Settle it synchronously so none of those outcomes
+        // can retry an update after the user explicitly disconnected.
+        if let target = pendingOtaReconnect {
+            central?.cancelPeripheralConnection(target)
+            stopStatusPolling()
+            checkpointLive()
+            intentionalDisconnectID = nil
+            peripheral = nil
+            configChar = nil
+            otaChar = nil
+            otaCapable = false
+            connectedName = nil
+            status = nil
+            syncingOfflineLog = false
+            histResyncs = 0
+            sessionWasReady = false
+            reconnectTarget = nil
+            connectionState = (central?.state == .poweredOn) ? .idle : .unknown
+            if driveModeOn { suspendDriveModeForLinkEnd() }
+            writeWidgetSummary(force: true)
+            stopLocationIfIdle()
+            return
         }
         // A FRESH scan-connect still pending (tapped a board row, no didConnect yet): same
         // problem as the reconnect branch above, cancelling a never-established connect yields
         // NO didDisconnect, so settle the state inline and consume the flag here too. Without
-        // this the UI stays pinned on .connecting and the stale userDisconnect flag would
-        // suppress the auto-reconnect after the next real unexpected drop. (An OTA reboot wait
+        // this the UI stays pinned on .connecting. (An OTA reboot wait
         // never lands here: it holds connectionState at .connected.) If the link did come up in
         // the race window, the didDisconnect that follows finds a peripheral we no longer hold
         // and didDisconnectPeripheral treats that as finished business.
         if connectionState == .connecting, reconnectTarget == nil, let pending = peripheral {
-            central.cancelPeripheralConnection(pending)
+            central?.cancelPeripheralConnection(pending)
             peripheral = nil
-            userDisconnect = false   // consumed: this branch handled the teardown itself
-            connectionState = (central.state == .poweredOn) ? .idle : .unknown
+            intentionalDisconnectID = nil
+            connectionState = (central?.state == .poweredOn) ? .idle : .unknown
             return
         }
-        if let peripheral { central.cancelPeripheralConnection(peripheral) }
+        if let peripheral {
+            // Scope the intent to this exact board. Late callbacks from any retired board may
+            // clear only their own matching intent and can never affect this session.
+            intentionalDisconnectID = peripheral.identifier
+            central?.cancelPeripheralConnection(peripheral)
+        }
     }
 
     /// Arm (or re-arm) the pending auto-reconnect for `reconnectTarget`. central.connect with no
@@ -673,11 +825,30 @@ final class BLEManager: NSObject, ObservableObject {
     /// Activity. Guarded so we never stomp a live link and only fire while the radio is on; when
     /// the radio is off we defer and centralManagerDidUpdateState re-arms on .poweredOn.
     private func armReconnect() {
-        guard let target = reconnectTarget,
+        guard let central, let target = reconnectTarget,
               central.state == .poweredOn,
               connectionState != .connected else { return }
         target.delegate = self
         central.connect(target, options: nil)   // stays pending until the board comes back; works backgrounded
+    }
+
+    /// Invalidate every asynchronous update owner before a board handle can be replaced. Each
+    /// engine has its own generation guard; the combined coordinator is stopped separately so an
+    /// old timer cannot start the next leg on a new board.
+    private func cancelUpdatesForLinkTeardown(reason: String, settleAsIdle: Bool = false) {
+        let nrfPastPointOfNoReturn = nrfFlasher?.canCancelSafely == false
+            && nrfDfuState.isRunning
+        // Nordic validation/commit runs on its own BLE central and cannot be undone by losing the
+        // S3 Config link. Keep its owner, callbacks, and combined coordinator alive so the app can
+        // verify the result after the same board reconnects instead of reporting a false cancel.
+        if !nrfPastPointOfNoReturn {
+            combinedCancelForLinkTeardown(reason: reason, settleAsIdle: settleAsIdle)
+        } else if combinedState.isRunning {
+            combinedState = .verifying
+            combinedPhaseLabel = "Finishing co-processor update"
+        }
+        otaCancelForLinkTeardown(reason: reason, settleAsIdle: settleAsIdle)
+        nrfCancelForLinkTeardown(reason: reason, settleAsIdle: settleAsIdle)
     }
 
     /// Drop the log from memory only, leaving the on-disk history alone. This half exists so
@@ -711,17 +882,30 @@ final class BLEManager: NSObject, ObservableObject {
     /// Live Activities can be disabled per-app in Settings; the toggle surfaces a hint.
     var liveActivitiesEnabled: Bool { liveActivity.isAvailable }
 
+    /// Persist the Drive-mode INTENT and keep the @Published mirror the toggle observes in step.
+    /// The single writer for DriveModeState.wanted from the app side.
+    private func setDriveModeWanted(_ value: Bool) {
+        DriveModeState.wanted = value
+        driveModeWanted = value
+    }
+
     /// Start the Drive-mode Live Activity. iOS requires the app to be foregrounded to
     /// begin one; the toggle lives in DeviceView, which is on-screen when tapped.
     func startDriveMode() {
+        // Persist the user's choice even when Live Activities are currently disabled. If they
+        // enable the capability in Settings, foreground reconciliation can honor the choice.
+        setDriveModeWanted(true)    // survives the willTerminate teardown below
         guard liveActivity.isAvailable else { return }
-        DriveModeState.wanted = true    // survives the willTerminate teardown below
         liveActivity.dropIfInactive()
         if liveActivity.adoptExisting() {   // reuse one already running (e.g. the Control Center toggle)
             driveModeOn = true
             liveActivity.update(liveState())
             return
         }
+        // `connectionState` becomes connected before the encrypted Detections subscription
+        // resolves. Remember an early On choice, but do not create the counter until the board is
+        // genuinely ready. The successful CCCD callback retries this method.
+        guard sessionWasReady || demoMode else { return }
         // Reflect whether the system actually started the activity (request can fail
         // silently); the controller also resets driveModeOn if it's later dismissed.
         driveModeOn = liveActivity.start(deviceName: connectedName ?? "beacons",
@@ -730,8 +914,19 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     func endDriveMode() {
+        stopDriveModeActivity(rememberOff: true)
+    }
+
+    /// A board session ending must remove its stale system surface, but it is not the same choice
+    /// as switching the counter off. Preserve the preference so the next ready foreground session
+    /// starts the counter again.
+    private func suspendDriveModeForLinkEnd() {
+        stopDriveModeActivity(rememberOff: false)
+    }
+
+    private func stopDriveModeActivity(rememberOff: Bool) {
         driveLinkGrace?.invalidate(); driveLinkGrace = nil   // no pending auto-end to fire later
-        DriveModeState.wanted = false   // deliberate off: do not resume this at the next launch
+        if rememberOff { setDriveModeWanted(false) }
         driveModeOn = false
         liveActivity.end()
         writeWidgetSummary(force: true)   // reflect "not connected / drive off" on the home widget
@@ -769,19 +964,24 @@ final class BLEManager: NSObject, ObservableObject {
     private func driveModeGraceExpired() {
         driveLinkGrace?.invalidate(); driveLinkGrace = nil
         guard driveModeOn, connectionState != .connected, !demoMode else { return }
-        endDriveMode()
+        suspendDriveModeForLinkEnd()
     }
 
     /// Re-sync Drive mode with reality when the app returns to the foreground: adopt an
     /// activity started by the Control Center toggle, and turn the flag off if the Live
     /// Activity was ended (the in-activity End button, the toggle, or a swipe-away).
     func reconcileDriveMode() {
+        // Pick up an intent change made while backgrounded (the in-activity End button or the
+        // Control Center toggle write DriveModeState.wanted directly), so the settings toggle
+        // reflects it on return.
+        driveModeWanted = DriveModeState.wanted
         liveActivity.dropIfInactive()
         if liveActivity.adoptExisting() {
             driveModeOn = true
             liveActivity.update(liveState())
             startLocationIfNeeded()
-        } else if DriveModeState.wanted, liveActivity.isAvailable {
+        } else if DriveModeState.wanted, liveActivity.isAvailable,
+                  sessionWasReady || demoMode {
             // No activity running, but the user never turned Drive mode off - so this is the
             // relaunch case: willTerminate ended the activity, and the intent outlived it.
             // Re-create the surface. This is the only path that reads `wanted`; every way of
@@ -982,11 +1182,25 @@ final class BLEManager: NSObject, ObservableObject {
     /// which empty state to print: an unexplained blank there reads as a clean bill of health.
     /// Reading authorizationStatus does not prompt and does not start the radio.
     var locationAuthorized: Bool {
-        switch locationManager.authorizationStatus {
+        switch locationAuthorizationStatus {
         case .authorizedWhenInUse, .authorizedAlways: return true
         default: return false
         }
     }
+
+    /// True when the user (or MDM) has explicitly shut location off - the map's "permission is
+    /// off" empty state, which needs an Open Settings pointer. Distinct from .notDetermined,
+    /// where the honest message is "nothing located yet", not "you turned this off".
+    /// Reading authorizationStatus does not prompt and does not start the radio.
+    var locationDenied: Bool {
+        switch locationAuthorizationStatus {
+        case .denied, .restricted: return true
+        default: return false
+        }
+    }
+
+    var locationRestricted: Bool { locationAuthorizationStatus == .restricted }
+    var bluetoothRestricted: Bool { CBManager.authorization == .restricted }
 
     /// Phone's last known coordinate - used to center the no-GPS RSSI ring. Falls back to
     /// CoreLocation's cached fix, so browsing history while disconnected still has a center now
@@ -1188,12 +1402,26 @@ final class BLEManager: NSObject, ObservableObject {
         UserDefaults.standard.set(Int(approxSeenSeq), forKey: approxSeenSeqKey)
     }
 
-    /// Clear the baseline so every detection counts as New again.
+    /// First-run baseline for the New dots. The first time the log is ever opened, treat whatever
+    /// is already stored as seen, so a fresh install (or a first offline backlog) does not paint a
+    /// dot on every row. Once-only, guarded by a persisted flag; from then on the watermark
+    /// advances each time the user leaves the Log tab (see MainTabView.onChange(of: tab)), so a New
+    /// dot always means "arrived since you last looked". Mirrors Android's seedSeenWatermarkOnce.
+    func seedSeenWatermarkOnce() {
+        guard !UserDefaults.standard.bool(forKey: seenWatermarkSeededKey) else { return }
+        markAllSeen()
+        UserDefaults.standard.set(true, forKey: seenWatermarkSeededKey)
+    }
+
+    /// Clear the baseline so every detection counts as New again. Also re-arms the first-open
+    /// seed, so a deliberate "show me everything as new" reset is not silently undone the next
+    /// time the Log opens.
     func clearSeenWatermark() {
         seenWatermark = nil
         approxSeenSeq = 0   // pseudo-band baseline back to "nothing marked seen" too
         UserDefaults.standard.removeObject(forKey: watermarkKey)
         UserDefaults.standard.removeObject(forKey: approxSeenSeqKey)
+        UserDefaults.standard.removeObject(forKey: seenWatermarkSeededKey)
     }
 
     /// Has this detection been seen yet? New means first heard after the watermark
@@ -1502,6 +1730,69 @@ final class BLEManager: NSObject, ObservableObject {
         let firstSeen: Date?
         let loc: CLLocationCoordinate2D?
         let basis: TimeBasis
+
+        /// Standard log exports may fall back to a non-drone wire coordinate: for those rows the
+        /// protocol defines `d.coordinate` as detector GPS. A bounded contribution must not. Its
+        /// timestamp names one exact in-window sighting, so an older/session-wide coordinate would
+        /// falsely claim to describe that sighting when no matching capture-local phone fix exists.
+        let allowDetectionCoordinateFallback: Bool
+
+        init(d: Detection, firstSeen: Date?, loc: CLLocationCoordinate2D?, basis: TimeBasis,
+             allowDetectionCoordinateFallback: Bool = true) {
+            self.d = d
+            self.firstSeen = firstSeen
+            self.loc = loc
+            self.basis = basis
+            self.allowDetectionCoordinateFallback = allowDetectionCoordinateFallback
+        }
+    }
+
+    /// One immutable Log export view. `detections` is a coalesced SwiftUI projection and cannot
+    /// define an evidence export: ingest can update `store` and its timing/location side tables
+    /// before the next published frame. Capture every row and its NEW verdict together on the
+    /// callback thread, then filter and render only this value.
+    struct DetectionExportSnapshot {
+        let rows: [CSVRowInput]
+        let unseenIDs: Set<String>
+        private let rowByID: [String: CSVRowInput]
+
+        init(rows: [CSVRowInput], unseenIDs: Set<String>) {
+            self.rows = rows
+            self.unseenIDs = unseenIDs
+            self.rowByID = Dictionary(uniqueKeysWithValues: rows.map { ($0.d.id, $0) })
+        }
+
+        var detections: [Detection] { rows.map(\.d) }
+        var ids: Set<String> { Set(rows.map { $0.d.id }) }
+
+        func basis(for id: String) -> TimeBasis? {
+            rowByID[id]?.basis
+        }
+
+        func filtered(category: String?, unseenOnly: Bool, offlineOnly: Bool) -> DetectionExportSnapshot {
+            let kept = rows.filter { row in
+                (category == nil || row.d.type.category == category)
+                    && (!unseenOnly || unseenIDs.contains(row.d.id))
+                    && (!offlineOnly || row.d.offline)
+            }
+            let keptIDs = Set(kept.map { $0.d.id })
+            return DetectionExportSnapshot(rows: kept, unseenIDs: unseenIDs.intersection(keptIDs))
+        }
+    }
+
+    /// Snapshot the authoritative Log plus every side-table field used by CSV/GPX. All BLE
+    /// callbacks and UI actions arrive on the main queue, so this is one non-interleavable pass.
+    func detectionExportSnapshot() -> DetectionExportSnapshot {
+        let ordered = store.values
+            .map { (d: $0, t: (lastSeen[$0.id] ?? .distantPast).timeIntervalSinceReferenceDate) }
+            .sorted { $0.t > $1.t }
+            .map(\.d)
+        let rows = ordered.map { d in
+            CSVRowInput(d: d, firstSeen: firstSeenAt[d.id], loc: capturedLoc[d.id],
+                        basis: timeBasis(for: d.id))
+        }
+        return DetectionExportSnapshot(rows: rows,
+                                       unseenIDs: Set(ordered.lazy.filter { self.isUnseen($0) }.map(\.id)))
     }
 
     /// CSV of the current log: when, what, and where for each detection. "Where" is
@@ -1554,7 +1845,9 @@ final class BLEManager: NSObject, ObservableObject {
             // for the same reason the drone columns below are: on a drone row that field is the
             // AIRCRAFT's Remote ID broadcast, so ungated it exported the aircraft as the observer
             // and made approx_lat identical to drone_lat. Matches Android mapCoordForExport.
-            let coord = r.loc ?? (d.type == .drone ? nil : d.coordinate)
+            let fallback = r.allowDetectionCoordinateFallback && d.type != .drone
+                ? d.coordinate : nil
+            let coord = r.loc ?? fallback
             let lat = coord.map { String(format: "%.6f", $0.latitude) } ?? ""
             let lon = coord.map { String(format: "%.6f", $0.longitude) } ?? ""
             // Drone Remote ID telemetry, all blank for a non-drone row. approx_lat/lon above is
@@ -1574,15 +1867,21 @@ final class BLEManager: NSObject, ObservableObject {
             // Kept byte-identical to Android's detectionsCsv.
             let isDrone = d.type == .drone
             let dc = isDrone ? d.coordinate : nil, pc = isDrone ? d.pilotCoordinate : nil
-            rows.append([csvSafe(when), r.basis.csvToken, r.basis.csvPrecisionSec,
-                         csvSafe(d.type.label), d.mac, "\(d.rssi)",
-                         d.source.label, d.method.label, "\(d.confidence)",
-                         "\(d.count)", lat, lon, d.companyIdHex ?? "",
-                         csvSafe(d.uasID ?? ""), f6(dc?.latitude), f6(dc?.longitude),
-                         iStr(d.altitude), iStr(d.speedH), iStr(d.heading), iStr(d.heightAGL),
-                         f6(pc?.latitude), f6(pc?.longitude), iStr(d.pilotAlt),
-                         csvSafe(d.ridStatusLabel ?? ""),
-                         csvSafe(d.maker ?? "")].joined(separator: ","))
+            // Serialize EVERY cell through the one document-aware encoder. Several fields are
+            // numeric or protocol-shaped today, but keeping a hand-picked "safe" subset is a
+            // brittle privacy boundary: the moment an external field accepts a record separator,
+            // later location columns can shift before redaction sees them.
+            // csvUntrustedText on mac too: it is decoded off the wire as a free string, so an
+            // impostor board can put "=cmd(...)" in it. A real MAC is untouched. Mirrors Android.
+            let fields = [when, r.basis.csvToken, r.basis.csvPrecisionSec,
+                          d.type.label, Self.csvUntrustedText(d.mac), "\(d.rssi)",
+                          d.source.label, d.method.label, "\(d.confidence)",
+                          "\(d.count)", lat, lon, d.companyIdHex ?? "",
+                          csvUntrustedText(d.uasID ?? ""), f6(dc?.latitude), f6(dc?.longitude),
+                          iStr(d.altitude), iStr(d.speedH), iStr(d.heading), iStr(d.heightAGL),
+                          f6(pc?.latitude), f6(pc?.longitude), iStr(d.pilotAlt),
+                          d.ridStatusLabel ?? "", csvUntrustedText(d.maker ?? "")]
+            rows.append(fields.map(csvSafe).joined(separator: ","))
         }
         return rows.joined(separator: "\n")
     }
@@ -1666,7 +1965,9 @@ final class BLEManager: NSObject, ObservableObject {
             // labelled "Position is where the PHONE was", the exact inversion of the honesty rule
             // this writer exists to enforce. Its real position gets its own waypoint below.
             // Matches Android detectionsGpx.
-            if let c = r.loc ?? (d.type == .drone ? nil : d.coordinate) {
+            let fallback = r.allowDetectionCoordinateFallback && d.type != .drone
+                ? d.coordinate : nil
+            if let c = r.loc ?? fallback {
                 wpt(lat: c.latitude, lon: c.longitude,
                     name: "Heard: \(label)",
                     desc: "Position is where the PHONE was, not the device. "
@@ -1707,52 +2008,182 @@ final class BLEManager: NSObject, ObservableObject {
         var ext: String { self == .csv ? "csv" : "gpx" }
     }
 
+    enum DetectionExportResult {
+        case success(URL)
+        case emptyGPX
+        case failure(String)
+    }
+
     /// `category` is a DeviceType.category key (ALPR / DRONE / BODY CAM / TRACKER), or nil for
     /// everything. Callers pass the filter the user is already looking at in the log, so export
     /// means "give me what is on screen" rather than silently handing over the whole history.
     /// The chosen category also lands in the FILENAME, so a partial export can never be mistaken
     /// for a complete one after it leaves the app.
-    func writeDetections(_ format: ExportFormat, category: String? = nil,
-                         completion: @escaping (URL?) -> Void) {
-        let snapshot = detections
-            .filter { category == nil || $0.type.category == category }
-            .map { d in
-                CSVRowInput(d: d, firstSeen: firstSeenAt[d.id], loc: capturedLoc[d.id],
-                            basis: timeBasis(for: d.id))
-            }
+    // MARK: - Bounded contribution capture window
+
+    private static func ms(_ d: Date?) -> Int64? { d.map { Int64($0.timeIntervalSince1970 * 1000) } }
+
+    /// Arm a bounded contribution's live-sighting ledger. The session store remains authoritative
+    /// for the normal Log, but cannot define this artifact because it also contains replayed rows
+    /// and devices last heard before Start.
+    func beginContributionCapture(startMs: Int64) {
+        contributionCaptureStartMs = startMs
+        contributionLiveSamples.removeAll(keepingCapacity: true)
+    }
+
+    /// Abandon any capture-only location state. Review owns a fully rendered CSV, so nothing in
+    /// this table is needed after Stop.
+    func cancelContributionCapture() {
+        contributionCaptureStartMs = nil
+        contributionLiveSamples.removeAll(keepingCapacity: true)
+    }
+
+    /// Record the phone position paired with this exact live sighting. A nil coordinate is still
+    /// a real sample and intentionally replaces an earlier fix: exporting the older position next
+    /// to the newer timestamp would claim they described the same observation.
+    private func recordContributionObservation(_ d: Detection, observedAt: Date,
+                                               observerLocation: CLLocationCoordinate2D?) {
+        guard let startMs = contributionCaptureStartMs else { return }
+        let observedAtMs = Self.ms(observedAt)!
+        guard observedAtMs >= startMs else { return }
+        contributionLiveSamples[d.id] = ContributionLiveSample(
+            detection: d, observedAtMs: observedAtMs, coordinate: observerLocation)
+    }
+
+    /// Device ID -> latest in-window LIVE sighting. This bypasses the coalesced `@Published`
+    /// projection without admitting offline replay records from the broader session store.
+    func windowObservationTimes(startMs: Int64, stopMs: Int64) -> [String: Int64] {
+        guard contributionCaptureStartMs == startMs else { return [:] }
+        return Dictionary(uniqueKeysWithValues: contributionLiveSamples.compactMap { id, sample in
+            guard sample.observedAtMs >= startMs, sample.observedAtMs <= stopMs else { return nil }
+            return (id, sample.observedAtMs)
+        })
+    }
+
+    /// Live count while capturing. Review uses the frozen timestamp map captured at Stop.
+    func windowObservationCount(startMs: Int64, stopMs: Int64) -> Int {
+        windowObservationTimes(startMs: startMs, stopMs: stopMs).count
+    }
+
+    /// The one atomic Stop result. CoreBluetooth and the Stop action both run on the main thread,
+    /// so no ingest can interleave between membership, row fields, timestamps, and the capture-
+    /// local observer coordinate. Rows are sorted for deterministic CSV output.
+    struct ContributionCaptureSnapshot {
+        let capturedAtByID: [String: Int64]
+        let rows: [CSVRowInput]
+    }
+
+    func finishContributionCapture(startMs: Int64, stopMs: Int64) -> ContributionCaptureSnapshot {
+        let times = windowObservationTimes(startMs: startMs, stopMs: stopMs)
+        let rows = contributionLiveSamples.compactMap { id, sample -> CSVRowInput? in
+            guard let capturedAt = times[id], sample.observedAtMs == capturedAt else { return nil }
+            return CSVRowInput(d: sample.detection,
+                               firstSeen: Date(timeIntervalSince1970: Double(capturedAt) / 1000),
+                               loc: sample.coordinate, basis: .exact,
+                               allowDetectionCoordinateFallback: false)
+        }.sorted {
+            let l = times[$0.d.id] ?? 0, r = times[$1.d.id] ?? 0
+            return l == r ? $0.d.id < $1.d.id : l > r
+        }
+        cancelContributionCapture()
+        return ContributionCaptureSnapshot(capturedAtByID: times, rows: rows)
+    }
+
+    /// The pure formatting leg (buildCSV + redact): no manager state, safe on any thread.
+    /// Three separate location flags - observer (the phone), drone AIRCRAFT coords, and drone
+    /// OPERATOR coords - because the operator position locates a person (see ContributionCsv).
+    static func renderContributionCSV(_ snapshot: [CSVRowInput],
+                                      includeObserverLocation: Bool, includeDroneLocation: Bool,
+                                      includeOperatorLocation: Bool) -> String {
+        let csv = buildCSV(snapshot)
+        return ContributionCsv.redact(csv, blankColumns: ContributionCsv.blankColumns(
+            includeObserverLocation: includeObserverLocation,
+            includeDroneLocation: includeDroneLocation,
+            includeOperatorLocation: includeOperatorLocation))
+    }
+
+    #if DEBUG
+    /// Regression hook: seed the authoritative store without publishing its UI projection and,
+    /// when armed, model the matching live ledger write. This pins both the coalescing regression
+    /// and the capture-local observer-position contract without exposing production mutators.
+    func testSeedContributionDetection(_ d: Detection, firstSeen: Date, lastSeen: Date,
+                                       observerLocation: CLLocationCoordinate2D? = nil) {
+        store[d.id] = d
+        firstSeenAt[d.id] = firstSeen
+        self.lastSeen[d.id] = lastSeen
+        if contributionCaptureStartMs != nil, !d.isHistory {
+            recordContributionObservation(d, observedAt: lastSeen,
+                                           observerLocation: observerLocation)
+        }
+    }
+    #endif
+
+    func writeDetections(_ format: ExportFormat, snapshot: DetectionExportSnapshot,
+                         filenameQualifier: String? = nil,
+                         completion: @escaping (DetectionExportResult) -> Void) {
         // Not persistQueue: that serial queue can be mid-checkpoint during a big replay, and
         // a user-initiated export shouldn't wait its turn behind a multi-MB store encode.
         DispatchQueue.global(qos: .userInitiated).async {
-            let body = format == .csv ? BLEManager.buildCSV(snapshot) : BLEManager.buildGPX(snapshot)
+            let body = format == .csv ? BLEManager.buildCSV(snapshot.rows) : BLEManager.buildGPX(snapshot.rows)
             // A GPX with no waypoints is a valid 125-byte document that maps nothing, and handing
             // that to a share sheet looks like the export silently failed. It happens whenever the
             // selected rows have no GPS fix: a detection heard with location off, or before the
             // first fix, still exports fine as CSV (blank approx columns) but has nothing to plot.
             // Report it as a failure so the UI can say WHY, rather than shipping an empty map.
             if format == .gpx && !body.contains("<wpt ") {
-                DispatchQueue.main.async { completion(nil) }
+                DispatchQueue.main.async { completion(.emptyGPX) }
                 return
             }
-            let slug = category.map { "-" + $0.lowercased().replacingOccurrences(of: " ", with: "-") } ?? ""
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent("acab-detections\(slug).\(format.ext)")
+            let slug = filenameQualifier.map {
+                "-" + $0.lowercased().replacingOccurrences(of: " ", with: "-")
+            } ?? ""
+            // A share extension may read the URL long after this callback returns. A fixed temp
+            // filename lets a second export overwrite the bytes behind the first open share sheet
+            // or mail draft. Give every export an immutable UUID parent while preserving the
+            // human-readable leaf name recipients see. Successful dirs intentionally live until
+            // iOS reclaims temporaryDirectory; deleting them here or on sheet dismissal can race
+            // an activity that retained the file provider URL.
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            let url = dir.appendingPathComponent("acab-detections\(slug).\(format.ext)")
             // write as Data with completeFileProtection: the GPS+MAC file must stay unreadable while
             // the phone is locked. String.write(to:atomically:encoding:) applies NO data protection,
             // so it was readable on a seized locked phone. The strict class is fine here (unlike the
             // checkpoint's UnlessOpen): exporting only happens with the phone unlocked in hand.
-            let ok = (try? Data(body.utf8).write(to: url, options: [.atomic, .completeFileProtection])) != nil
-            DispatchQueue.main.async { completion(ok ? url : nil) }
+            do {
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                try Data(body.utf8).write(to: url, options: [.atomic, .completeFileProtection])
+                DispatchQueue.main.async { completion(.success(url)) }
+            } catch {
+                try? FileManager.default.removeItem(at: dir)
+                DispatchQueue.main.async { completion(.failure(error.localizedDescription)) }
+            }
         }
     }
 
-    /// Back-compat shim for existing callers. Same behaviour as before: whole log, CSV.
-    func writeDetectionsCSV(completion: @escaping (URL?) -> Void) {
-        writeDetections(.csv, category: nil, completion: completion)
+    /// Convenience for a whole-log export. It still snapshots the authoritative store rather than
+    /// the delayed SwiftUI projection.
+    func writeDetections(_ format: ExportFormat, category: String? = nil,
+                         completion: @escaping (DetectionExportResult) -> Void) {
+        let snapshot = detectionExportSnapshot().filtered(category: category,
+                                                          unseenOnly: false, offlineOnly: false)
+        writeDetections(format, snapshot: snapshot, filenameQualifier: category, completion: completion)
     }
 
-    private static func csvSafe(_ s: String) -> String {
-        (s.contains(",") || s.contains("\"") || s.contains("\n"))
-            ? "\"\(s.replacingOccurrences(of: "\"", with: "\"\""))\"" : s
+    /// Use the same document-aware field serializer the redactor tests. Delegating here is
+    /// load-bearing: a lone carriage return is a CSV record separator too, so the old local
+    /// comma/quote/LF-only rule could emit an unquoted UAS ID that shifted later location columns
+    /// into a new physical record before redaction saw them.
+    private static func csvSafe(_ s: String) -> String { ContributionCsv.field(s) }
+
+    /// Spreadsheet applications may interpret an externally supplied text cell as a formula even
+    /// when RFC 4180 quoting is correct. Preserve the broadcast text, but make it literal by adding
+    /// one apostrophe when the first non-space/tab character is a formula sigil. This is export-only:
+    /// structural CSV parsing and numeric evidence cells must remain unchanged.
+    static func csvUntrustedText(_ s: String) -> String {
+        let first = s.drop(while: { $0 == " " || $0 == "\t" }).first
+        guard let first, "=+-@".contains(first) else { return s }
+        return "'" + s
     }
 
     /// Toggle the board's ALPR (Flock) detector (on by default).
@@ -1882,12 +2313,23 @@ final class BLEManager: NSObject, ObservableObject {
 
     /// Restore the pre-Desert alert mode when Desert ends WITHOUT going through setDesertMode(off).
     ///
-    /// Desert is the one toggle with no NVS backing (desert_detect.cpp: a plain `static bool`), so
-    /// any board reboot comes back with it off. The Settings toggle just follows the status frame
-    /// (SettingsView: `desertOn = s.desertMode`), which means the restore branch in setDesertMode
-    /// never ran for the single most common way Desert ends. The board's Silent IS persisted
-    /// (buzz=false in its NVS), so the result was a board left permanently mute after a power
-    /// cycle, which reads as "my starred device stopped beeping" and is not a detection fault.
+    /// HISTORY, because the rationale changed under this code. Desert USED TO BE the one toggle
+    /// with no NVS backing (desert_detect.cpp held a plain `static bool`), so any board reboot came
+    /// back with it off. The Settings toggle only follows the status frame (SettingsView:
+    /// `desertOn = s.desertMode`), so the restore branch in setDesertMode never ran for the single
+    /// most common way Desert ended, and because the board's Silent IS persisted (buzz=false in its
+    /// NVS) the board was left permanently mute after a power cycle. That reads as "my starred
+    /// device stopped beeping" and is not a detection fault.
+    ///
+    /// Firmware from 2026-08-08 PERSISTS Desert (desertRestoreEnabled), so a reboot no longer ends
+    /// it behind our back and that specific bug cannot recur on current firmware. This is kept
+    /// deliberately and must not be deleted as dead code:
+    ///   - boards already in the field still run the non-persisting build and this app pairs with
+    ///     them,
+    ///   - a factory reset or NVS wipe still clears it,
+    ///   - Desert can still end without passing through setDesertMode(off) from another client.
+    /// The condition it guards, "Desert stopped and we are not the ones who stopped it", is
+    /// unchanged. What changed is only how often it fires.
     private func reconcileDesert(_ s: DeviceStatus) {
         if s.desertMode { desertSeenOn = true; return }
         guard desertSeenOn else { return }        // never saw it on: nothing to restore
@@ -2017,10 +2459,41 @@ final class BLEManager: NSObject, ObservableObject {
     /// BLEManager+NrfDFU extension, which can't reach the private writeConfig itself.
     func nrfSendDfuTrigger() { writeConfig(["nrfdfu": true]) }
 
+    /// Ask the beacon to power off (rev-B). The board deep-sleeps and drops the link ITSELF. We do
+    /// NOT flag the disconnect here: the board answers with a {"pwr":"off"} notify only when it is
+    /// really about to drop, and `handlePwrNotify` arms `intentionalDisconnectID` on THAT. Arming on
+    /// the confirmation rather than on this request is what stops a board that ignores the key (older
+    /// firmware still reporting rev "B", or a write lost on the wire) from leaving the flag armed to
+    /// mis-classify a later unrelated disconnect. Once off, only a physical ~2s button hold wakes it.
+    func powerOffBeacon() {
+        guard canWriteConfig else { return }
+        writeConfig(["poweroff": true])
+    }
+
+    /// Intercept the board's {"pwr":"off"} shutdown heads-up on the OTA notify channel. The board
+    /// sends it only when it is genuinely about to deep-sleep - a physical button-hold OR an app
+    /// power-off - so flag the coming drop as intentional here, exactly as `disconnect()` does;
+    /// didDisconnectPeripheral then treats it as a clean teardown (no error banner, no auto-reconnect)
+    /// instead of a supervision-timeout loss. Returns true if it consumed the frame; a board that
+    /// never powers off never sends this, so the flag is never armed against one that keeps running.
+    func handlePwrNotify(_ data: Data) -> Bool {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (obj["pwr"] as? String) == "off" else { return false }
+        intentionalDisconnectID = peripheral?.identifier
+        return true
+    }
+
     /// The live peripheral + OTA characteristic, or nil when we don't have a usable link.
     var otaLink: (peripheral: CBPeripheral, char: CBCharacteristic)? {
-        guard let peripheral, let otaChar else { return nil }
+        guard otaCapable, let peripheral, let otaChar, otaChar.isNotifying else { return nil }
         return (peripheral, otaChar)
+    }
+
+    /// Identity of the board that can currently receive Config writes. The nRF updater uses this
+    /// to bind its download and DFU trigger to the board that initiated the operation.
+    var currentConfigPeripheralID: UUID? {
+        guard canWriteConfig, let peripheral else { return nil }
+        return peripheral.identifier
     }
 
     /// The board's current fw label ("beacon board" etc.), for the post-reboot version check.
@@ -2069,9 +2542,40 @@ final class BLEManager: NSObject, ObservableObject {
     }
     /// Reconnect to the peripheral we already hold (used after an OTA reboot).
     func otaReconnectPeripheral() {
-        guard let peripheral else { return }
+        guard let central, let peripheral,
+              otaOwnerPeripheralID == peripheral.identifier else { return }
         peripheral.delegate = self
         central.connect(peripheral, options: nil)
+    }
+
+    /// The post-flash reconnect exhausted its overall timeout. A pending CoreBluetooth connect
+    /// does not promise a terminal callback when cancelled, so settle the link synchronously as
+    /// well as failing the update. Leaving the retained peripheral and stale characteristics in
+    /// place would keep the app looking connected and let a later callback revive dead state.
+    func otaRebootReconnectTimedOut(ownerID: UUID, reason: String) {
+        guard let target = peripheral, target.identifier == ownerID else {
+            cancelUpdatesForLinkTeardown(reason: reason)
+            return
+        }
+        central?.cancelPeripheralConnection(target)
+        stopStatusPolling()
+        checkpointLive()
+        cancelUpdatesForLinkTeardown(reason: reason)
+        intentionalDisconnectID = nil
+        peripheral = nil
+        configChar = nil
+        otaChar = nil
+        otaCapable = false
+        connectedName = nil
+        status = nil
+        syncingOfflineLog = false
+        histResyncs = 0
+        sessionWasReady = false
+        reconnectTarget = nil
+        connectionState = (central?.state == .poweredOn) ? .idle : .unknown
+        if driveModeOn { suspendDriveModeForLinkEnd() }
+        writeWidgetSummary(force: true)
+        stopLocationIfIdle()
     }
 
     /// Push the phone's GPS to the board so a Mesh-Detect uplink can carry where we
@@ -2362,6 +2866,17 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
+    /// Checkpoint-boundary twin of the wire-side `at` clamp in Detection.init(from:). A file
+    /// written by a build BEFORE that clamp can carry a poisoned Date (the wire `at` was decoded
+    /// unchecked and checkpointed), and StoredRow's own Date fields never pass through
+    /// Detection.init(from:), so the load path must guard them itself or the poisoned stamp
+    /// reaches the same trapping Int conversions the wire clamp exists to protect.
+    private static func sanitizedStoredDate(_ d: Date?) -> Date? {
+        guard let d else { return nil }
+        let t = d.timeIntervalSince1970
+        return t.isFinite && (0...4_294_967_295).contains(t) ? d : nil
+    }
+
     /// Populate the store from a decoded, capped, recency-sorted batch. MAIN THREAD only (the store
     /// is main-confined; CB runs queue: nil). Split out of loadPersistedDetections so the heavy
     /// decode + sort can run off-main without moving store access off it.
@@ -2375,11 +2890,14 @@ final class BLEManager: NSObject, ObservableObject {
             // data; the load almost always lands first, so this only matters for that rare race.
             if store[d.id] != nil { continue }
             store[d.id] = d
-            if let f = r.firstSeen { firstSeenAt[d.id] = f }
-            if let l = r.lastSeen { lastSeen[d.id] = l }
-            if let b = r.timeBasis, let s = r.basisStamp {
+            // Clamped, not raw: see sanitizedStoredDate. A poisoned stamp is dropped entirely,
+            // which degrades the row to "time unknown" instead of a crash-on-open.
+            let rowFirstSeen = Self.sanitizedStoredDate(r.firstSeen)
+            if let f = rowFirstSeen { firstSeenAt[d.id] = f }
+            if let l = Self.sanitizedStoredDate(r.lastSeen) { lastSeen[d.id] = l }
+            if let b = r.timeBasis, let s = Self.sanitizedStoredDate(r.basisStamp) {
                 histBasis[d.id] = HistoryStamp(stamp: s, boot: r.basisBoot, seq: r.basisSeq ?? 0, basis: b)
-            } else if d.offline, let f = r.firstSeen, !isApproxTime(f) {
+            } else if d.offline, let f = rowFirstSeen, !isApproxTime(f) {
                 // A row checkpointed before TimeBasis existed carries no basis, and leaving
                 // histBasis empty makes timeBasis(for:) fall through isApproxTime to .exact,
                 // labelling a board-derived time as a phone-clock measurement. Its instant IS real
@@ -2447,7 +2965,10 @@ final class BLEManager: NSObject, ObservableObject {
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let phase = obj["hist"] as? String {
             if phase == "begin" {
-                offlineSyncTotal = (obj["n"] as? Int) ?? 0
+                // Clamp to the uint32 wire range: n and the derived arithmetic (promised -
+                // expected in handleHistEnd) must stay overflow-safe against an impostor board
+                // sending Int.max/Int.min.
+                offlineSyncTotal = min(4_294_967_295, max(0, (obj["n"] as? Int) ?? 0))
                 if offlineSyncTotal > 0 { syncingOfflineLog = true }   // a real replay is starting
                 // "from" = the first seq this drain will send (gDrain+1 on the board). After a
                 // board-side buffer wipe or key change the board's seq generation resets low, so a
@@ -2458,8 +2979,10 @@ final class BLEManager: NSObject, ObservableObject {
                 // Guarded by from-1 < lastGoodSeq, so only a reset moves it (a normal reconnect or a
                 // gap resync asks to sync from the cursor, i.e. from-1 == lastGoodSeq, no change).
                 // Older firmware omits "from"; then leave the handshake's cursors untouched.
-                if let from = obj["from"] as? Int, from >= 1 {
-                    let rebased = UInt32(from - 1)
+                // UInt32(exactly:), like the seq read below: a hostile from = 2^32+1 passes the
+                // >= 1 guard and the plain narrowing traps.
+                if let from = obj["from"] as? Int, from >= 1,
+                   let rebased = UInt32(exactly: from - 1) {
                     if rebased < lastGoodSeq {
                         lastGoodSeq = rebased
                         histHighestSeq = rebased   // clean-end cursor advances to this; must drop too
@@ -2467,7 +2990,8 @@ final class BLEManager: NSObject, ObservableObject {
                     }
                 }
             } else if phase == "end" {
-                handleHistEnd(expected: (obj["n"] as? Int) ?? histReceived)
+                // Same uint32 clamp as begin: keeps promised - expected inside safe Int range.
+                handleHistEnd(expected: min(4_294_967_295, max(0, (obj["n"] as? Int) ?? histReceived)))
             }
             return
         }
@@ -2515,15 +3039,20 @@ final class BLEManager: NSObject, ObservableObject {
             // Replayed buffered record: file it with its original time, no alert.
             ingestHistory(d, firstTime: firstTime)
         } else {
+            // One clock read names this live sighting everywhere. Stop deliberately pairs ledger
+            // row, lastSeen, and observer fix at this exact instant; separate Date() calls can
+            // straddle a millisecond boundary and erase a valid capture-local fix.
+            let observedAt = Date()
             if firstTime {                   // first sighting: stamp time and place
-                firstSeenAt[d.id] = Date()
+                firstSeenAt[d.id] = observedAt
                 capturedLoc[d.id] = freshCoord   // no location beats a stale one on the map and in the CSV
                 bestRssi[d.id] = d.rssi           // baseline the closest-approach pin chases from here
-            } else if d.coordinate == nil, let coord = freshCoord {
-                // Closest-approach pin (capturedLoc fallback only; drones keep their own broadcast
-                // coordinate, so they never reach here). Two DIFFERENT jobs, and conflating them
-                // used to lose the pin entirely: ACQUIRING a first position for a device that has
-                // none, and REFINING one it already has.
+            } else if let coord = freshCoord {
+                // `capturedLoc` is the PHONE/observer position and is independent of d.coordinate.
+                // A drone's d.coordinate is the AIRCRAFT's Remote ID broadcast; it must not block
+                // acquiring a later phone fix for approx_lat/lon after the first sighting arrived
+                // without one. Two DIFFERENT jobs live here: ACQUIRING a first observer position
+                // for any detection, and REFINING a non-drone fallback pin at closest approach.
                 //
                 // Acquisition can't be gated on the hysteresis. capturedLoc is a dictionary of
                 // non-optional values, so stamping it with a nil freshCoord above leaves the key
@@ -2533,20 +3062,24 @@ final class BLEManager: NSObject, ObservableObject {
                 // roughly-stationary device never does. It simply never showed on the map.
                 let smoothed = smoothedRssi(for: d.id, fallback: d.rssi)
                 if capturedLoc[d.id] == nil {
-                    // Acquire: the first fresh fix for a device we had no position for.
+                    // Acquire for EVERY type, including a drone that already has aircraft coords.
                     capturedLoc[d.id] = coord
                     bestRssi[d.id] = smoothed
-                } else if let best = bestRssi[d.id], smoothed >= best + 4 {
+                } else if d.coordinate == nil, let best = bestRssi[d.id], smoothed >= best + 4 {
                     // Refine: only MOVE an existing pin. A stronger sighting means we are
                     // physically nearer, so the pin chases where we heard it best. The 4 dB gate
-                    // is hysteresis: RSSI wobbles a few dB at rest, and without it the pin would
-                    // jitter on noise alone.
+                    // is hysteresis: RSSI wobbles a few dB at rest. Any row with its own coordinate
+                    // maps there instead, so its independently captured observer fix need not
+                    // chase signal strength once acquired. A no-position drone still refines the
+                    // observer fallback exactly as before.
                     capturedLoc[d.id] = coord
                     bestRssi[d.id] = smoothed
                 }
             }
             store[d.id] = d
-            lastSeen[d.id] = Date()
+            lastSeen[d.id] = observedAt
+            recordContributionObservation(d, observedAt: observedAt,
+                                           observerLocation: freshCoord)
         }
 
         if d.type == .drone, let c = d.coordinate {       // grow the drone's flight path
@@ -2911,10 +3444,18 @@ final class BLEManager: NSObject, ObservableObject {
             // when the board actually buffered something, raise the one-shot count banner. A
             // bare reconnect with nothing buffered (expected == 0) clears silently, no banner.
             if offlineSyncCount != histReceived { offlineSyncCount = histReceived }
+            // Third number: begin.n promised vs end.n sent. A shortfall is a record the board
+            // consumed from the ring and skipped (over-MTU), so it is gone and a re-drain cannot
+            // refill it; disclose it in the banner instead of passing received == end.n off as
+            // complete. promised == 0 means the begin sentinel never landed, so no judgement.
+            let promised = offlineSyncTotal
+            let unreplayed = promised > 0 ? max(0, promised - expected) : 0
             syncingOfflineLog = false
             offlineSyncTotal = 0
             histResyncs = 0
-            if expected > 0 { offlineSyncBanner = OfflineSyncSummary(count: expected) }
+            if expected > 0 || unreplayed > 0 {
+                offlineSyncBanner = OfflineSyncSummary(count: expected, unreplayed: unreplayed)
+            }
         } else {
             // Gap: ask the board to replay again from the last good contiguous seq. Stay
             // in the syncing state; a fresh end sentinel will settle it.
@@ -2932,11 +3473,12 @@ final class BLEManager: NSObject, ObservableObject {
         if let s = try? JSONDecoder().decode(DeviceStatus.self, from: data) {
             let previousEnabled = lastPushedEnabled
             status = s
+            nrfHandleStatusUpdate(s)
             otaSawFreshStatus = true      // a frame off THIS link; the post-reboot check keys on it
             bufferingOn = s.bufferingOn   // keep the toggle in step with the board
             ledOn = s.ledEnabled          // same, for the lights-out toggle
             reconcileBuzzer(s)            // and the buzzer, which used to be the one that drifted
-            reconcileDesert(s)            // Desert has no NVS: a board reboot ends it behind our back
+            reconcileDesert(s)            // rare since firmware persists Desert; still needed for older boards / NVS wipe
             // The drive-mode columns follow the board's detector toggles, and the Live Activity is
             // otherwise only pushed from publishDetections(). Without this, flipping a detector did
             // nothing visible until the NEXT detection arrived, which in a quiet area is minutes,
@@ -2966,13 +3508,14 @@ final class BLEManager: NSObject, ObservableObject {
     /// board. Used by the connect screen's "Continue without pairing" and the `-demo`
     /// launch argument in debug builds.
     func seedDemoData() {
+        cancelUpdatesForLinkTeardown(reason: "Update cancelled before entering the demo.")
         // A pending auto-reconnect from an earlier unexpected drop must NOT survive into the tour.
         // If the board re-advertises mid-demo, the armed central.connect fires didConnect, adopts
         // the peripheral over the demo, and its live detection notifies file into (or get dropped
         // by) the sample store, silently losing real hits. Cancel the parked connect and clear the
         // reconnect bookkeeping BEFORE seeding, exactly as disconnect() does. Setting
         // reconnectTarget = nil also clears isReconnecting via its didSet.
-        if let target = reconnectTarget { central.cancelPeripheralConnection(target) }
+        if let target = reconnectTarget { central?.cancelPeripheralConnection(target) }
         reconnectTarget = nil
         // A parked FRESH connect must not survive into the tour either (the connect screen
         // stays reachable while .connecting): if the board turned up mid-demo, the armed
@@ -2980,9 +3523,10 @@ final class BLEManager: NSObject, ObservableObject {
         // handle; didDisconnectPeripheral ignores a peripheral we no longer hold.
         connectTimeoutTimer?.invalidate(); connectTimeoutTimer = nil
         if connectionState == .connecting, let pending = peripheral {
-            central.cancelPeripheralConnection(pending)
+            central?.cancelPeripheralConnection(pending)
             peripheral = nil
         }
+        intentionalDisconnectID = nil
         demoMode = true
         connectionState = .connected
         connectedName = "beacon board"
@@ -2990,7 +3534,7 @@ final class BLEManager: NSObject, ObservableObject {
         // dimmed - the demo forces motorolaSupported precisely to introduce that control, and a
         // dimmed sub-toggle under an off parent defeats the tour. Matches the Android seed.
         status = decodeJSON(DeviceStatus.self, [
-            "fw": "beacon board 2.0.3", "up": 4920, "total": 6, "ble": true, "wifi": true,
+            "fw": "beacon board 2.0.5", "up": 4920, "total": 6, "ble": true, "wifi": true,
             "axon": true, "tracker": true, "glasses": true, "buzzer": true, "vol": 70, "gps": true, "bat": 82,
         ])
         // The sample board is a current one. Without this the tour would read it as pre-split
@@ -2999,9 +3543,9 @@ final class BLEManager: NSObject, ObservableObject {
         motorolaOn = true
         placeDemoDetections(around: lastCoord)       // cluster the sample hits around the user
         demoNeedsRelocate = (lastCoord == nil)       // no fix yet? re-place once one arrives
-        if locationManager.authorizationStatus == .notDetermined {
-            locationManager.requestWhenInUseAuthorization()   // so the map + demo can center on the user
-        }
+        // Demo data already carries Remote ID and canned observer coordinates. Do not surprise a
+        // user who chose the no-hardware tour with a location prompt; an existing grant can still
+        // re-center the samples around them.
         startLocationIfNeeded()   // already-authorized: get a fix so the samples land around the user
     }
 
@@ -3080,7 +3624,23 @@ final class BLEManager: NSObject, ObservableObject {
         // the tour, so this one-tap path used to be the unguarded way to lose a real log.
         resetDetectionState()
         loadPersistedDetections()
-        connectionState = (central.state == .poweredOn) ? .idle : .unknown
+        if let radioState = central?.state {
+            switch radioState {
+            case .poweredOn:    connectionState = .idle
+            case .poweredOff:   connectionState = .poweredOff
+            case .unauthorized: connectionState = .unauthorized
+            default:            connectionState = .unknown
+            }
+        } else {
+            // The no-hardware tour can run before first Bluetooth use. Returning from it must
+            // restore the rationale + CTA, not strand an uninitialized manager on "Starting".
+            switch CBManager.authorization {
+            case .notDetermined:          connectionState = .idle
+            case .denied, .restricted:    connectionState = .unauthorized
+            case .allowedAlways:          initializeCentral()
+            @unknown default:             connectionState = .unknown
+            }
+        }
         stopLocationIfIdle()
         writeWidgetSummary(force: true)   // out of the tour: connected flag + real count restored
     }
@@ -3112,6 +3672,12 @@ extension BLEManager: CBCentralManagerDelegate {
                 armReconnect()
                 break
             }
+            if scanWhenCentralIsReady {
+                scanWhenCentralIsReady = false
+                connectionState = .idle
+                startScan()
+                break
+            }
             let recovering = (connectionState == .poweredOff)
             connectionState = .idle
             // Already used a board this session and Bluetooth is granted? Resume the scan so it
@@ -3128,6 +3694,7 @@ extension BLEManager: CBCentralManagerDelegate {
             clearConnection()
             connectionState = .poweredOff
         case .unauthorized:
+            scanWhenCentralIsReady = false
             clearConnection()
             connectionState = .unauthorized
         default:
@@ -3146,7 +3713,17 @@ extension BLEManager: CBCentralManagerDelegate {
         checkpointLive()   // the session's only copy is in RAM; get it to disk before the link state goes
         stopStatusPolling()
         connectTimeoutTimer?.invalidate(); connectTimeoutTimer = nil
+        // CoreBluetooth may provide no disconnect callback when its radio becomes unavailable.
+        // Retaining any update state here would let a later board inherit this board's transfer or
+        // confirmation. Settle every asynchronous owner before dropping the handle.
+        let wasAwaitingOtaReboot = otaAwaitingReboot != nil
+        cancelUpdatesForLinkTeardown(reason: wasAwaitingOtaReboot
+            ? "Bluetooth became unavailable before the app could confirm the update. Reconnect and check the board's firmware."
+            : "Bluetooth became unavailable during the update. Turn it back on, reconnect, and try again.")
         sessionWasReady = false   // whatever readiness this session had died with the radio
+        intentionalDisconnectID = nil   // there may be no didDisconnect callback to consume it
+        otaQuarantinedPeripheralID = nil
+        nrfQuarantinedPeripheralID = nil
         peripheral = nil
         configChar = nil
         otaChar = nil
@@ -3260,13 +3837,14 @@ extension BLEManager: CBCentralManagerDelegate {
         // would tear the demo out from under the user and file live notifies into the sample store.
         // Drop the connection and leave demo mode intact; the user pairs for real by exiting the tour.
         if demoMode { central.cancelPeripheralConnection(peripheral); return }
-        // Reject a stray connect. After disconnect()/"Stop and scan" we clear reconnectTarget and go
-        // .idle, but a didConnect for the OLD target can already be queued on the main queue and would
-        // re-adopt the board the user just dropped. Only adopt when we're actually expecting a connect:
-        // a fresh scan-connect / pending reconnect (.connecting) or an OTA reboot reconnect. Flag the
-        // resulting didDisconnect as intentional so the cancel tears down instead of re-arming.
-        guard connectionState == .connecting || otaAwaitingReboot != nil else {
-            userDisconnect = true
+        // Global `.connecting` is not identity. A delayed callback from board A may arrive after
+        // the user has started connecting board B, so accept only the exact object held for the
+        // fresh attempt, pending reconnect, or OTA reboot.
+        let fresh = connectionState == .connecting && self.peripheral === peripheral
+        let reconnect = connectionState == .connecting && reconnectTarget === peripheral
+        let ota = otaAwaitingReboot != nil && self.peripheral === peripheral
+            && otaOwnerPeripheralID == peripheral.identifier
+        guard fresh || reconnect || ota else {
             central.cancelPeripheralConnection(peripheral)
             return
         }
@@ -3278,7 +3856,7 @@ extension BLEManager: CBCentralManagerDelegate {
         self.peripheral = peripheral
         peripheral.delegate = self
         connectTimeoutTimer?.invalidate(); connectTimeoutTimer = nil   // the connect resolved
-        reconnectTarget = nil
+        if reconnectTarget === peripheral { reconnectTarget = nil }
         connectedName = peripheral.name ?? ACABProfile.advertisedName
         peripheral.discoverServices([ACABProfile.service])
     }
@@ -3287,11 +3865,23 @@ extension BLEManager: CBCentralManagerDelegate {
                         error: Error?) {
         // A no-timeout pending auto-reconnect shouldn't normally fail, but if the OS reports one for
         // our reconnect target, re-arm rather than silently giving up on the board coming back.
-        if peripheral == reconnectTarget {
+        if reconnectTarget === peripheral {
             armReconnect()
             return
         }
+        guard self.peripheral === peripheral else { return }
         connectTimeoutTimer?.invalidate(); connectTimeoutTimer = nil
+        if otaAwaitingReboot != nil {
+            // The reboot wait owns this exact handle and has its own overall timeout. A transient
+            // failed reconnect should retry rather than clear the handle and strand confirmation.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                guard let self, self.peripheral === peripheral,
+                      self.otaAwaitingReboot != nil else { return }
+                self.otaReconnectPeripheral()
+            }
+            return
+        }
+        guard connectionState == .connecting else { return }
         connectionState = .idle
         connectHint = BLEManager.pairWindowHint
         self.peripheral = nil
@@ -3299,25 +3889,35 @@ extension BLEManager: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
-        stopStatusPolling()   // link is down; a reconnect restarts it in didDiscoverCharacteristicsFor
-        // An OTA in the "rebooting" phase EXPECTS this disconnect (the board just reflashed and
-        // restarted). Kick off the reconnect-and-confirm instead of tearing everything down.
-        if otaHandleDisconnect(peripheral) { return }
         // A disconnect for a peripheral we no longer hold is finished business: the connect
         // timeout / cancel-pending / demo-entry cleanup already cancelled it and settled
         // connectionState inline (a cancelled connect guarantees no didDisconnect, so they
         // couldn't wait for this one). Arming the auto-reconnect below would resurrect a
         // connect the user or the watchdog just tore down. The stray-connect reject in
-        // didConnect cancels a peripheral it never adopted and relies on this callback to
-        // consume its userDisconnect flag - consume it and STOP: the teardown below is scoped
-        // to the ADOPTED session, and running it for a stray used to force connectionState to
+        // didConnect can cancel a peripheral it never adopted. Its later callback must not
+        // consume the adopted session's intentional-disconnect intent: doing so could turn the
+        // current
+        // board's user-requested disconnect into an unexpected drop and reconnect it. Stop here:
+        // the teardown below is scoped to the ADOPTED session. Running it for a stray used to force
+        // connectionState to
         // .idle (and end Drive mode) out from under whatever the app was actually doing, e.g.
         // orphaning a live scan the background park then never stopped (it only parks
         // .scanning), leaving the radio lit indefinitely.
         if self.peripheral !== peripheral {
-            if userDisconnect { userDisconnect = false }
             return
         }
+        if otaQuarantinedPeripheralID == peripheral.identifier {
+            otaQuarantinedPeripheralID = nil
+        }
+        if nrfQuarantinedPeripheralID == peripheral.identifier {
+            nrfQuarantinedPeripheralID = nil
+        }
+        stopStatusPolling()   // link is down; a reconnect restarts it in didDiscoverCharacteristicsFor
+        // An OTA in the "rebooting" phase EXPECTS this disconnect (the board just reflashed and
+        // restarted). Kick off the reconnect-and-confirm instead of tearing everything down.
+        if otaHandleDisconnect(peripheral) { return }
+        cancelUpdatesForLinkTeardown(
+            reason: "The connection to the board was lost during the update. Reconnect and try again.")
         checkpointLive()   // session over: the board buffered nothing while we were connected, so RAM was the only copy
         self.peripheral = nil
         configChar = nil
@@ -3335,16 +3935,16 @@ extension BLEManager: CBCentralManagerDelegate {
         // anything else is an UNEXPECTED drop (the board was unplugged / power-cycled), and THAT is
         // the bug we're fixing: keep the CBPeripheral handle and arm a pending auto-reconnect so the
         // link, widget, and Live Activity resync the instant the board re-advertises - no manual tap.
-        if userDisconnect {
-            userDisconnect = false   // consume the intentional-disconnect flag
+        if intentionalDisconnectID == peripheral.identifier {
+            intentionalDisconnectID = nil   // consume this board's intentional-disconnect target
             reconnectTarget = nil    // and make sure no stale pending reconnect survives
             connectionState = (central.state == .poweredOn) ? .idle : .unknown
             // The user chose to disconnect: there is nothing to reconnect to, so end Drive mode /
             // the Live Activity right now instead of flipping it to "Reconnecting…" and arming the
             // 120s grace (which would leave a stale counter on the Lock Screen for two minutes).
-            // Only the unexpected-drop path below wants the grace. endDriveMode() is a no-op when
-            // Drive mode isn't running.
-            if driveModeOn { endDriveMode() }
+            // Only the unexpected-drop path below wants the grace. End the current activity but
+            // preserve the counter preference for the next ready board session.
+            if driveModeOn { suspendDriveModeForLinkEnd() }
         } else if wasReady {
             reconnectTarget = peripheral   // retain the handle we just lost; a pending connect needs it alive
             // .connecting (not .idle) keeps the UI + the "Reconnecting…" Live Activity truthful, and
@@ -3372,6 +3972,7 @@ extension BLEManager: CBCentralManagerDelegate {
 
 extension BLEManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard self.peripheral === peripheral else { return }
         guard let svc = peripheral.services?.first(where: { $0.uuid == ACABProfile.service }) else {
             disconnect(); return
         }
@@ -3381,6 +3982,7 @@ extension BLEManager: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
+        guard self.peripheral === peripheral else { return }
         otaChar = nil
         var sawDetections = false, sawConfig = false
         for ch in service.characteristics ?? [] {
@@ -3406,13 +4008,16 @@ extension BLEManager: CBPeripheralDelegate {
                 .compactMap { $0 }.joined(separator: " + ")
             connectHint = "This board is missing its \(missing) channel, so it cannot report to the app. "
                         + "Turn it off and on, then try again."
-            userDisconnect = true            // deliberate teardown: do not auto-reconnect into it
-            central.cancelPeripheralConnection(peripheral)
-            connectionState = .idle
+            intentionalDisconnectID = peripheral.identifier
+            central?.cancelPeripheralConnection(peripheral)
+            // Keep this unresolved attempt non-idle until its own disconnect callback consumes the
+            // scoped intent. Exposing idle here allowed a replacement board to start while the old
+            // callback was still pending.
             return
         }
-        // Only boards built with in-app OTA carry acab0104; released 1.7 boards don't.
-        otaCapable = (otaChar != nil)
+        // Merely discovering acab0104 is not enough. OTA waits exclusively for notifications on
+        // that characteristic, so capability becomes true only after its CCCD succeeds below.
+        otaCapable = false
         connectionState = .connected
         startLocationIfNeeded()   // now we have a board whose detections need stamping
         startStatusPolling()   // periodic READ fallback for status frames too big for a small MTU notify
@@ -3431,6 +4036,10 @@ extension BLEManager: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
+        // CoreBluetooth may deliver a CCCD completion after the old link has already torn down.
+        // No callback from a retired peripheral may mark its replacement ready, expose OTA, or
+        // send a buffer handshake through the manager's current characteristic.
+        guard self.peripheral === peripheral else { return }
         if let error {
             // A refused CCCD write is how a pairing decline (or a board holding stale bond keys
             // for another phone) actually surfaces: the characteristics are READ_ENC/WRITE_ENC,
@@ -3444,11 +4053,18 @@ extension BLEManager: CBPeripheralDelegate {
             print("[ACAB-ble] notify subscribe failed for \(characteristic.uuid): \(error.localizedDescription)")
             #endif
             // Identity-guarded: if the board already dropped us (its own reaction to the refused
-            // encryption) the teardown ran and disconnect() would only strand a stale
-            // userDisconnect flag with no didDisconnect left to consume it.
-            if characteristic.uuid == ACABProfile.detections, self.peripheral === peripheral {
+            // encryption) the teardown ran and a second disconnect would be redundant.
+            if characteristic.uuid == ACABProfile.detections {
                 disconnect()
+            } else if characteristic.uuid == ACABProfile.ota {
+                // OTA is optional. A refused OTA CCCD must hide only the updater, not tear down a
+                // working detection link or let a transfer arm the board and wait forever.
+                otaCapable = false
             }
+            return
+        }
+        if characteristic.uuid == ACABProfile.ota {
+            otaCapable = characteristic.isNotifying
             return
         }
         // Once the Detections characteristic is actually subscribed, run the buffer
@@ -3461,16 +4077,32 @@ extension BLEManager: CBPeripheralDelegate {
         // async CCCD write resolves, so a declined pairing would still count as ready there.)
         sessionWasReady = true
         connectHint = nil   // link is usable; the hint no longer applies
+        // The live counter preference defaults on, but the surface starts only after a real board
+        // has completed its encrypted Detections subscription. A stored false is an explicit user
+        // choice and is never overwritten. If this reconnect happened in the background,
+        // scene-phase reconciliation starts the activity when the app next becomes active.
+        if DriveModeState.wanted, UIApplication.shared.applicationState == .active {
+            startDriveMode()
+        }
         sendBufferHandshake()
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
+        guard self.peripheral === peripheral else { return }
+        guard error == nil else {
+            #if DEBUG
+            if let error {
+                print("[ACAB-ble] value update failed for \(characteristic.uuid): \(error.localizedDescription)")
+            }
+            #endif
+            return
+        }
         guard let data = characteristic.value else { return }
         switch characteristic.uuid {
         case ACABProfile.detections: ingestDetection(data)
         case ACABProfile.status:     ingestStatus(data)
-        case ACABProfile.ota:        otaHandleNotify(data)
+        case ACABProfile.ota:        if !handlePwrNotify(data) { otaHandleNotify(data) }
         default: break
         }
     }
@@ -3479,6 +4111,7 @@ extension BLEManager: CBPeripheralDelegate {
     /// has room again. The OTA streamer parks here when a write returns "not ready" and
     /// resumes from this callback, so we never overrun the link.
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        guard self.peripheral === peripheral else { return }
         otaResumeStreaming()
     }
 }
@@ -3495,6 +4128,7 @@ extension BLEManager: CLLocationManagerDelegate {
         sendPhoneLocation()
     }
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        locationAuthorizationStatus = manager.authorizationStatus
         switch manager.authorizationStatus {
         case .authorizedWhenInUse, .authorizedAlways:
             // Just-granted, mid-session: start only if something is actually waiting on a fix.

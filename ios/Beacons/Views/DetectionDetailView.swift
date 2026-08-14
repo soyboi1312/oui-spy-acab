@@ -132,7 +132,7 @@ struct DetectionDetailView: View {
     private var topBar: some View {
         HStack {
             if embedded {
-                Color.clear.frame(width: 36, height: 36)   // no back button in the two-pane
+                Color.clear.frame(width: 44, height: 44)   // no back button in the two-pane
             } else {
                 Button { dismiss() } label: {
                     Image(systemName: "chevron.left").font(.system(size: 16, weight: .semibold))
@@ -140,12 +140,16 @@ struct DetectionDetailView: View {
                         .frame(width: 36, height: 36)
                         .background(ACABTheme.bg2, in: Circle())
                         .overlay(Circle().strokeBorder(ACABTheme.line, lineWidth: 1))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Back")
             }
             Spacer()
             Kicker("DETECTION")
             Spacer()
-            Color.clear.frame(width: 36, height: 36)   // invisible right item to keep the title centered
+            Color.clear.frame(width: 44, height: 44)   // invisible right item to keep the title centered
         }
         .padding(.horizontal, ACABTheme.pad)
         .padding(.top, 8).padding(.bottom, 10)
@@ -217,9 +221,10 @@ struct DetectionDetailView: View {
     /// and the answer was previously only on the website. A reporter using the device hit exactly
     /// that and concluded the hardware was broken.
     ///
-    /// Renders nothing for categories with no mapped questions. That is deliberate for glasses and
-    /// body cam: those already carry the experimental note directly below, and stacking a second
-    /// hedge under it reads as doubt about the detection rather than a pointer to context.
+    /// Renders nothing for categories with no mapped questions (nearby device and unknown, whose
+    /// faqKey is ""). Every real category has entries now, glasses and body cam included, and the
+    /// drift check enforces that; the panel sits above each category's own experimental note where
+    /// one exists.
     @ViewBuilder
     private var relatedHelpPanel: some View {
         let qs = FAQContent.shared.related(for: d.type)
@@ -446,6 +451,7 @@ struct DetectionDetailView: View {
                 Spacer(minLength: 0)
             }
             .padding(.vertical, 10)
+            .frame(minHeight: 44)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -465,7 +471,9 @@ struct DetectionDetailView: View {
     private var sightingSpan: String? {
         let first = ble.firstSeenDate(for: d.id)
         guard let first, !ble.timeBasis(for: d.id, stamp: first).hidesInstant else { return nil }
-        let secs = max(1, Int(Date().timeIntervalSince(first)))
+        // Non-trapping: a poisoned first-seen Date from an old checkpoint must not crash the
+        // detail view every time it opens (the decode clamp stops new ones at ingest).
+        let secs = max(1, Int(exactly: Date().timeIntervalSince(first).rounded(.down)) ?? Int.max)
         switch secs {
         case ..<60:      return "\(secs)s"
         case ..<3600:    return "\(secs / 60)m"
@@ -495,6 +503,8 @@ struct DetectionDetailView: View {
                                 in: Capsule())
                     .overlay(Capsule().strokeBorder(on ? Color.clear : ACABTheme.watchTone.opacity(0.4),
                                                     lineWidth: 1))
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
         }
@@ -514,6 +524,8 @@ struct DetectionDetailView: View {
                 }
                 Button { withAnimation(.easeInOut(duration: 0.15)) { showRssiInfo.toggle() } } label: {
                     Image(systemName: "info.circle").font(.system(size: 12)).foregroundStyle(ACABTheme.dim)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("What the RSSI graph means")
@@ -658,7 +670,8 @@ struct DetectionDetailView: View {
     /// "3d ago", or a dash if we don't know the time.
     private func relativeAgo(_ date: Date?) -> String {
         guard let date else { return "-" }
-        let secs = max(0, Int(Date().timeIntervalSince(date)))
+        // Non-trapping: a poisoned Date from an old checkpoint must degrade, not crash the view.
+        let secs = max(0, Int(exactly: Date().timeIntervalSince(date).rounded(.down)) ?? Int.max)
         switch secs {
         case ..<5:        return "now"
         case ..<60:       return "\(secs)s ago"
@@ -764,7 +777,9 @@ struct DetectionDetailView: View {
                 // is deliberately told is only "near a community-mapped camera" - the screen
                 // reader was making the stronger claim the visible copy refuses to make.
                 .accessibilityLabel(!hit.confirmed
-                     ? "near a community-mapped camera, about \(Int(hit.meters.rounded())) meters away, manufacturer unverified"
+                     ? (hit.tier == 2
+                        ? "near a legacy-tag community camera candidate, about \(Int(hit.meters.rounded())) meters away"
+                        : "near a canonical community-mapped camera, about \(Int(hit.meters.rounded())) meters away, manufacturer attribution not structured")
                      : (hit.maker.isEmpty
                         ? "matches a mapped camera about \(Int(hit.meters.rounded())) meters away"
                         : "matches a mapped \(hit.maker) camera about \(Int(hit.meters.rounded())) meters away"))

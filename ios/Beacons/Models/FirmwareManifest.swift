@@ -103,6 +103,9 @@ extension FirmwareManifest {
         // label carries its own offline baseline (matches the Android per-board fallback).
         return FirmwareManifest(schema: 1, updated: nil, builds: [
             "beacon board": build(DeviceStatus.latestVersion, "https://soyboi.tech/flash.html"),
+            // rev-B rides the beacon version line but flashes from its own page: its image must
+            // never land on rev-A hardware, so the fallback must not point it at flash.html.
+            "beacon board rev-B": build(DeviceStatus.latestVersion, "https://soyboi.tech/flash-revb.html"),
             "ACAB-ouispy": build(DeviceStatus.colonelLatestVersion, acabFlasher),
             "mesh-detect-ACAB": build(DeviceStatus.colonelLatestVersion, acabFlasher),
             "mesh-detect-ACAB-ch1": build(DeviceStatus.colonelLatestVersion, acabFlasher),
@@ -128,6 +131,7 @@ final class FirmwareManifestStore: ObservableObject {
     private let cacheKey = "acab.firmwareManifest"       // last-good JSON
     private let cacheTimeKey = "acab.firmwareManifestAt" // when we fetched it (epoch seconds)
     private let ttl: TimeInterval = 6 * 60 * 60          // refresh at most once per ~6 h
+    private nonisolated static let maxManifestBytes = 256 * 1024
     private var inFlight = false
 
     private init() {
@@ -183,22 +187,77 @@ final class FirmwareManifestStore: ObservableObject {
         var req = URLRequest(url: manifestURL)
         req.cachePolicy = .reloadIgnoringLocalCacheData   // we do our own TTL/caching
         req.timeoutInterval = 15
-        guard let (data, response) = try? await URLSession.shared.data(for: req),
-              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-              let fetched = try? JSONDecoder().decode(FirmwareManifest.self, from: data),
+        guard let payload = try? await Self.boundedManifestData(for: req),
+              (200..<300).contains(payload.response.statusCode),
+              let fetched = try? JSONDecoder().decode(FirmwareManifest.self, from: payload.data),
               fetched.schema == 1, !fetched.builds.isEmpty else {
             // Bad network, non-2xx, or malformed/unsupported JSON: keep serving whatever we
             // already have. Never clobber a good cache with garbage.
             return
         }
+        let data = payload.data
         UserDefaults.standard.set(data, forKey: cacheKey)
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: cacheTimeKey)
         manifest = fetched
+    }
+
+    private nonisolated static func boundedManifestData(
+        for request: URLRequest
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        guard let url = request.url, url.scheme?.lowercased() == "https",
+              url.host?.lowercased() == "soyboi.tech", url.user == nil,
+              url.password == nil, url.port == nil || url.port == 443 else {
+            throw FirmwareManifestFetchError.invalidResponse
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        let session = URLSession(
+            configuration: configuration,
+            delegate: FirmwareManifestRejectRedirectsDelegate(),
+            delegateQueue: nil
+        )
+        defer { session.finishTasksAndInvalidate() }
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let http = response as? HTTPURLResponse,
+              http.url?.scheme?.lowercased() == "https",
+              http.url?.host?.lowercased() == "soyboi.tech",
+              http.expectedContentLength <= Int64(maxManifestBytes) else {
+            throw FirmwareManifestFetchError.invalidResponse
+        }
+        var data = Data()
+        if http.expectedContentLength > 0 {
+            data.reserveCapacity(min(maxManifestBytes, Int(http.expectedContentLength)))
+        }
+        for try await byte in bytes {
+            guard data.count < maxManifestBytes else {
+                throw FirmwareManifestFetchError.tooLarge
+            }
+            data.append(byte)
+        }
+        return (data, http)
     }
 
     private static func readCache(key: String) -> FirmwareManifest? {
         guard let data = UserDefaults.standard.data(forKey: key),
               let m = try? JSONDecoder().decode(FirmwareManifest.self, from: data) else { return nil }
         return m
+    }
+}
+
+private enum FirmwareManifestFetchError: Error {
+    case invalidResponse
+    case tooLarge
+}
+
+private final class FirmwareManifestRejectRedirectsDelegate: NSObject, URLSessionTaskDelegate,
+    @unchecked Sendable {
+    nonisolated func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
     }
 }

@@ -3,8 +3,8 @@ import Foundation
 // MARK: - One-click combined update
 //
 // A single "Update" button that brings a beacon fully current in one determinate flow:
-// the S3 application firmware first (BLEManager+OTA), then, if it applies, the nRF
-// co-processor (BLEManager+NrfDFU). This file COMPOSES those two proven engines; it does
+// the nRF co-processor first while its physical authorization is live, then the S3 application
+// firmware. This file COMPOSES those two proven engines; it does
 // not re-implement any transfer. It only sequences them, maps their two progress streams
 // onto one 0...1 bar, and self-heals the awkward seam where the S3 reboot reset-pulses the
 // nRF (so its reported version briefly disappears).
@@ -46,7 +46,8 @@ final class CombinedUpdateContext {
     let startedAt = Date()
 
     // What we planned to run at the start. Decides how the 0...1 bar is split so a single
-    // stale leg spans the full range and both legs split 0-60 / 60-100.
+    // stale leg spans the full range. When both are stale, nRF runs first while the physical-start
+    // authorization is live, then S3 spans the remaining range.
     let s3Planned: Bool
     let nrfPlanned: Bool
     let s3Base: Double, s3Span: Double
@@ -61,7 +62,7 @@ final class CombinedUpdateContext {
     // Progress of the nRF leg.
     var nrfIndeterminateStartedAt: Date?   // trigger/scan creep timing (indeterminate)
     var verifyStartedAt: Date?             // confirm creep timing (indeterminate)
-    var nrfRetried = false                 // the nRF leg auto-retries exactly once
+    var nrfFinished = false                // durable across dismissNrfUpdate before the S3 leg
 
     init(entry: FirmwareManifest.Build, fwLabel: String, latest: String,
          s3Planned: Bool, nrfPlanned: Bool) {
@@ -71,8 +72,8 @@ final class CombinedUpdateContext {
         self.s3Planned = s3Planned
         self.nrfPlanned = nrfPlanned
         if s3Planned && nrfPlanned {
-            s3Base = 0;   s3Span = 0.60           // S3 = 0-60%
-            nrfBase = 0.60; nrfSpan = 0.40        // nRF = 60-100%
+            nrfBase = 0;   nrfSpan = 0.40         // nRF = 0-40%
+            s3Base = 0.40; s3Span = 0.60          // S3 = 40-100%
         } else if s3Planned {
             s3Base = 0;   s3Span = 1.0            // S3 spans the whole bar
             nrfBase = 1.0; nrfSpan = 0
@@ -96,18 +97,40 @@ extension BLEManager {
     /// The S3 application firmware is behind AND self-updatable. Keeps BOTH comparators the
     /// per-leg UI used: the version compare (`updateAvailable`) and the OTA eligibility gate
     /// (`ota` + verifiable image + the board actually exposing the OTA characteristic).
-    func s3UpdateStale(entry: FirmwareManifest.Build, latest: String) -> Bool {
-        guard entry.ota, entry.hasVerifiableImage, otaCapable else { return false }
-        return status?.updateAvailable(latest: latest) ?? false
+    func s3UpdateStale(entry: FirmwareManifest.Build, fwLabel: String, latest: String) -> Bool {
+        guard let status, !status.needsNewerApp,
+              status.firmwareLabel == fwLabel,
+              entry.ota, entry.hasVerifiableImage, otaCapable else { return false }
+        return status.updateAvailable(latest: latest)
     }
 
     /// Either radio is behind: the OR of the two existing checks. Drives whether the single
     /// "Update" button is offered at all.
-    func combinedUpdateStale(entry: FirmwareManifest.Build, latest: String) -> Bool {
-        s3UpdateStale(entry: entry, latest: latest) || nrfUpdateAvailable(entry)
+    func combinedUpdateStale(entry: FirmwareManifest.Build, fwLabel: String,
+                             latest: String) -> Bool {
+        s3UpdateStale(entry: entry, fwLabel: fwLabel, latest: latest)
+            || nrfUpdateAvailable(entry)
     }
 
     // MARK: Entry points
+
+    private var combinedCompletedAwaitingStatus: Bool {
+        guard let ctx = combinedCtx, ctx.s3Finished, ctx.nrfFinished,
+              ctx.s3Planned, ctx.nrfPlanned, case .done = otaState,
+              case .reconnecting = combinedState else { return false }
+        return true
+    }
+
+    /// The S3 can be cancelled only before it commits and reboots. Once it reaches the reboot or
+    /// confirmation phase, stopping only this coordinator would lie to the user while the board
+    /// update continued in the background and would also abandon the planned second-radio leg.
+    var combinedCanCancel: Bool {
+        guard combinedState.isRunning else { return false }
+        if combinedCompletedAwaitingStatus { return false }
+        if otaState.isRunning { return firmwareUpdateCanCancel }
+        if nrfDfuState.isRunning { return nrfUpdateCanCancel }
+        return true
+    }
 
     /// Start the one-click flow. Non-throwing: any real failure lands in `combinedState`.
     func startCombinedUpdate(entry: FirmwareManifest.Build, fwLabel: String, latest: String) {
@@ -116,7 +139,7 @@ extension BLEManager {
         // an in-flight sub-engine from a prior path would be clobbered).
         guard !otaState.isRunning, !nrfDfuState.isRunning else { return }
 
-        let s3 = s3UpdateStale(entry: entry, latest: latest)
+        let s3 = s3UpdateStale(entry: entry, fwLabel: fwLabel, latest: latest)
         let nrf = nrfUpdateAvailable(entry)
         guard s3 || nrf else { return }   // button wouldn't be shown; defense in depth
 
@@ -138,13 +161,65 @@ extension BLEManager {
 
     /// User asked to stop a running flow. Best-effort: stops the timer and the live sub-engine.
     func combinedCancel() {
-        guard combinedState.isRunning else { return }
+        guard combinedState.isRunning, combinedCanCancel else { return }
         combinedStopTimer()
-        if otaState.isCancellable { cancelFirmwareUpdate() }
-        if nrfDfuState.isRunning { cancelNrfUpdate() }
+        if firmwareUpdateCanCancel { cancelFirmwareUpdate() }
+        if nrfDfuState.isRunning, nrfUpdateCanCancel { cancelNrfUpdate() }
         combinedCtx = nil
         combinedPhaseLabel = "Update cancelled"
         combinedState = .failed(reason: "Update cancelled.")
+    }
+
+    /// Settle only the combined coordinator when its initiating board link is terminal. The caller
+    /// separately cancels the two transfer engines so this method never re-enters their callbacks.
+    func combinedCancelForLinkTeardown(reason: String, settleAsIdle: Bool = false) {
+        if combinedCompletedAwaitingStatus {
+            combinedNotice = "Both updates completed. Reconnect to refresh the co-processor status."
+            combinedFinish(.done)
+            return
+        }
+        let wasRunning = combinedState.isRunning || combinedCtx != nil || combinedTimer != nil
+        combinedStopTimer()
+        combinedCtx = nil
+        guard wasRunning else { return }
+        combinedNotice = nil
+        if settleAsIdle {
+            combinedProgress = 0
+            combinedElapsed = 0
+            combinedPhaseLabel = ""
+            combinedState = .idle
+        } else {
+            combinedPhaseLabel = "Update stopped"
+            combinedState = .failed(reason: reason)
+        }
+    }
+
+    /// Consume a transfer engine's terminal in the same MainActor turn that publishes it. The
+    /// timer remains useful for progress, but a completed single-leg update must not have a window
+    /// where Disconnect or Cancel can overwrite success before the next 0.4 second tick.
+    func combinedHandleSubengineTerminal() {
+        guard let ctx = combinedCtx, combinedState.isRunning else { return }
+        if case .done = nrfDfuState {
+            combinedDriveNrf(ctx)
+            return
+        }
+        guard case .done = otaState else { return }
+        if !ctx.s3Finished {
+            ctx.s3Finished = true
+            ctx.s3DidUpdate = true
+            ctx.s3DoneAt = Date()
+            ctx.reconnectStartedAt = ctx.reconnectStartedAt ?? Date()
+            otaRereadStatus()
+        }
+        if !ctx.nrfPlanned {
+            combinedFinish(.done)
+        } else {
+            // Both-radio flow already completed and confirmed the nRF leg before S3. Keep the
+            // existing fresh-status seam so a missing nrfv is reported honestly, but Cancel is no
+            // longer exposed because both transfer engines are terminal.
+            combinedState = .reconnecting
+            combinedSetProgress(ctx.s3Base + ctx.s3Span * 0.95)
+        }
     }
 
     /// Clear a terminal state back to rest.
@@ -199,7 +274,9 @@ extension BLEManager {
     // MARK: Leg 1 - S3 application firmware
 
     private func combinedBeginFirstLeg(_ ctx: CombinedUpdateContext) {
-        if ctx.s3Planned {
+        if ctx.s3Planned && ctx.nrfPlanned {
+            combinedBeginNrfLeg(ctx)
+        } else if ctx.s3Planned {
             combinedState = .updatingS3
             startFirmwareUpdate(entry: ctx.entry, fwLabel: ctx.fwLabel)
         } else {
@@ -278,7 +355,11 @@ extension BLEManager {
         // soon as the S3 reboot settled - don't stall on a nrfv that a single-radio board never
         // reports.
         if !ctx.nrfPlanned {
-            combinedDecideNrfLeg(ctx)
+            // Keep the plan frozen. In particular, a legacy proto<2 board can become proto2
+            // after this S3 leg, but the warm OTA reboot deliberately did not reopen the
+            // physical-start window required to arm legacy nRF DFU. The user must power-cycle,
+            // reconnect, and start a separate nRF run from a freshly authorized session.
+            combinedFinish(.done)
             return
         }
 
@@ -335,26 +416,38 @@ extension BLEManager {
             let sub = 0.25 + 0.625 * Double(min(100, max(0, p))) / 100
             combinedSetProgress(ctx.nrfBase + ctx.nrfSpan * sub)
         case .confirming:
-            // Best-effort confirm: the nRF engine resolves to .done after a bounded wait even if
-            // the new version isn't re-reported, so this is "updated (verifying)", not a failure.
+            // The initiating S3 must report the target version before the nRF engine reaches done.
             if case .verifying = combinedState {} else { ctx.verifyStartedAt = Date() }
             combinedState = .verifying
             let started = ctx.verifyStartedAt ?? Date()
             let t = min(1.0, Date().timeIntervalSince(started) / Self.combinedConfirmCreep)
             combinedSetProgress(ctx.nrfBase + ctx.nrfSpan * (0.875 + 0.125 * t * 0.9))
         case .done:
-            combinedFinish(.done)
-        case .failed(let reason):
-            if !ctx.nrfRetried {
-                // Auto-retry the co-processor leg exactly once (the DFU is idempotent).
-                ctx.nrfRetried = true
-                ctx.nrfIndeterminateStartedAt = Date()
-                dismissNrfUpdate()                 // reset .failed -> .idle so start takes
-                combinedState = .updatingCoproc
-                startNrfUpdate(entry: ctx.entry)
+            ctx.nrfFinished = true
+            if ctx.s3Planned && !ctx.s3Finished {
+                dismissNrfUpdate()
+                combinedState = .updatingS3
+                startFirmwareUpdate(entry: ctx.entry, fwLabel: ctx.fwLabel)
             } else {
-                // S3 already took (or wasn't needed); the co-processor didn't. Surface partial so
-                // the same button can re-offer just the nRF leg.
+                combinedFinish(.done)
+            }
+        case .failed(let reason):
+            // A transfer may have landed just after its bounded confirmation timed out. Re-read
+            // the live version before retrying so we never put an already-current co-processor
+            // back into its unauthenticated legacy bootloader unnecessarily.
+            if let target = ctx.entry.nrf?.version,
+               let running = status?.nrfVersion, running >= target {
+                combinedFinish(.done)
+                return
+            }
+            // The stock legacy DFU bootloader cannot authenticate its own image or expose a
+            // cryptographic target identity. Do not automatically re-arm it after a failure. The
+            // user can inspect the result, power-cycle deliberately, and retry from a clean link.
+            if ctx.s3Planned && !ctx.s3Finished {
+                combinedFail(reason)
+            } else {
+                // S3 already took (or was not needed); the co-processor did not. Surface partial
+                // so the same button can re-offer just the nRF leg after a deliberate restart.
                 combinedNotice = reason
                 combinedFinish(.partial)
             }

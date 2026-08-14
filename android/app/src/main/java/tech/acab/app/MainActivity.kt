@@ -14,16 +14,23 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.Lifecycle
+import tech.acab.app.ble.ConnState
 import tech.acab.app.ui.AcabApp
 import tech.acab.app.ui.theme.Acab
 
 class MainActivity : ComponentActivity() {
     private val vm: AcabViewModel by viewModels()
     private var permissionsGranted by mutableStateOf(false)
+    private var startDriveRequested = false
 
     private val requestPermissions = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { syncPermissionState() }
+
+    private val requestDriveNotification = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* Drive mode stays usable when declined; the app surfaces the missing-counter state. */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,6 +59,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         syncPermissionState()
+        maybeStartRequestedDrive()
     }
 
     // launchMode=singleTask: a drive-mode notification tap lands here when the activity
@@ -73,12 +81,32 @@ class MainActivity : ComponentActivity() {
             openLogNew.value = true
             intent.removeExtra(EXTRA_OPEN_LOG_NEW)
         }
+        if (intent.getBooleanExtra(EXTRA_START_DRIVE, false)) {
+            startDriveRequested = true
+            intent.removeExtra(EXTRA_START_DRIVE)
+            maybeStartRequestedDrive()
+        }
+    }
+
+    /** A Quick Settings tile is a background service on Android 14 and newer, so it cannot start
+     * a location foreground service under while-in-use permission. Apply its request only after
+     * this activity is actually visible. */
+    private fun maybeStartRequestedDrive() {
+        if (!startDriveRequested ||
+            !lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
+        startDriveRequested = false
+        if (vm.ble.state.value != ConnState.READY) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !hasPermission(Manifest.permission.POST_NOTIFICATIONS)) {
+            requestDriveNotification.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        vm.ble.startDriveMode()
     }
 
     /** Recheck whether we can scan/connect, and kick off location if allowed. */
     private fun syncPermissionState() {
         permissionsGranted = requiredPermissions().all { hasPermission(it) }
-        if (hasLocationPermission()) vm.startLocation()
+        vm.onPermissionsChanged(permissionsGranted, hasLocationPermission())
     }
 
     // Everything we ask for in one prompt: BLE plus location for the map. On Android
@@ -91,10 +119,8 @@ class MainActivity : ComponentActivity() {
         }
         add(Manifest.permission.ACCESS_FINE_LOCATION)
         add(Manifest.permission.ACCESS_COARSE_LOCATION)
-        // Drive-mode counter notification (Android 13+ runtime grant).
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            add(Manifest.permission.POST_NOTIFICATIONS)
-        }
+        // Notifications are requested at the Drive-mode / alert feature boundary. They are not
+        // needed to scan, so including them in this first-run prompt made the rationale dishonest.
     }.toTypedArray()
 
     // What we actually need to scan and connect. On 12+ location is just for the
@@ -118,6 +144,9 @@ class MainActivity : ComponentActivity() {
     companion object {
         /** Intent extra set by the drive-mode notification's contentIntent (AcabLinkService). */
         const val EXTRA_OPEN_LOG_NEW = "open_log_new"
+
+        /** Quick Settings intent consumed only after the activity is visible. */
+        const val EXTRA_START_DRIVE = "start_drive"
 
         /** Pending deep link, as observable state rather than a MainScreen parameter:
          *  AcabApp sits between the activity and the tab shell, and the tap can arrive while

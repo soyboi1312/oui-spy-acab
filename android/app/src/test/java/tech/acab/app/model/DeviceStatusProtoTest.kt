@@ -28,10 +28,18 @@ class DeviceStatusProtoTest {
     }
 
     @Test
-    fun `proto equal to supported is compatible`() {
+    fun `proto below supported is compatible`() {
         val s = status("""{"fw":"beacon board 2.0.4","proto":1}""")
         assertEquals(1, s.protoVersion)
         assertFalse(s.needsNewerApp)
+    }
+
+    @Test
+    fun `proto equal to supported is compatible`() {
+        val s = status("""{"fw":"beacon board 2.0.5","proto":2,"bodycam":true}""")
+        assertEquals(2, s.protoVersion)
+        assertFalse(s.needsNewerApp)
+        assertTrue("the v2 bodycam alias must land on the body-cam field", s.bodyCam)
     }
 
     @Test

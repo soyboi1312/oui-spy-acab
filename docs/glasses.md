@@ -1,13 +1,17 @@
 # Smart / recording glasses detection (capture-pending)
 
-**Status: signature-sourced, capture-pending.** The company IDs below are verified
-against the Bluetooth SIG registry, but ACAB has not yet field-confirmed that a pair
-of glasses advertises them *while worn and recording*. Because the Meta company IDs are
-shared with the Meta Quest headset, the shipped firmware does **not** flag a bare
-shared-ID hit at all: a Quest on its own stays silent, and a Meta ID is only reported
-when it co-signals the `META_RB_GLASS` token that marks the glasses (see the gate below).
-The eyewear-only IDs ship enabled (like Axon), report honestly as "possible recording
-glasses," and get promoted to field-validated once we have a capture.
+**Status: `0x01AB` field-validated while worn; the rest signature-sourced, capture-pending.**
+The company IDs below are verified against the Bluetooth SIG registry. On 2026-07-31 a
+ground-truth capture (three Meta glasses, Ray-Ban and Oakley, worn through a 70-minute,
+1568-row capture) confirmed that the glasses advertise the Meta corporate ID `0x01AB`
+*while worn*, so `0x01AB` was un-gated: a bare `0x01AB` hit now emits at confidence 45 (the
+apps' weak-match "verify this" band, with the Quest caveat kept), token or no token. The
+other shared IDs stay gated: `0x058E` (Meta Quest), TCL's `0x0BC6`, and Jieli's `0x05D6`. A
+Quest on its own still stays silent; a `0x058E` advert only emits when it co-signals the
+`META_RB_GLASS` token that marks the glasses (see the gate below), and `0x0BC6` / `0x05D6`
+have no token to rescue them. The eyewear-only IDs ship enabled (like Axon) and report
+honestly as "possible recording glasses." Still capture-pending: the `META_RB_GLASS` token's
+exact byte framing, and worn-advertising confirmation for Snap and Vuzix.
 
 ## Its own category, not trackers and not body cam
 
@@ -38,7 +42,7 @@ detector.
 | `0x03C2` | Snapchat Inc | Snap Spectacles camera glasses | yes, Snap's only BLE hardware is Spectacles | higher |
 | `0x060C` | Vuzix Corporation | Vuzix camera AR glasses (Blade, M400, Shield, Z100) | yes, eyewear-only registrant | higher (70) |
 | `0x058E` | Meta Platforms Technologies, LLC | Ray-Ban / Oakley Meta AI glasses **and** Meta Quest VR | no, shared across Meta hardware | bare hit gated off; token-confirmed only (72) |
-| `0x01AB` | Meta Platforms, Inc. | Meta corporate/parent ID, appears across Meta hardware | no, not eyewear-specific | bare hit gated off; token-confirmed only (72) |
+| `0x01AB` | Meta Platforms, Inc. | Meta corporate/parent ID, appears across Meta hardware | no, not eyewear-specific | bare hit ships at 45 (weak match); token-confirmed 72 |
 | `0x0BC6` | TCL COMMUNICATION EQUIPMENT CO.,LTD. | RayNeo AR/smart glasses (a TCL sub-brand), also TCL phones/tablets/TVs | no, TCL corporate ID | gated off (no token to confirm) |
 | none | RayNeo | RayNeo smart glasses | no dedicated SIG company ID exists | n/a |
 
@@ -76,16 +80,22 @@ cannot prove it is glasses. Worse, a Quest advertises from a rotating private ad
 bare shared-ID match would re-alert on every rotation and the per-MAC Ignore could never
 silence it, a permanent false alarm on hardware with tens of millions of units.
 
-So the shipped firmware **gates the bare shared-ID match off** (`0x058E`, `0x01AB`, and
-TCL's `0x0BC6`). A Quest on its own does not flag as recording glasses. A Meta-ID advert
-only emits when it also carries the `META_RB_GLASS` token described below, in which case it
-is reported as confirmed glasses ("Ray-Ban Meta: recording glasses") with no Quest caveat.
-Ray-Ban Meta coverage does **not** depend on the shared ID: the frames also advertise the
-eyewear-only Luxottica ID `0x0D53`, which stays enabled. The "nearby glasses" Android app
-documents the same underlying overlap, that matches on the Meta IDs "will also trigger on
-other Bluetooth-enabled products from the same companies, including VR headsets," and where
-it falls back on visual context, ACAB instead stays silent on the bare hit rather than
-guess.
+So the shipped firmware **gates the bare shared-ID match off** for `0x058E`, TCL's `0x0BC6`,
+and Jieli's `0x05D6`. A Quest on its own does not flag as recording glasses. `0x01AB` is the
+exception: it was un-gated on the 2026-07-31 ground-truth capture, so a bare `0x01AB` advert
+now emits as a weak match at confidence 45 ("Meta: possible recording glasses or Quest"),
+token or not. A gated `0x058E` advert only emits when it also carries the `META_RB_GLASS`
+token described below, in which case it is reported as confirmed glasses ("Ray-Ban Meta:
+recording glasses") with no Quest caveat.
+Ray-Ban Meta coverage rides the un-gated `0x01AB`: in the 2026-07-31 capture the worn
+Ray-Ban and Oakley Meta frames were only ever heard on `0x01AB`, while the eyewear-only
+Luxottica ID `0x0D53` fired zero times. That disproved the earlier plan of leaning on
+`0x0D53` as the Ray-Ban Meta fallback and is why the bare-ID gate was lifted for `0x01AB`;
+`0x0D53` stays enabled in the table but is not what caught real worn frames in our capture.
+The "nearby glasses" Android app documents the same underlying overlap, that matches on the
+Meta IDs "will also trigger on other Bluetooth-enabled products from the same companies,
+including VR headsets," and where it falls back on visual context, ACAB surfaces a weak match
+on the bare `0x01AB` hit (and stays silent on the still-gated Meta IDs) rather than guess.
 
 Luxottica (`0x0D53`), Snapchat (`0x03C2`), and Vuzix (`0x060C`) sidestep the ambiguity
 entirely, because those registrants only ship eyewear, so they carry higher confidence with
@@ -96,9 +106,12 @@ to rescue it, so it stays gated off until a field capture gives RayNeo a clean d
 
 Two things gate promoting this from capture-pending to field-validated:
 
-1. **Advertise-while-worn.** Confirm that a pair of Ray-Ban/Oakley Meta, Snap Spectacles,
-   or a Luxottica frame actually broadcasts its company ID passively while worn and
-   recording (not only during pairing). The device **name** does identify the glasses, but
+1. **Advertise-while-worn.** Confirmed for Meta on 2026-07-31: worn Ray-Ban and Oakley Meta
+   frames broadcast the `0x01AB` company ID passively while worn, and the Luxottica `0x0D53`
+   did not fire at all. Still open for Snap Spectacles and Vuzix: confirm those actually
+   broadcast their company ID passively while worn and recording (not only during pairing),
+   and the same for any Luxottica frame on `0x0D53`. The device **name** does identify the
+   glasses, but
    per Help Net Security's reporting that name is generally only exposed during pairing, so
    it is rarely visible in the field against someone who paired in advance. Net: continuous
    field detection has to rely on the company ID (plus, for Meta, the payload subtype below),
@@ -129,9 +142,10 @@ phone-only approach, and the buzzer means it works with the phone away entirely.
 Toggled with `{"glasses": true|false}` on the Config characteristic, mirroring the
 `axon` / `tracker` enable pattern, NVS-persisted, and **on by default** (like Axon). The
 Status JSON reports it as `"glasses"` beside `"axon"` and `"tracker"`. Detail strings name
-the vendor and say "possible recording glasses"; a bare Meta or TCL shared-ID hit does not
-emit at all, and a token-confirmed Meta hit reports as "Ray-Ban Meta: recording glasses"
-with no Quest caveat. See [docs/ble-protocol.md](ble-protocol.md) for the wire fields and
+the vendor and say "possible recording glasses"; a bare `0x01AB` hit emits as a weak match at
+confidence 45, the still-gated shared IDs (`0x058E`, `0x0BC6`, `0x05D6`) do not emit on their
+own, and a token-confirmed Meta hit reports as "Ray-Ban Meta: recording glasses" with no
+Quest caveat. See [docs/ble-protocol.md](ble-protocol.md) for the wire fields and
 [docs/signatures.md](signatures.md) for the signature table.
 
 ## Sources

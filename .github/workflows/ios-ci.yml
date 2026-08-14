@@ -1,0 +1,67 @@
+name: iOS CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios-ci.yml'
+  pull_request:
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-release-build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate the Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Run unit tests
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Beacons.xcodeproj \
+            -scheme Beacons \
+            -configuration Debug \
+            -destination 'platform=iOS Simulator,OS=latest,name=iPhone 16 Pro' \
+            -resultBundlePath "$RUNNER_TEMP/BeaconsTests.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            test
+
+      - name: Build Release configuration without signing
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Beacons.xcodeproj \
+            -scheme Beacons \
+            -configuration Release \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Upload test result bundle
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: ios-test-results
+          path: ${{ runner.temp }}/BeaconsTests.xcresult
+          if-no-files-found: warn

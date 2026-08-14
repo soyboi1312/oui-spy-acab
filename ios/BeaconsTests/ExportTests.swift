@@ -95,6 +95,257 @@ final class ExportTests: XCTestCase {
         XCTAssertEqual(c[21], "-117.114303")
     }
 
+    func testDroneObserverPositionIsIndependentOfAircraftPosition() throws {
+        // `loc` is where the PHONE heard the drone. The wire lat/lon is where the AIRCRAFT says
+        // it is. Both must survive as distinct fields; acquiring one can never be gated on the
+        // presence of the other.
+        let observer = CLLocationCoordinate2D(latitude: 40.123456, longitude: -70.654321)
+        let csv = BLEManager.renderContributionCSV(
+            [try row(Self.droneJSON, loc: observer)],
+            includeObserverLocation: true,
+            includeDroneLocation: true,
+            includeOperatorLocation: true)
+        let records = try XCTUnwrap(ContributionCsv.parseDocument(csv)?.records)
+        XCTAssertEqual(records.count, 2)
+        let header = records[0], data = records[1]
+        func value(_ name: String) -> String { data[header.firstIndex(of: name)!] }
+        XCTAssertEqual(value("approx_lat"), "40.123456")
+        XCTAssertEqual(value("approx_lon"), "-70.654321")
+        XCTAssertEqual(value("drone_lat"), "32.763950")
+        XCTAssertEqual(value("drone_lon"), "-117.114273")
+    }
+
+    func testContributionStopUsesUnpublishedLiveLedgerAndMatchingObserverFix() throws {
+        // The UI projection is deliberately never published. Stop must still see the manager's
+        // capture-local live ledger, and the observer coordinate must be the one paired with this
+        // exact sighting rather than a session-wide first/closest position.
+        let manager = BLEManager()
+        let d = try decode(Self.nearbyJSON.replacingOccurrences(
+            of: "c2:40:d8:1c:2b:96", with: "02:aa:bb:cc:dd:01"))
+        let start: Int64 = 1_780_000_000_000
+        let seen = start + 1_234
+        let observer = CLLocationCoordinate2D(latitude: 40.123456, longitude: -70.654321)
+
+        manager.beginContributionCapture(startMs: start)
+        manager.testSeedContributionDetection(
+            d,
+            firstSeen: Date(timeIntervalSince1970: Double(start - 60_000) / 1000),
+            lastSeen: Date(timeIntervalSince1970: Double(seen) / 1000),
+            observerLocation: observer)
+        XCTAssertFalse(manager.detections.contains(where: { $0.id == d.id }),
+                       "the regression fixture must not enter the coalesced UI projection")
+
+        let snapshot = manager.finishContributionCapture(startMs: start, stopMs: start + 2_000)
+        XCTAssertEqual(snapshot.capturedAtByID, [d.id: seen])
+        XCTAssertEqual(snapshot.rows.count, 1)
+        XCTAssertEqual(snapshot.rows[0].loc?.latitude, observer.latitude)
+        XCTAssertEqual(snapshot.rows[0].loc?.longitude, observer.longitude)
+        XCTAssertFalse(snapshot.rows[0].allowDetectionCoordinateFallback)
+
+        let csv = BLEManager.renderContributionCSV(
+            snapshot.rows,
+            includeObserverLocation: true,
+            includeDroneLocation: true,
+            includeOperatorLocation: true)
+        let records = try XCTUnwrap(ContributionCsv.parseDocument(csv)?.records)
+        let header = records[0], data = records[1]
+        XCTAssertEqual(data[header.firstIndex(of: "approx_lat")!], "40.123456")
+        XCTAssertEqual(data[header.firstIndex(of: "approx_lon")!], "-70.654321")
+        XCTAssertEqual(ContributionCsv.dataRowCount(csv), 1)
+    }
+
+    func testContributionExcludesReplayOnlyStoreRow() throws {
+        // A replay can land in the authoritative session store during a reconnect and carry times
+        // that overlap the user's window. It is not a live in-window observation, so it must never
+        // receive the contribution's `.exact` timestamp.
+        let manager = BLEManager()
+        let historyJSON = Self.nearbyJSON
+            .replacingOccurrences(of: "c2:40:d8:1c:2b:96", with: "02:aa:bb:cc:dd:02")
+            .replacingOccurrences(of: "\"n\":1}", with: "\"n\":1,\"hist\":true,\"seq\":7}")
+        let d = try decode(historyJSON)
+        XCTAssertTrue(d.isHistory)
+        let start: Int64 = 1_780_000_100_000
+
+        manager.beginContributionCapture(startMs: start)
+        manager.testSeedContributionDetection(
+            d,
+            firstSeen: Date(timeIntervalSince1970: Double(start + 100) / 1000),
+            lastSeen: Date(timeIntervalSince1970: Double(start + 500) / 1000))
+        let snapshot = manager.finishContributionCapture(startMs: start, stopMs: start + 1_000)
+        XCTAssertTrue(snapshot.capturedAtByID.isEmpty)
+        XCTAssertTrue(snapshot.rows.isEmpty)
+    }
+
+    func testContributionWithoutInWindowFixDoesNotFallBackToWireCoordinate() throws {
+        // For a non-drone, wire lat/lon may be detector GPS and remains useful in a standard Log
+        // export. A bounded contribution timestamp describes one exact live sighting, though, so
+        // that fallback is too old/ambiguous when the capture ledger has no matching phone fix.
+        let manager = BLEManager()
+        let d = try decode(Self.nearbyJSON.replacingOccurrences(
+            of: "c2:40:d8:1c:2b:96", with: "02:aa:bb:cc:dd:03"))
+        let start: Int64 = 1_780_000_200_000
+        manager.beginContributionCapture(startMs: start)
+        manager.testSeedContributionDetection(
+            d,
+            firstSeen: Date(timeIntervalSince1970: Double(start - 5_000) / 1000),
+            lastSeen: Date(timeIntervalSince1970: Double(start + 500) / 1000),
+            observerLocation: nil)
+
+        let snapshot = manager.finishContributionCapture(startMs: start, stopMs: start + 1_000)
+        let csv = BLEManager.renderContributionCSV(
+            snapshot.rows,
+            includeObserverLocation: true,
+            includeDroneLocation: true,
+            includeOperatorLocation: true)
+        let records = try XCTUnwrap(ContributionCsv.parseDocument(csv)?.records)
+        let header = records[0], data = records[1]
+        XCTAssertEqual(data[header.firstIndex(of: "approx_lat")!], "")
+        XCTAssertEqual(data[header.firstIndex(of: "approx_lon")!], "")
+
+        // The standard-export default is intentionally unchanged.
+        let standard = BLEManager.buildCSV([try row(Self.nearbyJSON, loc: nil)])
+        let standardRecords = try XCTUnwrap(ContributionCsv.parseDocument(standard)?.records)
+        let standardHeader = standardRecords[0], standardData = standardRecords[1]
+        XCTAssertEqual(standardData[standardHeader.firstIndex(of: "approx_lat")!], "32.763243")
+        XCTAssertEqual(standardData[standardHeader.firstIndex(of: "approx_lon")!], "-117.116077")
+    }
+
+    func testStandardExportSnapshotUsesAuthoritativeStoreAndFreezesScope() throws {
+        let manager = BLEManager()
+        let live = try decode(Self.nearbyJSON.replacingOccurrences(
+            of: "c2:40:d8:1c:2b:96", with: "02:aa:bb:cc:ee:01"))
+        let offlineJSON = Self.droneJSON
+            .replacingOccurrences(of: "60:60:1f:1a:1a:3f", with: "02:aa:bb:cc:ee:02")
+            .replacingOccurrences(of: "\"n\":15}", with: "\"n\":15,\"hist\":true,\"seq\":8}")
+        let offline = try decode(offlineJSON)
+        let now = Date(timeIntervalSince1970: 1_780_001_000)
+        manager.testSeedContributionDetection(live, firstSeen: now, lastSeen: now)
+        manager.testSeedContributionDetection(offline, firstSeen: now, lastSeen: now)
+        XCTAssertTrue(manager.detections.isEmpty,
+                      "the fixture must bypass the coalesced SwiftUI projection")
+
+        let frozen = manager.detectionExportSnapshot()
+        XCTAssertEqual(frozen.ids, [live.id, offline.id])
+        XCTAssertEqual(frozen.filtered(category: nil, unseenOnly: false, offlineOnly: true).ids,
+                       [offline.id])
+        XCTAssertEqual(frozen.filtered(category: "DRONE", unseenOnly: false, offlineOnly: false).ids,
+                       [offline.id])
+        XCTAssertEqual(frozen.filtered(category: nil, unseenOnly: true, offlineOnly: false).ids,
+                       [live.id, offline.id])
+    }
+
+    func testLoneCarriageReturnInUasIdCannotBypassRealEmitterRedaction() throws {
+        // A lone CR is a CSV record separator just like LF/CRLF. uas_id precedes every drone and
+        // operator location column, so leaving it unquoted lets the apparent row break before the
+        // sensitive fields. Exercise BLEManager's real emitter AND redactor, not merely field().
+        let json = """
+        {"t":4,"s":2,"meth":6,"c":99,"mac":"60:60:1f:1a:1a:40","rssi":-70,\
+        "lat":32.763950,"lon":-117.114273,"plat":32.762257,"plon":-117.114303,\
+        "alt":208,"id":"UAS\\rSECOND RECORD","n":2}
+        """
+        let snapshot = [try row(json)]
+        let raw = BLEManager.buildCSV(snapshot)
+        XCTAssertTrue(raw.contains("\"UAS\rSECOND RECORD\""),
+                      "the real emitter must quote a lone carriage return")
+
+        let redacted = BLEManager.renderContributionCSV(
+            snapshot,
+            includeObserverLocation: false,
+            includeDroneLocation: false,
+            includeOperatorLocation: false)
+        let records = try XCTUnwrap(ContributionCsv.parseDocument(redacted)?.records)
+        XCTAssertEqual(records.count, 2)
+        XCTAssertEqual(ContributionCsv.dataRowCount(redacted), 1)
+        let header = records[0], data = records[1]
+        func value(_ name: String) -> String { data[header.firstIndex(of: name)!] }
+        XCTAssertEqual(value("uas_id"), "UAS\rSECOND RECORD")
+        for name in ContributionCsv.observerLocationCols
+            .union(ContributionCsv.droneLocationCols)
+            .union(ContributionCsv.operatorLocationCols) {
+            XCTAssertEqual(value(name), "", "\(name) must be blank after real-path redaction")
+        }
+        XCTAssertEqual(value("altitude_m"), "208", "non-location telemetry still survives")
+    }
+
+    func testRealEmitterSerializesEveryCellBeforeLocationRedaction() throws {
+        // MAC is protocol-shaped today, but it is intentionally a field the old builder emitted
+        // raw. Put comma + CRLF into that cell to prove the production writer does not rely on a
+        // hand-picked list of fields that happen to look safe. Every row must remain rectangular,
+        // and later location columns must still be found and removed by name.
+        let json = Self.droneJSON.replacingOccurrences(
+            of: "60:60:1f:1a:1a:3f", with: "MAC,\\r\\nSECOND LINE")
+        let snapshot = [try row(json)]
+        let raw = BLEManager.buildCSV(snapshot)
+        let rawRecords = try XCTUnwrap(ContributionCsv.parseDocument(raw)?.records)
+        XCTAssertEqual(rawRecords.count, 2)
+        XCTAssertEqual(rawRecords[1].count, rawRecords[0].count)
+        XCTAssertEqual(rawRecords[1][4], "MAC,\r\nSECOND LINE")
+
+        let redacted = BLEManager.renderContributionCSV(
+            snapshot,
+            includeObserverLocation: false,
+            includeDroneLocation: false,
+            includeOperatorLocation: false)
+        let records = try XCTUnwrap(ContributionCsv.parseDocument(redacted)?.records)
+        XCTAssertEqual(records.count, 2)
+        XCTAssertEqual(records[1].count, records[0].count)
+        let header = records[0], data = records[1]
+        for name in ContributionCsv.observerLocationCols
+            .union(ContributionCsv.droneLocationCols)
+            .union(ContributionCsv.operatorLocationCols) {
+            XCTAssertEqual(data[header.firstIndex(of: name)!], "", "\(name) must be blank")
+        }
+    }
+
+    func testUntrustedSpreadsheetFormulaTextIsMadeLiteral() throws {
+        for value in ["=2+2", "+SUM(A1:A2)", "-1+2", "@cmd", "  \t=HYPERLINK(\"x\")"] {
+            XCTAssertEqual(BLEManager.csvUntrustedText(value), "'" + value)
+        }
+        for value in ["", "safe", "  safe", "1+2"] {
+            XCTAssertEqual(BLEManager.csvUntrustedText(value), value)
+        }
+
+        let malicious = Self.droneJSON.replacingOccurrences(
+            of: "1581F67QC236L014509G", with: "=2+2")
+        let csv = BLEManager.buildCSV([try row(malicious)])
+        let records = try XCTUnwrap(ContributionCsv.parseDocument(csv)?.records)
+        let header = records[0]
+        XCTAssertEqual(records[1][header.firstIndex(of: "uas_id")!], "'=2+2")
+        XCTAssertEqual(records[1][header.firstIndex(of: "rssi")!], "-86",
+                       "numeric evidence must not be rewritten as text")
+
+        let maliciousMaker = #"{"t":10,"s":1,"meth":1,"c":65,"mac":"11:22:33:44:55:66","rssi":-70,"det":"=cmd on wifi","n":1}"#
+        XCTAssertEqual(try decode(maliciousMaker).maker, "=cmd")
+        let makerCSV = BLEManager.buildCSV([try row(maliciousMaker)])
+        let makerRecords = try XCTUnwrap(ContributionCsv.parseDocument(makerCSV)?.records)
+        let makerHeader = makerRecords[0]
+        XCTAssertEqual(makerRecords[1][makerHeader.firstIndex(of: "maker")!], "'=cmd",
+                       "radio-derived maker text must remain literal in spreadsheets")
+    }
+
+    func testRepeatedStandardExportsKeepReadableNameButUseUniqueParents() throws {
+        // Two share sheets can overlap in time. The second export must not mutate the URL already
+        // handed to the first, while the leaf filename should remain useful to the recipient.
+        let manager = BLEManager()
+        let done = expectation(description: "two exports finish")
+        done.expectedFulfillmentCount = 2
+        var urls: [URL] = []
+        for _ in 0..<2 {
+            manager.writeDetections(.csv) { result in
+                if case let .success(url) = result { urls.append(url) }
+                done.fulfill()
+            }
+        }
+        wait(for: [done], timeout: 5)
+        XCTAssertEqual(urls.count, 2)
+        XCTAssertEqual(urls.map(\.lastPathComponent), ["acab-detections.csv", "acab-detections.csv"])
+        XCTAssertNotEqual(urls[0].deletingLastPathComponent(), urls[1].deletingLastPathComponent())
+        XCTAssertEqual(try Data(contentsOf: urls[0]), try Data(contentsOf: urls[1]))
+
+        // No activity owns these test artifacts, so the test may clean up its exact UUID dirs.
+        for url in urls { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+    }
+
     // MARK: - GPX
 
     func testGpxIsWellFormedAndDeclaresTheNamespace() throws {

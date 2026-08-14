@@ -15,6 +15,17 @@ struct DetectionCategory: Identifiable {
     var id: String { key }
 }
 
+/// One-shot handoff from a Status category tile to the Log tab with that category filter
+/// armed. Same static-slot + notification pattern as MapFocus (and deliberately NOT the
+/// UserDefaults channel the Live Activity uses): a tile tap must never outlive the session,
+/// or a stale persisted category would hijack an unrelated later launch's Log open.
+/// MainTabView switches tabs on the notification; DetectionsView consumes the slot exactly
+/// once (onAppear when the tab was cold, onReceive when it is already alive).
+enum LogFocus {
+    static var pendingCategory: String?
+    static let notification = Notification.Name("acabFocusLogCategory")
+}
+
 /// ALPR, DRONE, BODY CAM, TRACKER, GLASSES, CAMERA (Network camera). Reuses each type's
 /// existing tint + glyph (netcamTone + web.camera.fill for the CAMERA / networkCamera entry).
 let detectionCategories: [DetectionCategory] = [
@@ -36,27 +47,34 @@ struct DetectionsView: View {
     @State private var selecting = false   // bulk-select mode
     @State private var selection: Set<String> = []   // selected Detection.id
     @State private var exportFile: ExportFile?
-    @State private var gpxHadNothing = false
+    @State private var exportProblem: ExportProblem?
     @State private var confirmClear = false           // gate the destructive log wipe
     // Pause the live feed so a fast-scrolling list can actually be read. Paused freezes the
     // DISPLAYED rows to a snapshot; the store keeps accumulating in BLEManager (nothing is
-    // dropped), and resume snaps back to live. frozenIds backs the "N new" affordance without
-    // re-hashing the snapshot on every body eval.
+    // dropped), and resume snaps back to live. The frozen export also owns NEW and time metadata,
+    // so the visible row and any file made from it cannot drift apart.
     @State private var paused = false
-    @State private var frozen: [Detection] = []
-    @State private var frozenIds: Set<String> = []
+    @State private var frozenExport: BLEManager.DetectionExportSnapshot?
     // T3: on regular width the log is a two-pane master/detail; this drives the right pane.
     // Never set at compact width, so the phone-portrait path is untouched.
     @State private var selectedDetail: Detection?
     @Environment(\.horizontalSizeClass) private var hSize
+    // Accessibility text sizes reflow the tile strip into a grid and pad the scroll bottom.
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     /// Three-way status scope over the feed: everything, only-new (after the seen
     /// watermark), or only records the board buffered offline and replayed.
     private enum StatusScope { case all, new, offline }
 
+    private struct ExportProblem: Identifiable {
+        let id = UUID()
+        let title: String
+        let message: String
+    }
+
     private var shown: [Detection] {
         // Paused: read from the frozen snapshot so the list holds still. Live otherwise.
-        let base = paused ? frozen : ble.detections
+        let base = paused ? (frozenExport?.detections ?? []) : ble.detections
         return base.filter { d in
             (filter == nil || d.type.category == filter) && matchesScope(d)
         }
@@ -66,23 +84,23 @@ struct DetectionsView: View {
     /// the "N new" hint. The store never stops filling; only the display is frozen.
     private var pausedNewCount: Int {
         guard paused else { return 0 }
-        return ble.detections.reduce(0) { $0 + (frozenIds.contains($1.id) ? 0 : 1) }
+        let frozenIDs = frozenExport?.ids ?? []
+        return ble.detections.reduce(0) { $0 + (frozenIDs.contains($1.id) ? 0 : 1) }
     }
 
     private func pauseFeed() {
-        frozen = ble.detections
-        frozenIds = Set(frozen.map { $0.id })
+        frozenExport = ble.detectionExportSnapshot()
         paused = true
     }
     private func resumeFeed() {
         paused = false
-        frozen = []
-        frozenIds = []
+        frozenExport = nil
     }
     private func matchesScope(_ d: Detection) -> Bool {
         switch scope {
         case .all:     return true
-        case .new:     return ble.isUnseen(d)
+        case .new:
+            return paused ? (frozenExport?.unseenIDs.contains(d.id) == true) : ble.isUnseen(d)
         case .offline: return d.offline
         }
     }
@@ -195,6 +213,9 @@ struct DetectionsView: View {
                     .frame(maxWidth: 640)
                     .frame(maxWidth: .infinity, alignment: .center)
                 }
+                // Extra bottom margin only at accessibility sizes, so grown content never ends
+                // under the tab bar; zero at default sizes (layout untouched).
+                .contentMargins(.bottom, dynamicTypeSize.isAccessibilitySize ? 24 : 0, for: .scrollContent)
                 if selecting { selectBar }
             }
             .navigationBarHidden(true)
@@ -204,10 +225,17 @@ struct DetectionsView: View {
             .onAppear {
                 // Drive-mode surfaces (widget / notification) deep-link here with
                 // the NEW filter pre-armed via this flag; consume it once.
-                if UserDefaults.standard.bool(forKey: "acab.pendingNewFilter") {
+                let deepLinkNew = UserDefaults.standard.bool(forKey: "acab.pendingNewFilter")
+                if deepLinkNew {
                     scope = .new
                     UserDefaults.standard.removeObject(forKey: "acab.pendingNewFilter")
+                } else {
+                    // First ordinary open, baseline the New dots to what is already here so a
+                    // fresh install / first backlog is not a wall of dots. Once-only. Skipped on a
+                    // NEW deep-link, or the baseline would erase the very rows it exists to show.
+                    ble.seedSeenWatermarkOnce()
                 }
+                consumeLogFocus()   // Status-tile category handoff, cold-tab path
             }
             // A Live Activity tap while this tab is already showing never re-fires
             // onAppear; RootView posts this notification so the filter arms right away.
@@ -215,19 +243,19 @@ struct DetectionsView: View {
                 scope = .new
                 UserDefaults.standard.removeObject(forKey: "acab.pendingNewFilter")
             }
+            // Status-tile category handoff, warm-tab path (see LogFocus).
+            .onReceive(NotificationCenter.default.publisher(for: LogFocus.notification)) { _ in
+                consumeLogFocus()
+            }
             .sheet(item: $exportFile) { ShareSheet(items: [$0.url]) }
-            .alert("Nothing to map", isPresented: $gpxHadNothing) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text("None of these detections has a location, so there is nothing to put on a map. "
-                     + "Export CSV instead - it keeps every row, with the location columns blank.")
+            .alert(item: $exportProblem) { problem in
+                Alert(title: Text(problem.title), message: Text(problem.message),
+                      dismissButton: .default(Text("OK")))
             }
             .confirmationDialog("Clear \(ble.detections.count) detection\(ble.detections.count == 1 ? "" : "s")?",
                                 isPresented: $confirmClear, titleVisibility: .visible) {
                 Button("Export CSV first") {
-                    ble.writeDetectionsCSV { url in
-                        if let url { exportFile = ExportFile(url: url) }
-                    }
+                    export(.csv, snapshot: ble.detectionExportSnapshot(), qualifier: nil)
                 }
                 Button("Clear log", role: .destructive) { ble.clearDetections() }
                 Button("Cancel", role: .cancel) {}
@@ -251,6 +279,8 @@ struct DetectionsView: View {
                         .padding(.horizontal, 12).frame(height: 36)
                         .background(ACABTheme.bg2, in: Capsule())
                         .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
@@ -266,49 +296,70 @@ struct DetectionsView: View {
         ScrollView(.horizontal, showsIndicators: false) {
         HStack(spacing: 8) {
             actionChip("checkmark.circle", "SELECT") { resumeFeed(); selecting = true }   // bulk-ignore acts on live rows
-            // Both exports carry the CURRENT category filter, and the labels name it, so the chip
-            // says what it will actually hand over ("EXPORT DRONE CSV") rather than implying the
-            // whole log. Mirrors Android LogScreen.exportLog.
-            actionChip("square.and.arrow.up", filter.map { "\($0) CSV" } ?? "EXPORT CSV") {
-                ble.writeDetections(.csv, category: filter) { url in
-                    if let url { exportFile = ExportFile(url: url) }
-                }
+            // CSV and GPX used to be two chips. That was two of the four slots in a row that must
+            // scroll on a phone, spent on two variants of one action, so they fold into a single
+            // EXPORT chip with a menu. Both formats still carry the CURRENT category filter, and
+            // the chip names it ("EXPORT DRONE") so a partial export can't be mistaken for the
+            // whole log. Mirrors Android LogScreen's export menu.
+            Menu {
+                Button {
+                    export(.csv)
+                } label: { Label("CSV, shown rows", systemImage: "tablecells") }
+                Button {
+                    export(.gpx)
+                } label: { Label("GPX, for maps", systemImage: "mappin.and.ellipse") }
+            } label: {
+                chipLabel("square.and.arrow.up", filter.map { "EXPORT \($0)" } ?? "EXPORT")
             }
-            actionChip("mappin.and.ellipse", filter.map { "\($0) GPX" } ?? "EXPORT GPX") {
-                ble.writeDetections(.gpx, category: filter) { url in
-                    // nil here means "nothing mappable", not "write failed": buildGPX refuses to
-                    // hand back a waypoint-less document. Say so, or the share sheet opens on an
-                    // empty file and looks like a broken export.
-                    if let url { exportFile = ExportFile(url: url) } else { gpxHadNothing = true }
-                }
-            }
+            .buttonStyle(.plain)
             actionChip("checkmark", "MARK SEEN") { ble.markAllSeen(); scope = .all }
         }
         }
     }
 
+    // The chip's visual, factored out so the plain-action chips and the EXPORT menu share one
+    // capsule. A Menu needs a label view, not a Button, so actionChip below wraps this in a Button
+    // and the export menu uses it directly.
+    private func chipLabel(_ system: String, _ label: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: system).font(.system(size: 11, weight: .semibold))
+            Text(label).font(ACABTheme.mono(10, weight: .bold)).tracking(0.5)
+        }
+        .foregroundStyle(ACABTheme.dim)
+        .padding(.horizontal, 11).frame(height: 36)
+        .background(ACABTheme.bg2, in: Capsule())
+        .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
+        // 44pt minimum hit target: the capsule stays 36pt visually, the extra height is
+        // invisible tappable area (contentShape), so the look is unchanged.
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+    }
+
     private func actionChip(_ system: String, _ label: String,
                             _ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 5) {
-                Image(systemName: system).font(.system(size: 11, weight: .semibold))
-                Text(label).font(ACABTheme.mono(10, weight: .bold)).tracking(0.5)
-            }
-            .foregroundStyle(ACABTheme.dim)
-            .padding(.horizontal, 11).frame(height: 36)
-            .background(ACABTheme.bg2, in: Capsule())
-            .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
-        }
+        Button(action: action) { chipLabel(system, label) }
         .buttonStyle(.plain)
     }
 
     /// A strip of compact category tiles, one per category that has a detection this session;
     /// tapping one toggles it as a filter for the list. Dynamic so the row scales as categories
-    /// grow and a zero-count (useless) filter never takes up space.
+    /// grow and a zero-count (useless) filter never takes up space. At accessibility text sizes
+    /// the strip reflows into a 3-wide grid: up to six-across tiles get ~55pt each while the
+    /// labels quadruple, and the row became unreadable. Default layout untouched.
+    @ViewBuilder
     private func summaryTiles(_ snap: LogSnapshot) -> some View {
-        HStack(spacing: 8) {
-            ForEach(shownCategories(snap)) { c in
-                tile(c.type, c.key, c.tileLabel, count: snap.counts[c.key] ?? 0)
+        if dynamicTypeSize.isAccessibilitySize {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3),
+                      spacing: 8) {
+                ForEach(shownCategories(snap)) { c in
+                    tile(c.type, c.key, c.tileLabel, count: snap.counts[c.key] ?? 0)
+                }
+            }
+        } else {
+            HStack(spacing: 8) {
+                ForEach(shownCategories(snap)) { c in
+                    tile(c.type, c.key, c.tileLabel, count: snap.counts[c.key] ?? 0)
+                }
             }
         }
     }
@@ -344,8 +395,23 @@ struct DetectionsView: View {
                         in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
                 .strokeBorder(active ? type.tint.opacity(0.4) : ACABTheme.line, lineWidth: 1))
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel("\(spokenCategory(label)), \(n) detection\(n == 1 ? "" : "s")")
+        .accessibilityAddTraits(active ? .isSelected : [])
+        .accessibilityHint(active ? "Clears this filter" : "Filters the log to this category")
+    }
+
+    private func spokenCategory(_ label: String) -> String {
+        switch label {
+        case "ALPR": return "automatic license plate readers"
+        case "BODY CAM": return "body cameras"
+        case "CAMERA", "NETCAM", "NETWORK CAM": return "network cameras"
+        case "TRKR", "TRACKER": return "item trackers"
+        case "GLAS", "GLASSES": return "recording glasses"
+        default: return label.lowercased()
+        }
     }
 
     /// All / New / Offline segmented chips ("mark all seen" lives in the header chips now).
@@ -366,6 +432,10 @@ struct DetectionsView: View {
                         .foregroundStyle(ACABTheme.dim)
                         .padding(.horizontal, 10).padding(.vertical, 6)
                         .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
+                        // Small destructive control: pad the hit area out to 44pt without
+                        // growing the drawn capsule.
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Clear log")
@@ -386,8 +456,12 @@ struct DetectionsView: View {
             .padding(.horizontal, 11).padding(.vertical, 7)
             .background(active ? tint : ACABTheme.bg2, in: Capsule())
             .overlay(Capsule().strokeBorder(active ? .clear : ACABTheme.line, lineWidth: 1))
+            // 44pt hit target; the drawn capsule keeps its size.
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(active ? .isSelected : [])
     }
 
     /// The detection list (honoring the active filters), divider between rows.
@@ -434,6 +508,9 @@ struct DetectionsView: View {
                 .padding(.horizontal, 11).frame(height: 30)
                 .background(paused ? ACABTheme.accent : ACABTheme.bg2, in: Capsule())
                 .overlay(Capsule().strokeBorder(paused ? .clear : ACABTheme.line, lineWidth: 1))
+                // 44pt hit target around the 30pt capsule.
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(paused ? "Resume live feed" : "Pause live feed")
@@ -453,40 +530,79 @@ struct DetectionsView: View {
     private func row(_ d: Detection) -> some View {
         // Resolved once per row: the log is where a buffered record is most likely to be read as
         // a plain timestamp, so the caveat has to travel with it.
-        let basis = ble.timeBasis(for: d.id)
-        // Per-row new-dot on every lens (not just NEW), so a fresh hit reads inline on ALL.
-        let isNew = ble.isUnseen(d)
+        let basis = paused ? (frozenExport?.basis(for: d.id) ?? .unknown) : ble.timeBasis(for: d.id)
         if selecting {
+            let selected = selection.contains(d.id)
             Button { toggle(d) } label: {
                 HStack(spacing: 10) {
-                    Image(systemName: selection.contains(d.id) ? "checkmark.circle.fill" : "circle")
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                         .font(.system(size: 18))
-                        .foregroundStyle(selection.contains(d.id) ? ACABTheme.accent : ACABTheme.faint)
-                    DetectionRow(detection: d, timeBasis: basis, isNew: isNew)
+                        .foregroundStyle(selected ? ACABTheme.accent : ACABTheme.faint)
+                    DetectionRow(detection: d, timeBasis: basis)
                 }
             }
             .buttonStyle(.plain)
+            .accessibilityAddTraits(selected ? .isSelected : [])
         } else if hSize == .regular {
             // Two-pane: rows select the right dossier instead of pushing; the active
             // row carries a subtle highlight.
             Button { selectedDetail = d } label: {
-                DetectionRow(detection: d, timeBasis: basis, isNew: isNew)
+                DetectionRow(detection: d, timeBasis: basis)
                     .background(
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .fill(selectedDetail?.id == d.id ? ACABTheme.lineStrong : Color.clear)
                     )
             }
             .buttonStyle(.plain)
+            .accessibilityAddTraits(selectedDetail?.id == d.id ? .isSelected : [])
         } else {
             // Value-based nav: the destination is built ONCE on tap (via navigationDestination),
             // not eagerly per row. A closure-NavigationLink here would materialize a full
             // DetectionDetailView for every row in the LazyVStack, so fast-scrolling thousands of
             // rows spiked memory/CPU and crashed the app.
             NavigationLink(value: d) {
-                DetectionRow(detection: d, timeBasis: basis, isNew: isNew)
+                DetectionRow(detection: d, timeBasis: basis)
             }
             .buttonStyle(.plain)
         }
+    }
+
+    /// Export the exact rows the user is reviewing. A paused view keeps its row fields, NEW
+    /// membership, timestamps, and observer positions frozen together; a live view takes one
+    /// authoritative manager snapshot at the tap instead of exporting the delayed UI projection.
+    private func export(_ format: BLEManager.ExportFormat,
+                        snapshot supplied: BLEManager.DetectionExportSnapshot? = nil,
+                        qualifier suppliedQualifier: String? = nil) {
+        let base = supplied ?? (paused ? frozenExport : nil) ?? ble.detectionExportSnapshot()
+        let scoped = supplied == nil
+            ? base.filtered(category: filter, unseenOnly: scope == .new, offlineOnly: scope == .offline)
+            : base
+        let qualifier = suppliedQualifier ?? exportQualifier
+        ble.writeDetections(format, snapshot: scoped, filenameQualifier: qualifier) { result in
+            switch result {
+            case .success(let url):
+                exportFile = ExportFile(url: url)
+            case .emptyGPX:
+                exportProblem = ExportProblem(
+                    title: "Nothing to map",
+                    message: "None of the reviewed detections has a location. Export CSV instead; it keeps every reviewed row with blank location columns.")
+            case .failure(let detail):
+                exportProblem = ExportProblem(
+                    title: "Export failed",
+                    message: "The file could not be prepared. \(detail)")
+            }
+        }
+    }
+
+    private var exportQualifier: String? {
+        var parts: [String] = []
+        if let filter { parts.append(filter) }
+        switch scope {
+        case .all: break
+        case .new: parts.append("NEW")
+        case .offline: parts.append("OFFLINE")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "-")
     }
 
     /// Bottom action bar shown in select mode: bulk-ignore the selected rows.
@@ -500,6 +616,8 @@ struct DetectionsView: View {
                     .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
             }
             .buttonStyle(.plain)
+            .accessibilityAddTraits(!shown.isEmpty && selection.isSuperset(of: shown.map(\.id))
+                                    ? .isSelected : [])
             Button(action: ignoreSelected) {
                 HStack(spacing: 7) {
                     Image(systemName: "bell.slash").font(.system(size: 13, weight: .bold))
@@ -522,6 +640,15 @@ struct DetectionsView: View {
         )
     }
 
+    /// Consume the one-shot Status-tile handoff: arm the category filter over the ALL scope.
+    /// The nil-out makes it exactly-once, so a later plain visit to the tab is unfiltered.
+    private func consumeLogFocus() {
+        guard let cat = LogFocus.pendingCategory else { return }
+        LogFocus.pendingCategory = nil
+        filter = cat
+        scope = .all
+    }
+
     private func toggle(_ d: Detection) {
         if selection.contains(d.id) { selection.remove(d.id) } else { selection.insert(d.id) }
     }
@@ -542,7 +669,7 @@ struct DetectionsView: View {
         if ble.demoMode { return "Sample data mode." }
         // No status frame at all = no board linked; "Scanning…" would be a lie.
         if ble.status == nil { return "No board linked." }
-        if radiosOff { return "Radios are off, flip them on in Device." }
+        if radiosOff { return "Radios are off, flip them on in Beacon." }
         return "Scanning\u{2026}"
     }
     private var radiosOff: Bool { if let s = ble.status { return !s.ble && !s.wifi }; return false }
@@ -598,14 +725,26 @@ struct DetectionsView: View {
         switch scope {
         case .new:     return "Nothing new"
         case .offline: return "Nothing offline"
-        case .all:     return "No matches"
+        // ALPR gets its specific title (Android parity): the body below already explains why a
+        // quiet ALPR lens is the expected result, and the generic "No matches" undersold that.
+        case .all:     return filter == "ALPR" ? "No ALPR radio signal" : "No matches"
         }
     }
     private var noMatchBody: String {
         switch scope {
         case .new:     return "Everything here is marked seen. New hits show up as they arrive."
         case .offline: return "No offline-recorded detections yet. The board buffers these while your phone is away."
-        case .all:     return "No detections in this category yet."
+        case .all:
+            // ALPR gets a specific line because a quiet result there means something different:
+            // most current installs are RF-silent (see the site + faq), so absence is expected,
+            // not a failure, and the map is the primary ALPR surface.
+            if filter == "ALPR" {
+                return "No compatible ALPR radio signal was observed. Some cameras do not broadcast "
+                     + "a detectable signal, many backhaul over cellular and stay silent. Check the "
+                     + "map for known installations, or export a diagnostic capture to contribute if "
+                     + "you can visually confirm one nearby."
+            }
+            return "No detections in this category yet."
         }
     }
 }

@@ -67,7 +67,11 @@ enum ReconstructedTime {
     static let floorSec = 2
 
     static func precisionSec(elapsedSec: TimeInterval) -> Int {
-        max(floorSec, Int((max(0, elapsedSec) * driftPerSecond).rounded()))
+        // Int(exactly:) instead of the trapping Int(_: Double): the decode boundary clamps `at`,
+        // but a checkpoint written by an older build can still replay a poisoned Date into here,
+        // and an absurd error bar must degrade, not crash.
+        let scaled = (max(0, elapsedSec) * driftPerSecond).rounded()
+        return max(floorSec, Int(exactly: scaled) ?? Int.max)
     }
 }
 

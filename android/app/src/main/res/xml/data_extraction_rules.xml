@@ -4,8 +4,10 @@
      only one leaves the other path open, which is the usual mistake here.
 
      See backup_rules.xml for why everything is excluded. Short version: the detections log, the
-     ALPR cache, the tile cache and the prefs (which carry board key material) are exactly the data
-     this product promises never leaves the device. -->
+     ALPR cache, the tile cache and the prefs (which carry board key material) must never travel
+     through automatic cloud backup or phone-to-phone migration, so both BACKUP channels stay
+     closed. This statement is intentionally scoped to backup; BLE board traffic, provider
+     requests and explicit export/send paths have their own disclosures. -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="root" />

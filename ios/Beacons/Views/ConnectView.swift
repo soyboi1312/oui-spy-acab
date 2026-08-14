@@ -1,17 +1,29 @@
 import SwiftUI
 import CoreBluetooth
+import UIKit
 
 /// Pre-connection / first-run screen: says what the beacon does, explains the permissions
 /// before the OS asks, scans for a board, and offers a first-class "tour on sample data" path.
 struct ConnectView: View {
     @EnvironmentObject var ble: BLEManager
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var showSavedLog = false   // read-only path into the persisted log, no board needed
+    // Scan-outcome bookkeeping: BLEManager's 45s scan window closes by silently settling back
+    // to .idle, which looked like a spinner that just gave up. Track when the window closed
+    // with nothing found so the panel can say so and offer another go.
+    @State private var scanStartedAt: Date?
+    @State private var scanCameUpEmpty = false
 
-    // The five things the beacon listens for, as shown in the "what it hears" strip.
+    // The six things the beacon listens for, as shown in the "what it hears" strip. Network
+    // cameras belong beside trackers: both are opt-in, and the copy below names them.
     private let hears: [(DeviceType, String)] = [
         (.flockCamera, "ALPR"), (.drone, "DRONES"), (.axonBodyCam, "BODY CAMS"),
-        (.tracker, "TRACKERS"), (.recordingGlasses, "GLASSES"),
+        (.tracker, "TRACKERS"), (.recordingGlasses, "GLASSES"), (.networkCamera, "NET CAM"),
     ]
+    // Start reflowing before the accessibility categories: at XX Large the five fixed columns
+    // already force BODY CAMS / TRACKERS through minimumScaleFactor. Accessibility sizes get two
+    // generous columns; XX Large and XXX Large get three or four depending on device width.
+    private var expandedHearsLayout: Bool { dynamicTypeSize >= .xxLarge }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -39,6 +51,17 @@ struct ConnectView: View {
 
             scopeFootnote
         }
+        // Timed-out-empty detection. Only a scan that ran (near) the full 45s window counts:
+        // a user tapping "Scanning..." to stop early chose to stop, and scolding them with
+        // "No boards found" for it would be wrong.
+        .onChange(of: ble.connectionState) { old, new in
+            if new == .scanning { scanStartedAt = Date(); scanCameUpEmpty = false }
+            if old == .scanning, new != .scanning {
+                let ranFull = scanStartedAt.map { Date().timeIntervalSince($0) >= 40 } ?? false
+                scanCameUpEmpty = ranFull && ble.discovered.isEmpty
+                scanStartedAt = nil
+            }
+        }
         .sheet(isPresented: $showSavedLog) {
             DetectionsView()
                 .environmentObject(ble)
@@ -55,22 +78,35 @@ struct ConnectView: View {
     private var beaconHearsPanel: some View {
         VStack(alignment: .leading, spacing: 14) {
             Kicker("WHAT YOUR BEACON CAN HEAR")
-            HStack(spacing: 0) {
+            // One row for all six tiles at normal + large type: equal flexible columns divide the
+            // width so they never wrap to a second row (labels wrap to two lines instead). Only at
+            // true accessibility sizes does it fall back to an adaptive grid that wraps on purpose.
+            LazyVGrid(
+                columns: dynamicTypeSize.isAccessibilitySize
+                    ? [GridItem(.adaptive(minimum: 116), spacing: 8)]
+                    : Array(repeating: GridItem(.flexible(), spacing: 6), count: hears.count),
+                spacing: expandedHearsLayout ? 14 : 8
+            ) {
                 ForEach(hears, id: \.1) { type, label in
                     VStack(spacing: 7) {
-                        CatGlyph(type: type, size: 32, filled: true)
+                        CatGlyph(type: type, size: 30, filled: true)
                         Text(label)
                             .font(ACABTheme.mono(8.5, weight: .medium)).tracking(0.5)
                             .foregroundStyle(ACABTheme.dim)
-                            .lineLimit(1).minimumScaleFactor(0.7)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.7)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .frame(maxWidth: .infinity)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(spokenHearsLabel(label))
                 }
             }
-            Text("a passive listener. it never jams, spoofs, or transmits, it writes down what's already shouting.")
+            Text("a passive detector. it never jams or spoofs nearby devices. it listens for their broadcasts, then reports detections to your phone.")
                 .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("trackers and network cameras are opt-in, switch them on in Device settings.")
+            Text("trackers and network cameras are opt-in, switch them on in Beacon settings.")
                 .font(ACABTheme.mono(9.5)).foregroundStyle(ACABTheme.faint)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -84,7 +120,11 @@ struct ConnectView: View {
         case .poweredOff:
             message("Bluetooth is off", "Turn on Bluetooth to find your board.", "bolt.slash.fill")
         case .unauthorized:
-            message("Bluetooth not allowed", "Enable Bluetooth for beacons in Settings.", "lock.fill")
+            permissionMessage("Bluetooth not allowed",
+                              ble.bluetoothRestricted
+                                ? "Bluetooth is restricted by device policy, so beacons cannot scan for a board."
+                                : "Bluetooth access is off for beacons. Turn it on in Settings to scan for a board.",
+                              "lock.fill")
         case .unknown:
             message("Starting Bluetooth\u{2026}", "", "antenna.radiowaves.left.and.right")
         case .connecting:
@@ -112,6 +152,7 @@ struct ConnectView: View {
                             .overlay(Capsule().strokeBorder(ACABTheme.line, lineWidth: 1))
                     }
                     .buttonStyle(.plain)
+                    .frame(minHeight: 44)
                     .padding(.top, 6)
                 }
                 .frame(maxWidth: .infinity)
@@ -161,21 +202,34 @@ struct ConnectView: View {
     /// panel only shows before Bluetooth is granted; once it is, the CTA stands on its own.
     private var scanPanel: some View {
         VStack(spacing: 14) {
-            if btGranted {
+            // The 45s scan window closed with nothing found: name the outcome and the fix.
+            // Sits above the CTA so it is the first thing read after the timeout.
+            if scanCameUpEmpty, ble.discovered.isEmpty { noBoardsPanel }
+            if btGranted && ble.locationAuthorizationStatus != .notDetermined {
                 scanCTA
                 pairWindowNote
             } else {
                 VStack(alignment: .leading, spacing: 13) {
                     Kicker("BEFORE THE SYSTEM ASKS")
-                    rationaleRow("antenna.radiowaves.left.and.right", "Bluetooth",
-                                 "pairs you to the beacon. The board does the listening, not your phone.")
-                    rationaleRow("location.fill", "Location",
-                                 "pins hits to the map. Nothing leaves this phone, no accounts, no cloud.")
+                    if !btGranted {
+                        rationaleRow("antenna.radiowaves.left.and.right", "Bluetooth",
+                                     "pairs you to the beacon. The board does the listening, not your phone.")
+                    }
+                    // Claim is deliberately automatic-upload-shaped: "nothing leaves this phone"
+                    // stopped being true when explicit CSV export and the contribution flow
+                    // shipped, and an absolute promise the app can be caught breaking is worse
+                    // than the accurate one. Same canonical sentence as Android.
+                    if ble.locationAuthorizationStatus == .notDetermined {
+                        rationaleRow("location.fill", "Location (optional)",
+                                     "pins observer-based hits to the map and sends your current coordinates over encrypted local Bluetooth to your own beacon for geotagging. Drones can still provide their own Remote ID position if you decline. The app does not automatically upload detections or location to us. Beyond your own beacon, they reach another recipient only when you explicitly export or send them. Map tiles and optional datasets are requested from their providers. No account is required.")
+                    }
                     scanCTA
                     pairWindowNote
                 }
                 .panel()
             }
+
+            if ble.locationDenied { locationPermissionPanel }
 
             if ble.discovered.isEmpty, ble.connectionState == .scanning {
                 Text("Looking for your board\u{2026}")
@@ -187,8 +241,36 @@ struct ConnectView: View {
             ForEach(ble.discovered) { dev in
                 Button { ble.connect(dev) } label: { boardRow(dev) }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("\(dev.name), signal strength \(dev.rssi) decibels relative to one milliwatt"
+                        + (dev.firmware.map { ", firmware \($0)" } ?? ""))
+                    .accessibilityHint("Connects to this beacon")
             }
         }
+    }
+
+    /// Shown after a full scan window found nothing: an actionable outcome instead of the
+    /// silent settle back to the idle CTA (which read as an indefinite spinner giving up).
+    private var noBoardsPanel: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "antenna.radiowaves.left.and.right.slash")
+                .font(.system(size: 22)).foregroundStyle(ACABTheme.dim)
+            Text("No boards found. Make sure your beacon is powered on and nearby, then scan again.")
+                .font(ACABTheme.mono(11.5)).foregroundStyle(ACABTheme.dim)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            Button { ble.startScanFromUser() } label: {
+                Text("SCAN AGAIN")
+                    .font(ACABTheme.mono(12, weight: .bold)).tracking(1)
+                    .foregroundStyle(ACABTheme.accent)
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 44)   // 44pt target
+                    .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .frame(maxWidth: .infinity)
+        .panel()
     }
 
     private func rationaleRow(_ symbol: String, _ lead: String, _ rest: String) -> some View {
@@ -203,12 +285,25 @@ struct ConnectView: View {
         }
     }
 
+    private func spokenHearsLabel(_ label: String) -> String {
+        switch label {
+        case "ALPR": return "automatic license plate readers"
+        case "DRONES": return "drones"
+        case "BODY CAMS": return "body cameras"
+        case "TRACKERS": return "item trackers"
+        case "GLASSES": return "recording glasses"
+        default: return label.lowercased()
+        }
+    }
+
     private var scanCTA: some View {
         Button {
-            ble.connectionState == .scanning ? ble.stopScan() : ble.startScan()
+            ble.connectionState == .scanning ? ble.stopScan() : ble.startScanFromUser()
         } label: {
             Label(ble.connectionState == .scanning ? "Scanning\u{2026}"
-                    : (btGranted ? "Scan for boards" : "Allow & scan for boards"),
+                    : (!btGranted ? "Allow Bluetooth & scan"
+                       : (ble.locationAuthorizationStatus == .notDetermined
+                          ? "Continue & scan for boards" : "Scan for boards")),
                   systemImage: ble.connectionState == .scanning
                     ? "stop.circle.fill" : "antenna.radiowaves.left.and.right")
                 .font(ACABTheme.mono(14, weight: .bold))
@@ -220,6 +315,51 @@ struct ConnectView: View {
         }
         .buttonStyle(.plain)
         .padding(.top, 2)
+    }
+
+    /// Location is optional: the board scan and Remote ID coordinates still work without it.
+    /// This recovery card avoids both bad extremes, a dead-looking map and a false claim that no
+    /// detections can ever be mapped, while offering the system route to change the decision.
+    private var locationPermissionPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "location.slash.fill")
+                    .foregroundStyle(ACABTheme.warn).frame(width: 20)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(ble.locationRestricted ? "Location is restricted" : "Location is off")
+                        .font(ACABTheme.mono(12.5, weight: .bold)).foregroundStyle(ACABTheme.text)
+                    Text(ble.locationRestricted
+                         ? "A device policy prevents observer-location access. Board scanning still works, and drones with Remote ID coordinates can still appear on the map."
+                         : "Board scanning still works. Observer-based map pins will be absent, while drones with Remote ID coordinates can still appear.")
+                        .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Button("OPEN SETTINGS", action: openSettings)
+                .font(ACABTheme.mono(11, weight: .bold)).tracking(1)
+                .foregroundStyle(ACABTheme.accent)
+                .frame(maxWidth: .infinity, minHeight: 44)
+                .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
+                    .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+        }
+        .panel()
+    }
+
+    private func permissionMessage(_ title: String, _ body: String, _ symbol: String) -> some View {
+        VStack(spacing: 12) {
+            message(title, body, symbol)
+            Button("OPEN SETTINGS", action: openSettings)
+                .font(ACABTheme.mono(11, weight: .bold)).tracking(1)
+                .foregroundStyle(ACABTheme.accent)
+                .frame(maxWidth: .infinity, minHeight: 44)
+                .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
+                    .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+        }
+    }
+
+    private func openSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
     }
 
     /// First-time pairing note, shown under the scan button whenever no board is connected.
@@ -377,9 +517,11 @@ struct ConnectView: View {
         Link(destination: URL(string: "https://soyboi.tech")!) {
             Text("soyboi.tech")
                 .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.accent)
+                .frame(maxWidth: .infinity)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .frame(maxWidth: .infinity, alignment: .center)
         .padding(.top, 2)
     }
 

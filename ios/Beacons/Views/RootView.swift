@@ -8,33 +8,44 @@ struct RootView: View {
     /// MainTabView) so it presents over the tabs the instant they appear, which is exactly the
     /// "I'm connected, now what?" moment new users were getting stuck at.
     @State private var showFirstRunTour = false
+    // Once the tab shell has existed, keep that exact instance mounted. A transient BLE dropout
+    // should cover it with recovery UI, not destroy its NavigationStacks and an in-progress
+    // ContributeView capture. This intentionally lasts for the process; the hidden shell is cheap
+    // and retaining user-entered field work is more important than rebuilding it after reconnect.
+    @State private var hasMountedMain = false
+    private var mainIsUsable: Bool {
+        ble.connectionState == .connected || (hasMountedMain && ble.isReconnecting)
+    }
 
     var body: some View {
         ZStack {
             ACABTheme.bg.ignoresSafeArea()
-            if ble.connectionState == .connected {
-                #if DEBUG
-                if ProcessInfo.processInfo.arguments.contains("-detail"),
-                   let d = ble.detections.max(by: { $0.rssi < $1.rssi }) {
-                    NavigationStack { DetectionDetailView(detection: d) }
-                } else {
-                    MainTabView()
-                }
-                #else
-                MainTabView()
-                #endif
-            } else {
+            if hasMountedMain || ble.connectionState == .connected {
+                connectedContent
+                    .opacity(mainIsUsable ? 1 : 0)
+                    .allowsHitTesting(mainIsUsable)
+                    .accessibilityHidden(!mainIsUsable)
+            }
+            if !mainIsUsable {
                 ConnectView()
+                    .background(ACABTheme.bg.ignoresSafeArea())
+                    .zIndex(1)
             }
         }
         // Reconnect "black box" count banner. Lives on RootView (always mounted) so it's
         // seen no matter which tab is up when the board finishes replaying its buffer.
         .overlay(alignment: .top) {
-            if let summary = ble.offlineSyncBanner {
-                OfflineSyncBannerView(summary: summary)
-                    .padding(.horizontal, 14)
-                    .transition(.move(edge: .top).combined(with: .opacity))
+            VStack(spacing: 8) {
+                if hasMountedMain, ble.isReconnecting {
+                    LinkRecoveryBannerView()
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                if let summary = ble.offlineSyncBanner {
+                    OfflineSyncBannerView(summary: summary)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
             }
+            .padding(.horizontal, 14)
         }
         .animation(.easeInOut, value: ble.offlineSyncBanner)
         .preferredColorScheme(.dark)
@@ -42,7 +53,10 @@ struct RootView: View {
         // Arm on the first REAL connection only: demo mode has its own guided framing, and firing
         // the tour over sample data would spend the one-time moment on a fake board.
         .onChange(of: ble.connectionState) { _, new in
-            if new == .connected, !ble.demoMode, !FirstRunTour.hasSeen { showFirstRunTour = true }
+            if new == .connected {
+                hasMountedMain = true
+                if !ble.demoMode, !FirstRunTour.hasSeen { showFirstRunTour = true }
+            }
         }
         .sheet(isPresented: $showFirstRunTour) { FirstRunTourView() }
         // The pending flags below live in UserDefaults, which survives process death: a tap
@@ -52,6 +66,7 @@ struct RootView: View {
         // Clear both on launch, before onOpenURL can re-set them, so a tap only ever seeds
         // the session it arrived in. RootView appears exactly once per process.
         .onAppear {
+            if ble.connectionState == .connected { hasMountedMain = true }
             UserDefaults.standard.removeObject(forKey: "acab.pendingNewFilter")
             UserDefaults.standard.removeObject(forKey: "acab.pendingTab")
         }
@@ -69,10 +84,54 @@ struct RootView: View {
             }
         }
     }
+
+    @ViewBuilder private var connectedContent: some View {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-detail"),
+           let d = ble.detections.max(by: { $0.rssi < $1.rssi }) {
+            NavigationStack { DetectionDetailView(detection: d) }
+        } else {
+            MainTabView()
+        }
+        #else
+        MainTabView()
+        #endif
+    }
+}
+
+/// Keep the app usable during a transient board dropout, especially Stop/Review in an active
+/// contribution. The tab shell remains mounted underneath; this compact banner names the state
+/// and retains the same escape ConnectView offered without replacing the user's navigation tree.
+private struct LinkRecoveryBannerView: View {
+    @EnvironmentObject var ble: BLEManager
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ProgressView().controlSize(.small).tint(ACABTheme.accent)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Reconnecting to your beacon")
+                    .font(ACABTheme.mono(11.5, weight: .bold)).foregroundStyle(ACABTheme.text)
+                Text("Your open screen and capture are preserved.")
+                    .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.dim)
+            }
+            Spacer(minLength: 4)
+            Button("STOP & SCAN") { ble.disconnect() }
+                .font(ACABTheme.mono(9.5, weight: .bold)).tracking(0.5)
+                .foregroundStyle(ACABTheme.dim)
+                .frame(minHeight: 44)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm))
+        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
+            .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+        .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
+        .accessibilityElement(children: .contain)
+    }
 }
 
 /// Four-tab shell (Status, Map, Log, Device) with a frosted tab bar.
 struct MainTabView: View {
+    @EnvironmentObject var ble: BLEManager
     @State private var tab: Int
 
     init() {
@@ -111,9 +170,16 @@ struct MainTabView: View {
             DetectionsView()
                 .tabItem { Label("Log", systemImage: "list.bullet.rectangle.fill") }.tag(2)
             DeviceView()
-                .tabItem { Label("Device", systemImage: "cpu.fill") }.tag(3)
+                .tabItem { Label("Beacon", systemImage: "cpu.fill") }.tag(3)   // label only; DeviceView identifier stays
         }
         .tint(ACABTheme.accent)
+        // A New dot means "arrived since you last looked at the log": advance the seen-watermark
+        // when the user LEAVES the Log tab. Opening a dossier keeps the selection on tag 2, so
+        // this only fires on a real tab switch, never when drilling into a row. Mirrors Android's
+        // Tab.LOG onDispose in MainScreen.
+        .onChange(of: tab) { old, new in
+            if old == 2 && new != 2 { ble.markAllSeen() }
+        }
         // Cold path: a Live Activity tap landed before we mounted (cold launch, or
         // ConnectView was up). RootView parked the target tab in this flag; consume it.
         .onAppear {
@@ -133,6 +199,11 @@ struct MainTabView: View {
         .onReceive(NotificationCenter.default.publisher(for: MapFocus.notification)) { _ in
             tab = 1
         }
+        // A Status category tile tap: switch to the Log tab. DetectionsView consumes the
+        // stashed category itself (see LogFocus in DetectionsView.swift).
+        .onReceive(NotificationCenter.default.publisher(for: LogFocus.notification)) { _ in
+            tab = 2
+        }
     }
 }
 
@@ -144,7 +215,18 @@ struct OfflineSyncBannerView: View {
     @EnvironmentObject var ble: BLEManager
 
     private var message: String {
+        // The unreplayed clause is a DISCLOSURE, not a retry prompt: those records were consumed
+        // from the board's ring and skipped (over-MTU), so no retry can refill them. Kept
+        // byte-identical to Android's OfflineSyncBanner copy.
         let noun = summary.count == 1 ? "detection" : "detections"
+        if summary.count == 0 && summary.unreplayed > 0 {
+            let bnoun = summary.unreplayed == 1 ? "detection" : "detections"
+            return "\(summary.unreplayed) buffered \(bnoun) couldn't be replayed from the beacon"
+        }
+        if summary.unreplayed > 0 {
+            return "\(summary.count) \(noun) recorded while you were away"
+                + " (\(summary.unreplayed) more couldn't be replayed)"
+        }
         return "\(summary.count) \(noun) recorded while you were away"
     }
 
@@ -164,16 +246,20 @@ struct OfflineSyncBannerView: View {
                     .foregroundStyle(ACABTheme.onAccent)
                     .padding(.horizontal, 12).frame(height: 30)
                     .background(ACABTheme.accent, in: Capsule())
+                    // 44pt hit target around the 30pt capsule; the drawn pill is unchanged.
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             Button { ble.clearOfflineSyncBanner() } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundStyle(ACABTheme.dim)
-                    .frame(width: 30, height: 30)
+                    .frame(width: 44, height: 44)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss")
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
         .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))

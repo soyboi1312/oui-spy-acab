@@ -2,9 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Beacons does not track users, collects no data, and shares nothing. The one required-reason
-         API it uses is UserDefaults: to store the user's own settings on their own device
-         (CA92.1), and to write the detection summary into the App Group the widget reads (1C8F.1). -->
+    <!-- Beacons does not track users or automatically collect user data. Improve Detection and
+         Log export create files only after a user action, and the user chooses and confirms the
+         destination in the system mail/share UI. The one required-reason API is UserDefaults: for
+         on-device settings (CA92.1) and the App Group detection summary (1C8F.1). -->
     <key>NSPrivacyTracking</key>
     <false/>
     <key>NSPrivacyTrackingDomains</key>

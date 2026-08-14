@@ -11,6 +11,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,6 +26,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -43,6 +47,7 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -57,7 +62,13 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -67,6 +78,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import tech.acab.app.net.ALPR_TIER_LEGACY_FORMAT
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import android.view.MotionEvent
@@ -154,7 +166,15 @@ fun DetailScreen(
     // T2: cap the readable dossier width so tablets/landscape stop stretching one column edge to
     // edge; at phone width the 640 cap is a no-op. The outer Box centers the capped content; the
     // top bar and scrim below stay full-bleed. The map thumbnail rides inside the capped column.
-    Box(Modifier.fillMaxSize().background(Acab.bg), contentAlignment = Alignment.TopCenter) {
+    Box(
+        Modifier.fillMaxSize().background(Acab.bg)
+            .then(if (helpDeepLink != null) Modifier.clearAndSetSemantics { } else Modifier)
+            // Compact dossiers are siblings of Scaffold and otherwise draw under status,
+            // navigation and cutout insets. In wide panes the parent already consumes these,
+            // so Compose applies zero here rather than double-padding.
+            .windowInsetsPadding(WindowInsets.safeDrawing),
+        contentAlignment = Alignment.TopCenter,
+    ) {
         Column(
             Modifier
                 .widthIn(max = 640.dp)
@@ -198,8 +218,15 @@ fun DetailScreen(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Kicker(if (stale) "SIGNAL · STALE" else "SIGNAL · LIVE",
                         color = if (stale) Acab.dim else Acab.faint)
-                    Icon(Icons.Outlined.Info, contentDescription = "What the RSSI graph means",
-                        tint = Acab.dim, modifier = Modifier.padding(start = 6.dp).size(14.dp).clickable { showRssiInfo = !showRssiInfo })
+                    Box(
+                        Modifier.minimumInteractiveComponentSize()
+                            .clickable { showRssiInfo = !showRssiInfo },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(Icons.Outlined.Info,
+                            contentDescription = "What the RSSI graph means",
+                            tint = Acab.dim, modifier = Modifier.size(14.dp))
+                    }
                     Spacer(Modifier.weight(1f))
                     SignalBars(rssiBars(d.rssi), tint = tone)
                 }
@@ -373,6 +400,7 @@ fun DetailScreen(
         ) {
             Box(
                 Modifier
+                    .minimumInteractiveComponentSize()
                     .size(36.dp)
                     .background(Acab.bg2, RoundedCornerShape(50))
                     .border(1.dp, Acab.line, RoundedCornerShape(50))
@@ -385,7 +413,7 @@ fun DetailScreen(
             Spacer(Modifier.weight(1f))
             Kicker("DETECTION")
             Spacer(Modifier.weight(1f))
-            Spacer(Modifier.size(36.dp))   // dummy right item so the kicker stays centered
+            Spacer(Modifier.size(48.dp))   // match the back button's 48dp layout target
         }
     }
 
@@ -406,7 +434,16 @@ private fun HelpOverlay(questionId: String, onClose: () -> Unit) {
         Modifier
             .fillMaxSize()
             .background(Acab.bg)
-            .clickable(enabled = false) {}      // swallow taps so the dossier behind is inert
+            // A semantics-free touch shield: child controls and scrolling consume first; only
+            // otherwise-unhandled events are stopped from reaching the dossier underneath.
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent(PointerEventPass.Final)
+                        event.changes.filterNot { it.isConsumed }.forEach { it.consume() }
+                    }
+                }
+            }
             .verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -416,6 +453,7 @@ private fun HelpOverlay(questionId: String, onClose: () -> Unit) {
         ) {
             Box(
                 Modifier
+                    .minimumInteractiveComponentSize()
                     .size(36.dp)
                     .clip(RoundedCornerShape(Acab.radius))
                     .background(Acab.bg2)
@@ -428,7 +466,7 @@ private fun HelpOverlay(questionId: String, onClose: () -> Unit) {
             Spacer(Modifier.weight(1f))
             Kicker("HELP")
             Spacer(Modifier.weight(1f))
-            Spacer(Modifier.size(36.dp))
+            Spacer(Modifier.size(48.dp))
         }
         Box(Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
             HelpScreen(scrollToId = questionId)
@@ -460,9 +498,10 @@ private fun BadgePill(label: String, tone: Color) {
  * the answer only existed on the website. A reporter using the device hit exactly that and
  * concluded the hardware was broken.
  *
- * Renders nothing for categories with no mapped questions , deliberate for glasses and body cam,
- * which already carry the experimental note directly below. Stacking a second hedge under it reads
- * as doubt about the detection rather than a pointer to context. Mirrors iOS relatedHelpPanel.
+ * Renders nothing for categories with no mapped questions (nearby device and unknown, whose
+ * faqKey is ""). Every real category has entries now, glasses and body cam included, and the
+ * drift check enforces that; the panel sits above each category's own experimental note where
+ * one exists. Mirrors iOS relatedHelpPanel.
  */
 @Composable
 private fun RelatedHelpPanel(d: Detection, onOpen: (String) -> Unit) {
@@ -473,7 +512,8 @@ private fun RelatedHelpPanel(d: Detection, onOpen: (String) -> Unit) {
         Kicker("RELATED HELP")
         qs.forEachIndexed { i, q ->
             Row(
-                Modifier.fillMaxWidth().clickable { onOpen(q.id) }.padding(vertical = 9.dp),
+                Modifier.fillMaxWidth().minimumInteractiveComponentSize()
+                    .clickable { onOpen(q.id) }.padding(vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
@@ -711,7 +751,15 @@ private fun ConfirmItPanel(d: Detection, firstSeen: Long?, watched: Boolean, onW
 @Composable
 private fun CheckRow(text: String, checked: Boolean, onToggle: () -> Unit) {
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(vertical = 10.dp),
+        Modifier.fillMaxWidth()
+            .minimumInteractiveComponentSize()
+            .toggleable(
+                value = checked,
+                role = Role.Checkbox,
+                onValueChange = { onToggle() },
+            )
+            .semantics(mergeDescendants = true) {}
+            .padding(vertical = 10.dp),
         verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
@@ -732,6 +780,7 @@ private fun WatchChip(watched: Boolean, onClick: () -> Unit) {
     val shape = RoundedCornerShape(6.dp)
     Row(
         Modifier
+            .minimumInteractiveComponentSize()
             .clip(shape)
             .background(if (watched) gold else gold.copy(alpha = 0.14f), shape)
             .border(1.dp, if (watched) Color.Transparent else gold.copy(alpha = 0.4f), shape)
@@ -806,6 +855,30 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
     val context = LocalContext.current
     val markers = rememberCategoryMarkers()
     val operatorMarker = rememberOperatorMarker()
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    val liveMap = remember { mutableStateOf<MapView?>(null) }
+    val mapResumed = remember { booleanArrayOf(false) }
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
+                    if (!mapResumed[0]) liveMap.value?.onResume()
+                    mapResumed[0] = liveMap.value != null
+                }
+                androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> {
+                    if (mapResumed[0]) liveMap.value?.onPause()
+                    mapResumed[0] = false
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            if (mapResumed[0]) liveMap.value?.onPause()
+            mapResumed[0] = false
+        }
+    }
 
     Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -825,21 +898,28 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
         // We NEVER show a "no mapped camera" line: OSM lags installs and cruiser ALPR is meant to
         // move, so absence is not evidence of a false positive (the confidence % chip is that tell).
         if (d.type == DeviceType.FLOCK_CAMERA || d.type == DeviceType.FLOCK_RAVEN) {
-            AlprStore.getInstance(context).nearest(lat, lon)?.let { (meters, maker, ok) ->
+            AlprStore.getInstance(context).nearest(lat, lon)?.let { (meters, maker, tier) ->
                 if (meters <= 150) {
                     val m = meters.roundToInt()
-                    // This line is the app VOUCHING for a detection using the mapped maker as
-                    // corroboration, so it must not spend the maker's credibility on a maker
-                    // nobody verified. An unverified node still corroborates the LOCATION but not
-                    // the NAME, so it drops the maker rather than repeating a guess back as
-                    // evidence. Mirrors iOS DetectionDetailView.
+                    // This line is the app using the mapped record as corroboration. Only tier 1
+                    // carries structured manufacturer attribution; tier 0 can support the mapped
+                    // location without naming a maker, while tier 2 stays explicitly a legacy
+                    // candidate. Mirrors iOS DetectionDetailView.
                     Text(
                         when {
-                            !ok -> "\u2713 near a community-mapped camera · $m m"
-                            maker.isEmpty() -> "\u2713 matches a mapped camera · $m m"
-                            else -> "\u2713 matches a mapped $maker camera · $m m"
+                            tier == 0 ->
+                                "\u2713 near a mapped ALPR camera · no structured manufacturer · $m m"
+                            tier == 2 -> "near a legacy ALPR candidate · $m m"
+                            tier == ALPR_TIER_LEGACY_FORMAT ->
+                                "\u2713 near a mapped ALPR camera · legacy dataset format · $m m"
+                            tier == 1 && maker.isEmpty() ->
+                                "\u2713 near a mapped ALPR camera · manufacturer attributed · $m m"
+                            tier == 1 -> "\u2713 matches a mapped $maker camera · $m m"
+                            else -> "near a mapped ALPR record · unknown attribution tier · $m m"
                         },
-                        color = if (ok) Acab.flockTone else Acab.warn, fontSize = 11.sp,
+                        color = if (tier == 1 || tier == ALPR_TIER_LEGACY_FORMAT)
+                            Acab.flockTone else Acab.warn,
+                        fontSize = 11.sp,
                         fontWeight = FontWeight.Medium, fontFamily = Acab.mono,
                     )
                 }
@@ -854,7 +934,8 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
                 .height(170.dp)
                 .clip(RoundedCornerShape(Acab.radiusSm))
                 .border(1.dp, Acab.line, RoundedCornerShape(Acab.radiusSm))
-                .clickable { onOpenInMap(lat, lon) },
+                .clickable(role = Role.Button) { onOpenInMap(lat, lon) }
+                .semantics { contentDescription = "Open this location in the map" },
         ) {
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
@@ -872,6 +953,14 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
                     object : MapView(ctx) {
                         override fun dispatchTouchEvent(event: MotionEvent?): Boolean = false
                     }.apply {
+                        liveMap.value = this
+                        if (lifecycleOwner.lifecycle.currentState.isAtLeast(
+                                androidx.lifecycle.Lifecycle.State.RESUMED)) {
+                            onResume()
+                            mapResumed[0] = true
+                        }
+                        importantForAccessibility =
+                            android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
                         setTileSource(TileSourceFactory.MAPNIK)
                         // MAPNIK ships light-only tiles; invert + desaturate so the thumbnail
                         // sits in the dark app instead of glowing like a flashlight.
@@ -894,7 +983,8 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
                         // drones broadcast the operator's position too; drop a pin for it
                         val plat = d.pilotLat
                         val plon = d.pilotLon
-                        if (plat != null && plon != null) {
+                        if (d.type == DeviceType.DRONE && plat != null && plon != null &&
+                            validCoord(plat, plon)) {
                             overlays.add(
                                 Marker(this).apply {
                                     position = GeoPoint(plat, plon)
@@ -922,7 +1012,8 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
                         val plat = d.pilotLat
                         val plon = d.pilotLon
                         val op = pins.firstOrNull { it.title == "Operator" }
-                        if (plat != null && plon != null) {
+                        if (d.type == DeviceType.DRONE && plat != null && plon != null &&
+                            validCoord(plat, plon)) {
                             if (op != null) {
                                 op.position = GeoPoint(plat, plon)
                             } else {
@@ -941,7 +1032,12 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
                         map.invalidate()
                     }
                 },
-                onRelease = { it.onDetach() },
+                onRelease = { map ->
+                    if (mapResumed[0]) map.onPause()
+                    mapResumed[0] = false
+                    if (liveMap.value === map) liveMap.value = null
+                    map.onDetach()
+                },
             )
             // Corner pill that makes the tap discoverable; the tap target is the whole
             // thumbnail, not just the pill. Kicker-style mono caps on a dim scrim. Top-trailing
@@ -1097,6 +1193,7 @@ private fun CopyMacButton(mac: String) {
     Row(
         Modifier
             .fillMaxWidth()
+            .minimumInteractiveComponentSize()
             .background(Acab.accent, RoundedCornerShape(Acab.radiusSm))
             .clickable {
                 val clip = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -1122,6 +1219,7 @@ private fun IgnoreButton(onIgnore: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
+            .minimumInteractiveComponentSize()
             .background(Acab.bg2, shape)
             .border(1.dp, Acab.line, shape)
             .clickable(onClick = onIgnore)
@@ -1147,6 +1245,7 @@ private fun WatchButton(watched: Boolean, onToggle: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
+            .minimumInteractiveComponentSize()
             .background(if (watched) Acab.watchTone else Acab.bg2, shape)
             .border(1.dp, if (watched) Color.Transparent else Acab.watchTone.copy(alpha = 0.4f), shape)
             .clickable(onClick = onToggle)
@@ -1188,12 +1287,14 @@ private fun RandomAddrWarnDialog(type: DeviceType, onDismiss: () -> Unit, onConf
         confirmButton = {
             Text("WATCH ANYWAY", color = Acab.warn, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                 letterSpacing = 0.5.sp, fontFamily = Acab.mono,
-                modifier = Modifier.clickable(onClick = onConfirm).padding(8.dp))
+                modifier = Modifier.minimumInteractiveComponentSize()
+                    .clickable(onClick = onConfirm).padding(8.dp))
         },
         dismissButton = {
             Text("CANCEL", color = Acab.dim, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                 letterSpacing = 0.5.sp, fontFamily = Acab.mono,
-                modifier = Modifier.clickable(onClick = onDismiss).padding(8.dp))
+                modifier = Modifier.minimumInteractiveComponentSize()
+                    .clickable(onClick = onDismiss).padding(8.dp))
         },
     )
 }
@@ -1219,7 +1320,8 @@ private fun WatchlistFullDialog(onDismiss: () -> Unit) {
         confirmButton = {
             Text("OK", color = Acab.dim, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                 letterSpacing = 0.5.sp, fontFamily = Acab.mono,
-                modifier = Modifier.clickable(onClick = onDismiss).padding(8.dp))
+                modifier = Modifier.minimumInteractiveComponentSize()
+                    .clickable(onClick = onDismiss).padding(8.dp))
         },
     )
 }
