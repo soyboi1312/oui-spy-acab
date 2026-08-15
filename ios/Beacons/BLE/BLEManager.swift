@@ -2464,7 +2464,7 @@ final class BLEManager: NSObject, ObservableObject {
     /// really about to drop, and `handlePwrNotify` arms `intentionalDisconnectID` on THAT. Arming on
     /// the confirmation rather than on this request is what stops a board that ignores the key (older
     /// firmware still reporting rev "B", or a write lost on the wire) from leaving the flag armed to
-    /// mis-classify a later unrelated disconnect. Once off, only a physical ~2s button hold wakes it.
+    /// mis-classify a later unrelated disconnect. Once off, only a physical ~1s button hold wakes it.
     func powerOffBeacon() {
         guard canWriteConfig else { return }
         writeConfig(["poweroff": true])

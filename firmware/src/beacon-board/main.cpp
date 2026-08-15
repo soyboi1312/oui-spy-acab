@@ -652,6 +652,169 @@ void setup() {
     // board commits to staying on, so a too-short button hold parks SILENTLY instead of beeping a
     // boot it then abandons. See the hold-time note at the gate.
 
+    // ---- SOFT-POWER GATE FIRST (moved up 2026-08-14) --------------------------------------------
+    // The gate used to sit BELOW NimBLE init, the flash-ring mount and the NVS restores, and a
+    // timed boot capture measured that stack at ~4s - so "hold to power on" felt like 5 seconds
+    // because the hold timer could not even START until the heavy init finished. The gate needs
+    // none of it: the chirp needs alertsInit, the park path needs Serial1 (for the nRF 'P'
+    // handshake), and the decision needs one GPIO and two NVS reads. Run it here and the hold
+    // starts ~0.5s after the press; the radios and restores initialize AFTER commit, while the
+    // user's finger is already off the button. A failed hold also parks ~4s sooner, which is
+    // exactly what a pocket bump wants. The OTA rollback check above deliberately stays ahead of
+    // this gate (it is cheap, and a bad trial image must be able to revert before anything else).
+    //
+    // INPUTS to acabPhysicalStart, collected by the power gate. Production must COLLECT and CALL,
+    // not hand-assign the answer: a helper that is tested but never invoked is not coverage, and
+    // a mutation to any hand-written assignment would have failed no test at all. Declared outside
+    // the dual-radio guard because the pairing decision below is outside it too; targets with no
+    // soft-power gate never reach a branch that could set these, and for them booting IS starting.
+    bool pwrCellAbsent = false;  // USB-only board seeing fresh power
+    bool pwrButtonHeld = false;  // hold-to-start, i.e. the ext0 wake after a hold-to-off
+    bool pwrSwitchLow  = false;  // slide-switch SKU reading ON at boot
+#ifdef ACAB_BENCH_NO_SLEEP
+    const bool pwrBenchBuild = true;
+#else
+    const bool pwrBenchBuild = false;
+#endif
+
+#ifdef ACAB_DUAL_RADIO
+    // UART to the companion nRF52840, brought up BEFORE the gate because powerOffDeepSleep's nRF
+    // park handshake writes it on every park path. 1000000 baud to match the nRF (exact divisor
+    // both ends); setRxBufferSize BEFORE begin, the core refuses to resize a started UART, and the
+    // 8192-byte ring absorbs forwarded-advert bursts without dropping lines.
+    Serial1.setRxBufferSize(8192);
+    // UART PIN ORDER IS BOARD-REVISION DEPENDENT. Default = REV-A = the 250 production boards.
+    //   rev-A (nRF rot 180): the TX/RX crossover is ALREADY IN COPPER, so the S3 keeps its pins
+    //       STRAIGHT: RX = D7 (GPIO44) fed by the nRF's TX, TX = D6 (GPIO43) into the nRF's RX.
+    //       This is the DEFAULT precisely because it is what ships - an OTA that quietly reverted
+    //       to the other order would kill BLE on every fielded unit while WiFi kept working.
+    //   flipped layout (nRF rot 0 - rev-B as build_pcb.py draws it): copper runs straight, so the
+    //       S3 crosses in SOFTWARE. Build those with -DACAB_UART_SOFT_CROSS.
+    // Symptom of getting this wrong: wifi_seen climbs normally while nRF adv=0 fwd=0 scan=0, with
+    // a co-processor that is provably fine on its own USB console. Both ends end up listening.
+#ifdef ACAB_UART_SOFT_CROSS
+    Serial1.begin(1000000, SERIAL_8N1, 43, 44);   // flipped board: cross in software (RX=D6, TX=D7)
+    Serial.println("[ACAB] dual-radio: BLE via companion nRF52840 (UART RX=D6/GPIO43, TX=D7/GPIO44 - software cross, flipped board)");
+#else
+    Serial1.begin(1000000, SERIAL_8N1, 44, 43);   // rev-A: copper already crossed (RX=D7, TX=D6)
+    Serial.println("[ACAB] dual-radio: BLE via companion nRF52840 (UART RX=D7/GPIO44, TX=D6/GPIO43 - copper cross, rev-A)");
+#endif
+    acabScannerSetCmdSink(nrfCmdSink);   // app radio toggles + ignore list -> nRF (our D7 TX)
+
+    // Soft power switch: if SW1 is at 'off' when power arrives (battery plugged in, or USB
+    // attached for charge-while-off), park everything now , the charger keeps working while
+    // we sleep. 3s grace so a bench module with no carrier (floating D10 reads HIGH) can be
+    // rescued by grounding D10, and so the message is visible on a serial monitor.
+    //
+    // ACAB_BENCH_NO_SLEEP: on a loose-jumper breadboard rig there is no SW1 and D10 floats HIGH,
+    // so the board deep-sleeps 3s after every boot and never comes up for bring-up. This flag
+    // skips the soft-power park so the S3 always runs on the bench. It is a BENCH-ONLY flag,
+    // never set on a shipped build (the real carrier drives D10 through SW1). DEFAULT OFF.
+    // Resolve the carrier revision FIRST: the power-gate below and swSensePollOff() both branch on
+    // it, so it has to be known before we look at D10.
+    boardRevDetect();
+#ifndef ACAB_BENCH_NO_SLEEP
+    pinMode(kSwSensePin, INPUT_PULLUP);
+    delay(10);
+    if (acabBoardIsRevB()) {
+    // rev-B button: this boot is either a cold power-up (cell just connected -> nothing held ->
+    // park immediately, so a unit going into a shipping box is OFF) or an ext0 wake from a press
+    // (-> the user must KEEP holding for kBtnOnHoldMs, which is what makes a bump-in-a-pocket
+    // unable to switch it on). Either way, no hold = straight back to sleep.
+    //
+    // EXCEPT after a SOFTWARE reset. An OTA finishing calls ESP.restart() (acab_ble_service.cpp:355,
+    // ota_update.cpp:212/367) with nobody touching the button, so the hold test would fail and the
+    // unit would park itself the instant it booted the new image - it would read as "the update
+    // bricked it". A software reset means the unit was already ON and chose to reboot, so the power
+    // decision was made long ago; honour it and skip the gate. Only the genuine power-on and
+    // deep-sleep-wake causes below arrive with the power state actually undecided.
+    const esp_reset_reason_t rr = esp_reset_reason();
+    // NOTE: no reset-cause taxonomy here any more. The old softReset list (SW/PANIC/WDTs) was
+    // wrong in both directions - ESP_RST_BROWNOUT on a running battery unit fell through to the
+    // hold gate and parked it (jingle, then silence, no coverage for the rest of the drive), and
+    // a panic inside a bump-wake boot LOOKED like a soft reset and powered on a boxed unit. The
+    // persisted marker (pwrCommittedOn) answers the actual question directly.
+    // AND EXCEPT on a battery-less build getting fresh power. rev-A slim ties D10 low so USB
+    // presence = running; a rev-B slim must keep that plug-and-forget behaviour or a car-dash unit
+    // stays dead every time the ignition cycles. Cell detect = the same D9 divider readBatteryPct()
+    // uses: on the slim build the BP1 flow-up is deliberately absent, so the carrier's VBAT net is
+    // an ISLAND and R2 holds the sense node hard at GND -> a few mV, deterministic (this is also
+    // why R1/R2 MUST be populated on rev-B slim - without them D9 floats and this read is garbage).
+    // Any real cell, even a protected one at cutoff, reads >= ~2.5 V. Threshold 2.0 V splits the
+    // two by a wide margin on both sides.
+    // Scope: auto-on applies to FRESH POWER only (plug-in, brownout recovery), NOT to an ext0 wake
+    // - after a deliberate hold-to-off, a pocket bump must not re-light the unit; turning it back
+    // on stays hold-gated. Unplug/replug also turns it on, which matches what "USB power = intent
+    // to run" means on a device with no battery.
+    bool cellAbsent = false;
+    if (rr != ESP_RST_DEEPSLEEP) {
+        uint32_t vs = 0;
+        for (int i = 0; i < 8; i++) vs += analogReadMilliVolts(8);   // XIAO D9 = GPIO8, VBAT/2
+        cellAbsent = ((int)(vs / 8) * 2) < 2000;
+    }
+    if (pwrCommittedOn()) {
+        // The unit was ON and never chose otherwise: OTA restart, panic, watchdog, brownout on a
+        // sagging cell - whatever rebooted us, the user's last decision was "on", so honour it.
+        Serial.printf("[pwr] committed ON in NVS (reset reason %d) -> staying on\n", (int)rr);
+    } else if (cellAbsent) {
+        Serial.println("[pwr] no cell detected (USB-only build) + fresh power -> auto-on, button = hold-to-off");
+        pwrCommit(true);
+        pwrCellAbsent = true;    // applying power to a USB-only board IS the intent to start it
+    } else {
+        // HOLD TIME: kBtnOnHoldMs is measured from HERE, and since the 2026-08-14 reorder "here"
+        // is ~0.5s after the press (Serial + coredump probe + OTA rollback check + alertsInit +
+        // Serial1), not the ~4s of radio/flash init that used to run first. Press-to-chirp is now
+        // about 1.5s total; the heavy init runs after commit, while the finger is already off.
+        if (!btnHeldFor(kBtnOnHoldMs)) {
+            Serial.println("[pwr] button not held at boot -> parking (hold ~1s to power on)");
+            powerOffDeepSleep();
+        }
+        Serial.println("[pwr] button held -> powering on");
+        pwrCommit(true);
+        // ACK CHIRP at the commit (2026-08-12, from a real build: power-on "took 5-8s"). Without it
+        // the user's only feedback is the boot jingle, which plays after the release-wait below
+        // plus the radio bring-up - so they held the whole time and the board felt slow. One short
+        // beep the instant the hold passes says "on - let go now". Queued/non-blocking, honors
+        // mute/volume, and can never fire on a pocket bump (the hold above already passed).
+        alertsBeepTest();
+        // THE RECOVERY PATH the apps instruct. Soft-off is deep sleep, so this wakes with
+        // ESP_RST_DEEPSLEEP, never ESP_RST_POWERON - which is exactly why the old reset-reason
+        // test never opened a window here and "turn it off and on" did not work.
+        pwrButtonHeld = true;
+        btnWaitRelease(3000);   // don't let the same press immediately read as an off-hold in loop()
+    }
+    } else {
+    if (digitalRead(kSwSensePin) == HIGH) {
+        Serial.println("[pwr] switch is OFF at boot -> sleeping in 3s (ground D10 to run)");
+        delay(3000);
+        if (digitalRead(kSwSensePin) == HIGH) powerOffDeepSleep();
+    }
+    // Records only that the switch READS ON. It does NOT mean a person just flipped it: the switch
+    // is still on after an OTA restart too, which is why this alone made every reflash open a
+    // window. acabPhysicalStart pairs it with the reset reason.
+    pwrSwitchLow = true;
+    }
+#else
+    Serial.println("[pwr] ACAB_BENCH_NO_SLEEP: soft-power park skipped (bench build, D10 ignored)");
+#endif
+#endif
+    // ---- end soft-power gate; everything below runs only on a boot that is staying up ----------
+    // The nRF reset pulse deliberately does NOT happen here, even though the UART is up. An early
+    // pulse looked like a free parallel-boot win, but review caught the cost: the co-processor
+    // comes up ~2s later and forwards adverts at full duty into the 8192-byte Serial1 ring while
+    // our heavy init still has ~2s to run with nothing draining it - in dense RF the ring overflows
+    // and a mid-line byte drop can splice two forwarded adverts into one chimeric line. So the pulse
+    // stays BELOW init (just before the jingle), where loop() is moments from draining, exactly as
+    // it was before the 2026-08-14 gate reorder.
+    //
+    // AUTO-WIPE DELTA, reviewed + ACCEPTED 2026-08-14: detLogBegin (the offline buffer's boot
+    // counter, which drives the N-reboots-without-app-contact seizure wipe) now runs only on boots
+    // that COMMIT to staying on. Parked boots - pocket bumps, failed holds, charge-while-off
+    // plug-ins - no longer advance the wipe countdown. Deliberate: the old order let a bag jostle a
+    // battery unit through enough bump-wake boots to wipe the owner's OWN evidence buffer, which is
+    // worse than a seized unit needing its parks to be real boots before the count advances. The
+    // accepted seizure posture already concedes flash imaging defeats the wipe. See det_log.cpp.
+
     // BLE identity. The dual-radio build advertises as "beacon" + reports the "beacon board"
     // fw label; the single-radio oui-spy stays "ACAB" / "ACAB-ouispy".
     // The LABEL is the OTA discriminator, not the version: the app resolves a manifest entry from
@@ -671,9 +834,11 @@ void setup() {
     const char* kFwLabel = "ACAB-ouispy";
 #endif
     // BLE service inits NimBLE + starts advertising for the app.
-    // Advertising DEFERRED: the soft-power gate below can still decide this boot parks, and the
-    // pairing gate is configured after it. Going on air here meant a phone could connect before
-    // either decision, with enforcement still off. acabBleStartAdvertising() runs once both settle.
+    // Advertising DEFERRED: the pairing gate is configured after this call, so going on air here
+    // would let a phone connect before it settles, with enforcement still off. acabBleStartAdvertising()
+    // runs once the pairing decision below is made. (The soft-power gate already ran ABOVE this since
+    // the 2026-08-14 reorder, so a parking boot never reaches here at all - this defer is now purely
+    // about the pairing gate, not the power decision.)
     acabBleBegin(kBleName, kFwLabel, /*startAdvertising=*/false);
 
     // Offline detection buffer: mount the flash ring + bump the boot counter. Stays
@@ -749,188 +914,34 @@ void setup() {
     // Default OFF: it is a deliberate, high-volume mode, not something to inherit by accident.
     desertRestoreEnabled(false);
 
-    // Did a PERSON start this board? The soft-power branches below COLLECT INPUTS; they do not
-    // decide. acabPhysicalStart (pair_window.h) combines them WITH the reset reason at the call
-    // site, and is host-tested.
-    //
-    // This used to say the decision was "derived from the gate's own decision rather than
-    // esp_reset_reason()". That describes a design which was considered and REJECTED, and leaving
-    // it here is how a future cleanup deletes the reset inputs. The reset reason is load-bearing:
-    // without it the switch SKU reopens a pairing window on every OTA and every panic, since the
-    // switch still reads ON after a warm restart. What the reset reason cannot do ALONE is
-    // recognise the app-instructed recovery, because soft-off is deep sleep and that wake reports
-    // ESP_RST_DEEPSLEEP rather than ESP_RST_POWERON. Both inputs, one rule, one call.
-    //
-    // Declared OUTSIDE the dual-radio guard because the pairing decision below is outside it too.
-    // Targets with no soft-power gate never reach a branch that could set this, and for them
-    // booting IS starting, so they default to true rather than silently never becoming pairable.
-// INPUTS to acabPhysicalStart, collected by the power gate below. Production must COLLECT and
-// CALL, not hand-assign the answer: a helper that is tested but never invoked is not coverage, and
-// a mutation to any hand-written assignment would have failed no test at all.
-    bool pwrCellAbsent = false;  // USB-only board seeing fresh power
-    bool pwrButtonHeld = false;  // hold-to-start, i.e. the ext0 wake after a hold-to-off
-    bool pwrSwitchLow  = false;  // slide-switch SKU reading ON at boot
-#ifdef ACAB_BENCH_NO_SLEEP
-    const bool pwrBenchBuild = true;
-#else
-    const bool pwrBenchBuild = false;
+    // (The acabPhysicalStart INPUTS - pwrCellAbsent / pwrButtonHeld / pwrSwitchLow - and the
+    // soft-power gate that collects them moved ABOVE the heavy init on 2026-08-14; see the
+    // SOFT-POWER GATE FIRST block. The reset reason stays load-bearing there: without it the
+    // switch SKU reopens a pairing window on every OTA and every panic, and soft-off wakes report
+    // ESP_RST_DEEPSLEEP rather than ESP_RST_POWERON. Both inputs, one rule, one call below.)
+
+#ifdef ACAB_DUAL_RADIO
+    // BLE detection comes from the companion nRF52840; its UART was brought up at the
+    // soft-power gate near the top of setup() (moved 2026-08-14), so this radio only
+    // needs to skip its own BLE scan and stay on WiFi + the app GATT.
+    cfg.enableBLE = false;
 #endif
 
 #ifdef ACAB_DUAL_RADIO
-    // BLE detection comes from the companion nRF52840 over UART, so this radio
-    // skips its own BLE scan and stays on WiFi + the app GATT. The v2 board flips
-    // U2 (antenna to the edge), which STRAIGHTENS the UART wiring (S3 D6<->nRF D6,
-    // S3 D7<->nRF D7), so we make the TX/RX crossover here by swapping our pins:
-    // RX = D6 (GPIO43) <- nRF D6/TX; TX = D7 (GPIO44) -> nRF D7/RX. The nRF keeps
-    // its native Serial1 (D6=TX/D7=RX), unchanged. GATT (NimBLE) is unaffected.
-    // 1000000 to match the nRF's Serial1 (cross-target contract): the co-processor dedups per MAC,
-    // but it still bursts (a whole street of first-seen MACs at once, every Remote ID advert from a
-    // drone overhead, a forward on every peak-RSSI jump), so the link needs headroom, and BLE 5
-    // extended adverts (bucket B1) push up to 255
-    // bytes per line. 1000000 is an exact UART divisor on both ends (the old 921600 is really
-    // 941176 on the nRF, ~2.1% error). Both ends must agree - the nRF-side begin is bumped to match.
-    // setRxBufferSize BEFORE begin: the core refuses to resize the RX ring once the UART is started,
-    // so an 8192-byte ring absorbs bursts of forwarded adverts without dropping lines.
-    Serial1.setRxBufferSize(8192);
-    // UART PIN ORDER IS BOARD-REVISION DEPENDENT. Default = REV-A = the 250 production boards.
-    //   rev-A (nRF rot 180, the batch standardised on 2026-07-28): the TX/RX crossover is ALREADY
-    //       IN COPPER, so the S3 must keep its pins STRAIGHT: RX = D7 (GPIO44) fed by the nRF's TX,
-    //       TX = D6 (GPIO43) into the nRF's RX. This is the DEFAULT precisely because it is what
-    //       ships - an OTA that quietly reverted to the other order would kill BLE on every unit in
-    //       the field while WiFi kept working, i.e. a half-dead device that looks like a bad board.
-    //   flipped layout (nRF rot 0 - the discarded prototypes, and rev-B as build_pcb.py draws it):
-    //       copper runs D6<->D6 / D7<->D7 straight, so the S3 has to cross in SOFTWARE. Build those
-    //       with -DACAB_UART_SOFT_CROSS.
-    // Symptom of getting this wrong: wifi_seen climbs normally while nRF adv=0 fwd=0 scan=0, with a
-    // co-processor that is provably fine on its own USB console. Both ends end up listening.
-#ifdef ACAB_UART_SOFT_CROSS
-    Serial1.begin(1000000, SERIAL_8N1, 43, 44);   // flipped board: cross in software (RX=D6, TX=D7)
-#else
-    Serial1.begin(1000000, SERIAL_8N1, 44, 43);   // rev-A: copper already crossed (RX=D7, TX=D6)
-#endif
-    acabScannerSetCmdSink(nrfCmdSink);   // app radio toggles + ignore list -> nRF (our D7 TX)
-    cfg.enableBLE = false;
-    // Print the pin order we ACTUALLY configured, not a hardcoded guess. The old literal claimed
-    // "RX=D6/TX=D7" no matter what the build did, which made a wrong-image diagnosis take far longer
-    // than it should have on 2026-07-28 - the log looked identical for both wirings.
-#ifdef ACAB_UART_SOFT_CROSS
-    Serial.println("[ACAB] dual-radio: BLE via companion nRF52840 (UART RX=D6/GPIO43, TX=D7/GPIO44 - software cross, flipped board)");
-#else
-    Serial.println("[ACAB] dual-radio: BLE via companion nRF52840 (UART RX=D7/GPIO44, TX=D6/GPIO43 - copper cross, rev-A)");
-#endif
-
-    // Soft power switch: if SW1 is at 'off' when power arrives (battery plugged in, or USB
-    // attached for charge-while-off), park everything now , the charger keeps working while
-    // we sleep. 3s grace so a bench module with no carrier (floating D10 reads HIGH) can be
-    // rescued by grounding D10, and so the message is visible on a serial monitor.
-    //
-    // ACAB_BENCH_NO_SLEEP: on a loose-jumper breadboard rig there is no SW1 and D10 floats HIGH,
-    // so the board deep-sleeps 3s after every boot and never comes up for bring-up. This flag
-    // skips the soft-power park so the S3 always runs on the bench. It is a BENCH-ONLY flag,
-    // never set on a shipped build (the real carrier drives D10 through SW1). DEFAULT OFF.
-    // Resolve the carrier revision FIRST: the power-gate below and swSensePollOff() both branch on
-    // it, so it has to be known before we look at D10.
-    boardRevDetect();
-#ifndef ACAB_BENCH_NO_SLEEP
-    pinMode(kSwSensePin, INPUT_PULLUP);
-    delay(10);
-    if (acabBoardIsRevB()) {
-    // rev-B button: this boot is either a cold power-up (cell just connected -> nothing held ->
-    // park immediately, so a unit going into a shipping box is OFF) or an ext0 wake from a press
-    // (-> the user must KEEP holding for kBtnOnHoldMs, which is what makes a bump-in-a-pocket
-    // unable to switch it on). Either way, no hold = straight back to sleep.
-    //
-    // EXCEPT after a SOFTWARE reset. An OTA finishing calls ESP.restart() (acab_ble_service.cpp:355,
-    // ota_update.cpp:212/367) with nobody touching the button, so the hold test would fail and the
-    // unit would park itself the instant it booted the new image - it would read as "the update
-    // bricked it". A software reset means the unit was already ON and chose to reboot, so the power
-    // decision was made long ago; honour it and skip the gate. Only the genuine power-on and
-    // deep-sleep-wake causes below arrive with the power state actually undecided.
-    const esp_reset_reason_t rr = esp_reset_reason();
-    // NOTE: no reset-cause taxonomy here any more. The old softReset list (SW/PANIC/WDTs) was
-    // wrong in both directions - ESP_RST_BROWNOUT on a running battery unit fell through to the
-    // hold gate and parked it (jingle, then silence, no coverage for the rest of the drive), and
-    // a panic inside a bump-wake boot LOOKED like a soft reset and powered on a boxed unit. The
-    // persisted marker (pwrCommittedOn) answers the actual question directly.
-    // AND EXCEPT on a battery-less build getting fresh power. rev-A slim ties D10 low so USB
-    // presence = running; a rev-B slim must keep that plug-and-forget behaviour or a car-dash unit
-    // stays dead every time the ignition cycles. Cell detect = the same D9 divider readBatteryPct()
-    // uses: on the slim build the BP1 flow-up is deliberately absent, so the carrier's VBAT net is
-    // an ISLAND and R2 holds the sense node hard at GND -> a few mV, deterministic (this is also
-    // why R1/R2 MUST be populated on rev-B slim - without them D9 floats and this read is garbage).
-    // Any real cell, even a protected one at cutoff, reads >= ~2.5 V. Threshold 2.0 V splits the
-    // two by a wide margin on both sides.
-    // Scope: auto-on applies to FRESH POWER only (plug-in, brownout recovery), NOT to an ext0 wake
-    // - after a deliberate hold-to-off, a pocket bump must not re-light the unit; turning it back
-    // on stays hold-gated. Unplug/replug also turns it on, which matches what "USB power = intent
-    // to run" means on a device with no battery.
-    bool cellAbsent = false;
-    if (rr != ESP_RST_DEEPSLEEP) {
-        uint32_t vs = 0;
-        for (int i = 0; i < 8; i++) vs += analogReadMilliVolts(8);   // XIAO D9 = GPIO8, VBAT/2
-        cellAbsent = ((int)(vs / 8) * 2) < 2000;
-    }
-    if (pwrCommittedOn()) {
-        // The unit was ON and never chose otherwise: OTA restart, panic, watchdog, brownout on a
-        // sagging cell - whatever rebooted us, the user's last decision was "on", so honour it.
-        Serial.printf("[pwr] committed ON in NVS (reset reason %d) -> staying on\n", (int)rr);
-    } else if (cellAbsent) {
-        Serial.println("[pwr] no cell detected (USB-only build) + fresh power -> auto-on, button = hold-to-off");
-        pwrCommit(true);
-        pwrCellAbsent = true;    // applying power to a USB-only board IS the intent to start it
-    } else {
-        // NOTE ON THE REAL HOLD TIME: kBtnOnHoldMs is measured from HERE, not from the press. The
-        // boot jingle was MOVED BELOW this gate (2026-08-12) so the board no longer announces a
-        // boot it may abandon: a too-short hold now parks SILENTLY, and the jingle plays only after
-        // the gate commits to ON. NimBLE init, the flash-ring mount and the NVS restores still run
-        // before this point, so the true hold is roughly kBtnOnHoldMs plus that init, not a bare 1s.
-        // A user who releases early no longer hears a jingle, so the sound stops reading as a fault.
-        if (!btnHeldFor(kBtnOnHoldMs)) {
-            Serial.println("[pwr] button not held at boot -> parking (keep holding ~2s to power on)");
-            powerOffDeepSleep();
-        }
-        Serial.println("[pwr] button held -> powering on");
-        pwrCommit(true);
-        // ACK CHIRP at the commit (2026-08-12, from a real build: power-on "took 5-8s"). Without it
-        // the user's only feedback is the boot jingle, which plays AFTER the release-wait below (up
-        // to 3s while they keep holding) plus the scanner bring-up - so they hold the whole time and
-        // the board feels slow. One short beep the instant the hold passes says "on - let go now";
-        // release then skips the wait cap and the jingle lands seconds sooner. Queued/non-blocking,
-        // honors mute/volume, and can never fire on a pocket bump (the hold above already passed).
-        alertsBeepTest();
-        // THE RECOVERY PATH the apps instruct. Soft-off is deep sleep, so this wakes with
-        // ESP_RST_DEEPSLEEP, never ESP_RST_POWERON - which is exactly why the old reset-reason
-        // test never opened a window here and "turn it off and on" did not work.
-        pwrButtonHeld = true;
-        btnWaitRelease(3000);   // don't let the same press immediately read as an off-hold in loop()
-    }
-    } else {
-    if (digitalRead(kSwSensePin) == HIGH) {
-        Serial.println("[pwr] switch is OFF at boot -> sleeping in 3s (ground D10 to run)");
-        delay(3000);
-        if (digitalRead(kSwSensePin) == HIGH) powerOffDeepSleep();
-    }
-    // Records only that the switch READS ON. It does NOT mean a person just flipped it: the switch
-    // is still on after an OTA restart too, which is why this alone made every reflash open a
-    // window. acabPhysicalStart pairs it with the reset reason.
-    pwrSwitchLow = true;
-    }
-#else
-    Serial.println("[pwr] ACAB_BENCH_NO_SLEEP: soft-power park skipped (bench build, D10 ignored)");
-
-#endif
-    // Running: pulse the nRF's RESET so it comes back from System OFF (harmless if it was
-    // never asleep , it just reboots into a known-fresh co-processor state with us). Its
-    // fresh boot prints "V<n>"; also ask explicitly in case it was already up.
+    // Pulse the nRF's RESET so it comes back from System OFF (harmless if it was never asleep - it
+    // just reboots into a known-fresh co-processor state with us). Its fresh boot prints "V<n>";
+    // also ask explicitly in case it was already up. Kept HERE, below the heavy init (not up at the
+    // gate), so the co-processor's advert forwarding starts only moments before loop() begins
+    // draining Serial1 - avoids the unpolled-ring-overflow window an early reset would open.
     nrfResetPulse();
     delay(30);
     acabScannerSendCoProcCmd("V");   // mutex sink, same interleave class as the DFU relay fix
 #endif
 
-    // Committed to staying on now: every park path above this deep-sleeps and never returns here,
-    // so this is the first safe place to announce the boot. MOVED here from before the soft-power
-    // gate (2026-08-12) so a too-short button hold parks SILENTLY instead of beeping a boot it then
-    // abandons, and the effective turn-on hold shrinks by the ~0.9s the jingle used to add.
+    // Boot jingle. Since the 2026-08-14 gate reorder the soft-power gate runs FIRST (near the top of
+    // setup), so a parked boot deep-sleeps long before here and never reaches this - the jingle no
+    // longer gates or shortens the turn-on hold (the 2026-08-12 note about that is history). It now
+    // simply marks "committed, radios up"; the ack chirp at the gate's commit is the fast feedback.
     alertsBootJingle();
 
     // Open the new-phone pairing window, ONCE, and only now: every path above this line can still

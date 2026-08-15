@@ -764,7 +764,7 @@ fun DeviceScreen(ble: AcabBleManager) {
                         text = {
                             Text(
                                 "The beacon shuts down and stops detecting. You'll turn it back on with the " +
-                                    "button on the device (hold about 2 seconds). It can't be powered back on from the app.",
+                                    "button on the device (hold it for about a second). It can't be powered back on from the app.",
                                 color = Acab.dim, fontSize = 14.sp)
                         },
                         confirmButton = {
