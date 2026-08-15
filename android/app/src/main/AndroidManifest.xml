@@ -24,8 +24,16 @@
     <!-- osmdroid tiles -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- NO storage permission, and keep it that way (removed 2026-08-14). The osmdroid-boilerplate
+         WRITE_EXTERNAL_STORAGE (maxSdk 29) was never requested at runtime and the tile cache lives
+         in app-private storage, but merely DECLARING it made the Play listing print "This app has
+         access to: Photos/Media/Files, Storage", contradicting the in-app "beacons never asks for
+         storage permission" copy. The remove markers also strip any copy a library manifest tries
+         to merge back in. -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="29" />
+        tools:node="remove" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        tools:node="remove" />
 
     <!-- Haptic alerts for stealth mode. -->
     <uses-permission android:name="android.permission.VIBRATE" />

@@ -43,6 +43,14 @@ struct FirstRunTourView: View {
              title: "quiet is a real result",
              body: "Most places are quiet. An empty log means no compatible radio broadcast was recognized nearby - not that nothing is there. Silent, wired, cellular-only, or powered-off equipment has nothing for beacons to hear.",
              note: "Want to see it work? Body cams and drones are common. Trackers and network cameras are opt-in, switch them on in Beacon settings."),
+        // Closing trust card (kept word-for-word with Android). Prompted by the Improve detection
+        // and log export flows: users reasonably wonder what file access those need. The honest
+        // answer is a win: exports are written in app-private space, leave only via the share
+        // sheet, and iOS never shows a storage prompt because none is needed.
+        Card(glyph: "lock",
+             title: "nothing leaves without you",
+             body: "Log exports and Improve detection reports are files the app writes in its own private space. Sharing one opens the system share sheet, and you choose exactly where it goes.",
+             note: "Nothing is uploaded automatically. beacons never asks for storage permission and cannot see your photos or files."),
     ]
 
     var body: some View {

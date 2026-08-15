@@ -25,6 +25,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.automirrored.filled.ListAlt
 import androidx.compose.material.icons.filled.Percent
 import androidx.compose.material.icons.filled.SettingsInputAntenna
@@ -95,6 +96,17 @@ private val TOUR_CARDS = listOf(
         "quiet is a real result",
         "Most places are quiet. An empty log means no compatible radio broadcast was recognized nearby - not that nothing is there. Silent, wired, cellular-only, or powered-off equipment has nothing for beacons to hear.",
         "Want to see it work? Body cams and drones are common. Trackers and network cameras are opt-in, switch them on in Beacon settings.",
+    ),
+    // Closing trust card (kept word-for-word with iOS). Prompted by the Improve detection / log
+    // export flows: users reasonably wonder what file access those need. The honest answer is a
+    // win: exports are written in app-private space and leave only via the share sheet, and the
+    // app never requests a storage permission (the manifest's WRITE_EXTERNAL_STORAGE is a legacy
+    // maxSdk=29 grant nothing ever requests at runtime).
+    TourCard(
+        Icons.Filled.Lock,
+        "nothing leaves without you",
+        "Log exports and Improve detection reports are files the app writes in its own private space. Sharing one opens the system share sheet, and you choose exactly where it goes.",
+        "Nothing is uploaded automatically. beacons never asks for storage permission and cannot see your photos or files.",
     ),
 )
 

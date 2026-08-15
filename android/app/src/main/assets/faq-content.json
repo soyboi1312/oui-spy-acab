@@ -133,6 +133,11 @@
           "a": "your detections go nowhere automatically beyond your phone and your own beacon. detections are logged on the beacon and mirrored to the app over a direct connection. there is no account, analytics, or automatic detection upload. if you explicitly use improve detection or export/share a Log CSV or GPX, the selected data goes only to the email recipient, app, or destination you choose."
         },
         {
+          "id": "q-storage",
+          "q": "does beacons need access to my files or storage?",
+          "a": "no. log exports and improve detection reports are files the app writes in its own private space. when you share one, the system share sheet opens and you pick exactly where it goes. nothing is uploaded automatically. beacons never asks for a storage permission and cannot see your photos or files."
+        },
+        {
           "id": "q-location",
           "q": "why does the app want my location?",
           "a": "so a hit becomes a place on a map, not just a beep. your location is used on your device to pin detections and center the map. if location is on, your phone also sends its current fix over the encrypted bluetooth link to your own board, so hits the board records while your phone is away still land on the map in the right place. that fix goes to your board, not automatically to me or anyone else. ordinary Log CSV and GPX exports can include where your phone heard a device and, for drones, the aircraft and operator positions broadcast over remote ID. those ordinary exports do not have location-removal switches, so review the file and destination before sharing. the three location switches apply only to improve detection: your observation and the operator position are off by default, while the aircraft position is on. opening the map loads tiles from a map provider (apple maps on iOS, openstreetmap on android), which sees an ordinary map request and your IP address, never your detections. say no and the app still works, you just lose the pins."
