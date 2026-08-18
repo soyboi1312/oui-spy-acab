@@ -149,7 +149,7 @@ A few things worth knowing about how the apps read a detection:
 
 ### Android
 
-**All Cameras Are Beacons for Android** lives in [android/](android/): native Kotlin / Jetpack Compose, the same feature set, with an OpenStreetMap map (no Google dependency). It isn't on the Play Store yet, so for now you build it from source or sideload the APK. Build and release notes are in [android/README.md](android/README.md).
+**All Cameras Are Beacons for Android** lives in [android/](android/): native Kotlin / Jetpack Compose, the same feature set, with an OpenStreetMap map (no Google dependency). It isn't on the Play Store yet, so for now you build it from source or sideload the APK. Build and release notes are in [android/README.md](android/README.md). You can also download it from [Google Play Store](https://play.google.com/store/apps/details?id=tech.soyboi.beacons). 
 
 Either app needs an OUI-Spy or Mesh-Detect board to actually detect anything, but you can poke around the interface without one.
 
