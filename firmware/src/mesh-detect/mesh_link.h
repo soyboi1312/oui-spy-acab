@@ -13,8 +13,9 @@
  *                Serial Module in PROTO mode with that channel set up. Use this to
  *                transmit on a specific channel.
  *
- * Every message names the unit: "Flock camera detected", "Flock Raven detected",
- * "Axon body camera detected", "Drone detected".
+ * Every message names the unit: "ALPR camera detected", "Flock Raven detected",
+ * "Body camera detected", "Drone detected" (labels come from acabTypeLabel in
+ * lib/acab_core/detection.h).
  */
 #ifndef ACAB_MESH_LINK_H
 #define ACAB_MESH_LINK_H

@@ -40,14 +40,16 @@
  *   {"motorola":false} quiet ONLY the broad Motorola-Solutions OUI proxy - a SUB-toggle
  *                      of the body-cam category, so the conf-90 Axon BWCDEVICE tag keeps
  *                      running. Absent key on old firmware = the two were one switch.
- *   {"buzzer":false}   mute the buzzer
+ *   {"buzzer":false}   mute detection/session sounds (physical power cues remain)
  *   {"lat":32.79,"lon":-116.94}  push the phone's GPS (Mesh-Detect tags its uplink)
  *
  * Status record (fw string is "<label> <version>", e.g. beacon board reports "beacon board"):
  *   {"fw":"ACAB-ouispy 2.0.0","up":12345,"total":42,"ble":true,"wifi":true,
  *    "axon":false,"buzzer":true,"gps":false, ...}
- *   wseen/bseen (radio diagnostics) appear on every build; bat only on battery-sense
- *   boards; co/chg/nbb only on the dual-radio beacon board.
+ *   bat appears only on battery-sense boards; co/chg/nbb only on the dual-radio beacon
+ *   board. The radio ingest counters (wseen/bseen) and the sink-drop total (sdrop) ride
+ *   the one-shot {"diag":true} reply, NOT the periodic status - moved 2026-08-26 to keep
+ *   the periodic frame's worst case under STATUS_JSON_MAX.
  *
  * The full, current key list for all three characteristics lives in docs/ble-protocol.md;
  * treat that doc as the source of truth and this header as a quick orientation.
@@ -121,17 +123,16 @@ bool acabBoardIsRevB() __attribute__((weak));
 // the status "nrfup" flag so the app mutes the co-proc fault banner during a legitimate update.
 bool acabNrfDfuActive();
 
-// One-shot: returns true (and clears the latch) if an {"nrfdfu":true} config write asked to kick
-// the companion nRF into BLE OTA DFU from a secure link during the physical pairing window. The
-// beacon-board loop() polls this and
-// forwards the trigger over UART. Always safe to call; single-board builds never see the request.
-bool acabBleTakeNrfDfuRequest();
-
-// One-shot: returns true (and clears the latch) if a {"poweroff":true} config write asked the board
-// to shut down. The beacon-board loop() polls this and, on rev-B only, runs the deep-sleep power-off
-// (mirrors the nrfdfu deferral: the write callback cannot block on the multi-second nRF park + never-
-// returning deep sleep). Always safe to call; single-board builds never see the request.
-bool acabBleTakePowerOffRequest();
+// Execute a deferred physical action on the loop task while retaining the authenticated link that
+// authorized it. The callback runs synchronously under a lease also taken by connect/disconnect;
+// phone B therefore cannot become the published owner after phone A's final token check but before
+// A's DFU/power-off action begins. Requests remain one-shot and expire across either boundary.
+// The callback must not recursively enter a BLE link boundary. False means no current authorized
+// request (or lease failure); in that case it is never invoked. Power-off may deliberately not
+// return because deep sleep ends the runtime.
+typedef void (*AcabBleDeferredLinkAction)(void* context);
+bool acabBleRunNrfDfuRequest(AcabBleDeferredLinkAction action, void* context = nullptr);
+bool acabBleRunPowerOffRequest(AcabBleDeferredLinkAction action, void* context = nullptr);
 
 // Notify a connected app that the board is powering off on purpose (button-hold or app request), so
 // it treats the imminent link drop as a clean shutdown. Called by the beacon-board power-off path
@@ -230,7 +231,9 @@ void acabBleSetBatteryPct(int pct);
 // the app shows a normal battery. No-op storage on other builds.
 void acabBleSetCharging(bool charging);
 
-// True only after the app link is encrypted and bonded. A raw pre-auth GAP link returns false.
+// True after the link is authenticated, including the short GPS/privacy preparation boundary
+// before config admission. A raw/stalled pre-auth GAP link returns false, so it cannot suppress
+// offline logging; once authentication succeeds the temporary true closes prior-owner queue races.
 bool acabBleClientConnected();
 
 // Drive the offline-buffer replay drain (a bounded burst of records per call, paced by the
@@ -244,7 +247,36 @@ void acabBleOtaWatchdog();
 
 // Latest phone GPS the app pushed via the Config characteristic, if fresher than
 // maxAgeMs (use 0xFFFFFFFF for "any age"). Returns false (outputs untouched) when
-// there's no fix. When ageMs is non-null, it gets the fix's age in millis.
+// there's no fix. Age is measured from 64-bit monotonic esp_timer stamps, so a stale fix cannot
+// become fresh again at the 49.7-day uint32 millis wrap. When ageMs is non-null, it gets the fix's
+// age in millis, saturated at UINT32_MAX for an "any age" request rather than wrapped.
+// CLEARED ON DISCONNECT: this always fails while no phone is connected, which is what keeps an
+// outward-facing path (mesh-detect's transmission boundary) from attaching the owner's position
+// to traffic seen after they left.
 bool acabBleGetPhoneGps(double* lat, double* lon, uint32_t maxAgeMs, uint32_t* ageMs = nullptr);
+
+// OFFLINE BUFFER ONLY - the same fix, retained across a disconnect only when that authenticated
+// session supplied the key accepted for the current log generation. A no-key/mismatched session
+// clears both GPS copies, and every authentication begins empty. Identical monotonic age contract,
+// including permanent finite expiry across any number of millis wraps.
+// The offline buffer exists to record what passed a board its owner walked away from, and
+// det_log only accepts rows while the phone is away, so this is the only position a buffered
+// record can carry.
+//
+// WHAT THE CODE GUARANTEES, exactly: the value this returns reaches the AES-CTR encrypted det_log
+// ring and nothing else on the board. It is never attached to a live detection notify, never sent
+// over the mesh, and never placed in the status document. The one caller (the offline-buffer stamp
+// in acab_scanner's handleDetection) puts it in a DetLogGpsStamp carried BESIDE the detection, so
+// it is not reachable from the AcabDetection the sink hands to acabBleNotifyDetection - a
+// structural boundary, not a check that could be forgotten at a new call site.
+//
+// THE ONE EXCEPTION, and it is the buffer's purpose: the record it was written into is later
+// replayed to a session that supplies the exact accepted generation key. A phone sharing that key
+// need not be the one that supplied the fix; a different-key phone gets keymis and no replay until
+// it explicitly clears the old rows. See docs/ble-protocol.md. The boundary above buys that nothing
+// outside authorized replay, and nothing before the owner asked for it, carries the coordinate.
+//
+// See the banner on the definition in acab_ble_service.cpp before adding a second caller.
+bool acabBleGetLastPhoneGps(double* lat, double* lon, uint32_t maxAgeMs, uint32_t* ageMs = nullptr);
 
 #endif // ACAB_BLE_SERVICE_H

@@ -509,8 +509,8 @@ static_assert(netcamOuiSorted(),
 // The confidence below is deliberately NOT raised on that result, and this is the important
 // part: 8 hits at ONE site is exactly the evidence shape that made POLICE_OUI's "3 distinct
 // MACs at one site" comment overstate its case, and that vendor turned out to be 0/27 when it
-// was finally measured (see police_signatures.h). One venue's ceiling cameras do not establish
-// what a Dahua OUI means in a house, an office, or a parking garage. Raise this only on
+// was finally measured (see bodycam_vendor_signatures.h). One venue's ceiling cameras do not
+// establish what a Dahua OUI means in a house, an office, or a parking garage. Raise this only on
 // captures from materially different environments.
 //
 // Confidence for a network-camera OUI match. Moderate: the OUI reliably names the vendor

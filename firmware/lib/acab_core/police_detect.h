@@ -1,11 +1,15 @@
 /*
  * ACAB - Police / Motorola Solutions gear detector.
  *
- * OUI-only match on Motorola Solutions blocks (see police_signatures.h). Flags "a
+ * OUI-only match on Motorola Solutions blocks (see bodycam_vendor_signatures.h). Flags "a
  * Motorola Solutions device nearby", a useful body-worn-equipment hint, but broad (it
  * catches any of their WiFi/BLE gear), so it is folded into the body-cam category and
  * sits behind its OWN sub-toggle underneath it: {"motorola":bool}, NVS-persisted,
- * default ON on beacon-board/oui-spy and OFF on mesh-detect.
+ * OPT-IN: default OFF on EVERY board. Every target passes policeRestoreEnabled(false),
+ * on the 2026-07-23 airport ground truth (all 27 Motorola WiFi OUI hits confirmed NOT
+ * body cams); that capture is written up in bodycam_vendor_signatures.h. A stored NVS
+ * value still wins over the default, so a board that already saved "on" keeps it until
+ * the user turns it off in the app.
  *
  * SUB-toggle, not a peer: classification needs BOTH axonIsEnabled() (the category) and
  * policeIsEnabled() (this broad-match opt-out). Turning the body-cam category off kills

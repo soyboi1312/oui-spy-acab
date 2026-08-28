@@ -23,6 +23,7 @@
  */
 #include "drone_detect.h"
 #include "drone_signatures.h"
+#include "oui_prefix.h"      // shared width-aware prefix matcher; also backs alpr_candidates.h
 #include "desert_detect.h"   // Desert mode forces classification even when toggled off
 #include "acab_scanner.h"    // acabSanitizeAscii: clamp attacker-sourced strings on ingest
 #include <Arduino.h>
@@ -225,14 +226,12 @@ static bool fillFromODID(const ODID_UAS_Data* uas, const uint8_t mac[6],
 // / the aircraft), so it only fires when the RID decode found nothing. drone_signatures.h.
 // Returns the vendor label on a hit, or nullptr when no OUI matched.
 static const char* droneVendorOui(const uint8_t mac[6]) {
-    if (mac[0] & 0x02) return nullptr; // skip randomized / locally-administered MACs (no real OUI), like flock/police
+    // The shared matcher carries the LAA guard (randomized MACs have no real OUI, like
+    // flock/police) and rejects unknown prefix widths outright - this path used to fall
+    // back to a 24-bit compare, which would have widened a mistyped MA-M sixteenfold.
     for (size_t i = 0; i < DRONE_VENDOR_OUI_COUNT; i++) {
         const DroneOui& o = DRONE_VENDOR_OUI[i];
-        if (mac[0] != o.prefix[0] || mac[1] != o.prefix[1] || mac[2] != o.prefix[2]) continue;
-        if (o.prefixBits == 28 && (mac[3] & 0xF0) != o.prefix[3]) continue;
-        if (o.prefixBits == 36 &&
-            (mac[3] != o.prefix[3] || (mac[4] & 0xF0) != o.prefix[4])) continue;
-        return o.vendor;
+        if (acabOuiPrefixMatches(o.prefix, o.prefixBits, mac)) return o.vendor;
     }
     return nullptr;
 }

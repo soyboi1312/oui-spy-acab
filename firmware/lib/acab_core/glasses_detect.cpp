@@ -137,7 +137,12 @@ bool glassesClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
     // at 45 with the Quest caveat, because the UUID loop ran first and returned. The token is
     // the strongest evidence we have that a Meta device is glasses rather than a headset, so
     // letting a weaker surface preempt it defeated the point of checking for it at all.
-    // Score-and-keep costs one stack AcabDetection and makes surface ORDER irrelevant.
+    // Score-and-keep costs one stack AcabDetection and stops a weaker surface preempting a
+    // stronger one. It does NOT make surface order free: every comparison below is `<=`, so on a
+    // tie the FIRST surface evaluated wins (an equal-confidence later surface is skipped), and
+    // docs/signatures.md publishes that evaluation order as the contract a reimplementer follows
+    // to emit the same `meth` - it says the same, as does this file's header. Reordering these
+    // loops silently changes `meth` on any advert carrying two equal-confidence surfaces.
     AcabDetection best; int bestConf = -1;
 
     // HeyCyan SDK service UUID: identifies the glasses SOFTWARE rather than a corporate

@@ -24,7 +24,22 @@ for t in test_*.cpp; do
         src="${CORE}/det_log.cpp"
         extra_flags="-DACAB_HOST_TEST -pthread"
     fi
-    if [ ! -f "$src" ]; then
+    if [ "$stem" = "link_action_lease" ]; then
+        # Deterministically blocks a simulated disconnect boundary behind an in-flight physical
+        # action callback, so the real check->action lease is exercised across two host threads.
+        extra_flags="-pthread"
+    fi
+    if [ "$stem" = "coredump_report" ]; then
+        # Compile the real IDF-facing state machine against deterministic esp_core_dump seams.
+        src="${CORE}/coredump_report.cpp"
+        extra_flags="-DACAB_HOST_TEST"
+    fi
+    if [ "$stem" = "alerts" ]; then
+        # The test includes the real beacon-board alerts.cpp directly so it can exercise the
+        # file-private tone helpers with host PWM/GPIO spies. Do not compile a second source copy.
+        src=""
+        extra_flags="-DACAB_HOST_TEST"
+    elif [ ! -f "$src" ]; then
         # HEADER-ONLY SUITE. Not every testable unit is a classifier with a matching
         # <name>_detect.cpp: sink_claim.h is a pure decision extracted from acab_scanner.cpp
         # precisely so it can be tested without Arduino or FreeRTOS. Compile the test alone when
@@ -41,7 +56,8 @@ for t in test_*.cpp; do
     # A COMPILE failure must be recorded and skipped, not fatal. Under `set -e` a bare g++ here
     # aborted the whole script on the first broken file, so the remaining tests never ran and the
     # log just stopped. That was survivable while this was one file run by hand; it is not now
-    # that there are eight and CI invokes this script, where a truncated log reads as "the suite
+    # that the suite has grown (ls test_*.cpp for the current count) and CI invokes this script,
+    # where a truncated log reads as "the suite
     # is smaller than I thought" rather than "it died early". A failing test RUN already used
     # `|| fail=1` and continued, so this only makes the two paths behave the same way.
     g++ -std=c++17 -Wall ${extra_flags:+$extra_flags} -I"$CORE" -Istubs -o "/tmp/$(basename "$t" .cpp)" "$t" ${src:+"$src"} \

@@ -6,6 +6,7 @@
 #include "flock_detect.h"
 #include "flock_signatures.h"
 #include "acab_scanner.h"    // acabSanitizeAscii: clamp attacker-sourced names on ingest
+#include "ascii_match.h"     // shared acabAsciiCiContains (case-insensitive name substring)
 #include "desert_detect.h"   // Desert mode forces classification even when toggled off
 #include <Preferences.h>     // persist the Flock/ALPR toggle across reboots (NVS)
 #include <ctype.h>
@@ -75,16 +76,7 @@ static bool falconWifiOui(const uint8_t mac[6]) {
     return false;
 }
 
-// case-insensitive substring (so we don't depend on GNU strcasestr)
-static bool ciContains(const char* hay, const char* needle) {
-    if (!hay || !needle || !*needle) return false;
-    for (const char* p = hay; *p; p++) {
-        const char* a = p; const char* b = needle;
-        while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) { a++; b++; }
-        if (!*b) return true;
-    }
-    return false;
-}
+// case-insensitive substring: shared acabAsciiCiContains (ascii_match.h)
 
 // case-insensitive prefix; returns the tail (name past the prefix) on a hit
 static const char* ciPrefix(const char* name, const char* prefix) {
@@ -103,6 +95,16 @@ static bool ciEndsWith(const char* s, const char* suf) {
     return *b == 0;
 }
 
+// The "*-FALCON" SSID rule, behind the SAME ext gate as an unvalidated OUI row: retired to
+// ext=1 on 2026-08-25 because its only evidence was this firmware's own diagnostic label read
+// back out of a capture as though it were a broadcast SSID. Full account, and what a capture
+// would have to show to ship it, at FLOCK_SSID_FALCON_SUFFIX in flock_signatures.h.
+// gFlockExtendedOui is compile-time false, so both call sites fold away in every build.
+static bool falconSsidSuffix(const char* ssid) {
+    if (FLOCK_SSID_FALCON_SUFFIX_EXT && !gFlockExtendedOui) return false;
+    return ciEndsWith(ssid, FLOCK_SSID_FALCON_SUFFIX);
+}
+
 // Anchored name matching (see FLOCK_NAME_PATTERNS in flock_signatures.h).
 //   NM_NONE     no pattern hit
 //   NM_LITERAL  "FS Ext Battery" - specific enough to rank strong on its own
@@ -119,7 +121,7 @@ static int nameMatch(const char* name) {
         const FlockNamePat& p = FLOCK_NAME_PATTERNS[i];
         switch (p.form) {
             case FLOCK_NAME_LITERAL:
-                if (ciContains(name, p.pat)) return NM_LITERAL;
+                if (acabAsciiCiContains(name, p.pat)) return NM_LITERAL;
                 break;
             case FLOCK_NAME_PREFIX_DIGITS: {
                 const char* t = ciPrefix(name, p.pat);
@@ -396,15 +398,15 @@ bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
         return true;
     }
 
-    // --- Primary too: Falcon cameras also stand up per-function networks named
-    //     "PROBE-FALCON" / "DATA-FALCON" (own drive capture 2026-07-24). Match any
-    //     "*-FALCON" SSID by name - Flock-specific, no OUI gate needed, and unlike the
-    //     probe-only OUI path it catches a Falcon in beacon / associated mode too
-    //     (which is how a 24:B2:B9 "DATA-FALCON" unit slipped the OUI gate). ---
+    // --- The "*-FALCON" SSID rule. RETIRED TO ext=1 on 2026-08-25 (falconSsidSuffix is
+    //     compile-time false), because its evidence turned out to be this firmware's own
+    //     diagnostic label read back out of a capture. It is kept, gated, as a provenance record
+    //     and as the shape the rule should take if a real capture ever justifies it; the account
+    //     and the bar to re-ship live at FLOCK_SSID_FALCON_SUFFIX in flock_signatures.h. ---
     // SELF-ATTESTATION ONLY, same gate as the "Flock-" branch above and for the same reason: on a
     // probe request the SSID names the network being SEARCHED FOR, so the frame attests nothing
     // about the transmitter. The probe-borne form lands in the M_PROBE 72 regrade below.
-    if (selfAttested && sawSSID && !emptySSID && ciEndsWith(ssid, FLOCK_SSID_FALCON_SUFFIX)) {
+    if (selfAttested && sawSSID && !emptySSID && falconSsidSuffix(ssid)) {
         acabInit(out, ACAB_FLOCK_CAMERA, SRC_WIFI, addr2, (int16_t)rssi);
         out->method = M_SSID;
         out->confidence = 85;
@@ -412,14 +414,16 @@ bool flockClassifyWiFi(const uint8_t* frame, size_t len, int rssi,
         return true;
     }
 
-    // The probe-request form of the same two names, REGRADED rather than dropped (2026-08-05).
-    // A station asking for "Flock-..." or "*-FALCON" is still a real signal - a Falcon riding as a
-    // WiFi client is the documented case, and it is what the 88 branch above used to swallow. But
-    // the frame identifies the SEEKER, not the network's owner, so it belongs at the probe tier
-    // beside the Falcon-OUI rule below, with a detail that says which it is. Sits after the two
-    // self-attestation branches so a beacon/probe-response can never land here.
+    // The probe-request form, REGRADED rather than dropped (2026-08-05). A station asking for
+    // "Flock-..." is still a real signal - a Falcon riding as a WiFi client is the documented
+    // case, and it is what the 88 branch above used to swallow. But the frame identifies the
+    // SEEKER, not the network's owner, so it belongs at the probe tier beside the Falcon-OUI rule
+    // below, with a detail that says which it is. Sits after the two self-attestation branches so
+    // a beacon/probe-response can never land here.
+    // The "*-FALCON" half rides the same ext=1 gate as the branch above, so today only the
+    // "Flock-" prefix can reach this tier.
     if (subtype == 0x4 && sawSSID && !emptySSID &&
-        (strncmp(ssid, FLOCK_SSID_PREFIX, pfxLen) == 0 || ciEndsWith(ssid, FLOCK_SSID_FALCON_SUFFIX))) {
+        (strncmp(ssid, FLOCK_SSID_PREFIX, pfxLen) == 0 || falconSsidSuffix(ssid))) {
         acabInit(out, ACAB_FLOCK_CAMERA, SRC_WIFI, addr2, (int16_t)rssi);
         out->method = M_PROBE;
         out->confidence = 72;

@@ -18,11 +18,13 @@ While it runs, type a note and hit return. It lands in the log as:
 Then grep the log by marker afterwards, or split on them.
 
 Requires a firmware build with -DACAB_DIAG (BLE) and/or -DACAB_DIAG_WIFI (WiFi), otherwise there
-is nothing to capture but the ordinary [diag] counters. Reminder that has already voided one
-drive test on this project: DESERT MODE IS NOT PERSISTED TO NVS, so a reflash silently turns it
-off, and without it you only log devices that already match a known signature - which is exactly
-the wrong thing when you are hunting an unknown vendor. Flash, re-enable Desert, confirm you are
-seeing junk, THEN drive.
+is nothing to capture but the ordinary [diag] counters. Desert-mode reminder: the toggle IS
+persisted to NVS now (desertSetEnabled / desertRestoreEnabled in desert_detect.cpp, since
+2026-08-08), so an ordinary app reflash keeps it; only a full flash erase, or a board that never
+had it enabled, starts with it off. A stale build without persistence once voided a drive test,
+because without Desert you only log devices that already match a known signature - exactly the
+wrong thing when you are hunting an unknown vendor. So the checklist stands: enable Desert,
+confirm you are seeing junk, THEN drive.
 
 Survives USB CDC drops (the ESP32-S3's CDC goes away on reset) by reopening, so a board reboot
 mid-capture costs you a line, not the session.

@@ -1,6 +1,15 @@
 /*
- * ACAB - Axon body-worn camera signature (clean-room).
- * Both values are public / own-capture, not ported. See docs/signatures.md.
+ * ACAB - body-worn camera signatures, two vendors (clean-room).
+ *
+ * Provenance is PER VALUE, not per file. This banner used to say "both values are public /
+ * own-capture, not ported", which stopped being true when the Utility BodyWorn signature
+ * landed. Read the citation on each value:
+ *   - Axon OUI 00:25:DF and the "BWCDEVICE" tag: public IEEE registry and our own field
+ *     capture. Not ported from anyone.
+ *   - Utility Inc. "BodyWorn Remote" NAME: third-party field observation, taken from the
+ *     community nite-oui-collection (nitekry) and credited in CREDITS.md.
+ *   - Utility Inc. OUIs 00:09:BC / 00:16:ED: public IEEE registry.
+ * See docs/signatures.md.
  */
 #ifndef ACAB_AXON_SIGNATURES_H
 #define ACAB_AXON_SIGNATURES_H
@@ -36,7 +45,7 @@
 // Utility Inc. public OUI blocks, the WEAK fallback behind the name match above. Kept
 // here rather than inline in axon_detect.cpp so every OUI in the project lives in a
 // signatures header next to its citation, matching the clean-room provenance discipline
-// used by flock_signatures.h and police_signatures.h. Weak on purpose: Utility makes
+// used by flock_signatures.h and bodycam_vendor_signatures.h. Weak on purpose: Utility makes
 // other gear on these blocks, so an OUI-only hit is confidence 70 vs 85 for the name.
 //   src: IEEE OUI registry (both MA-L, registrant "Utility, Inc." / "Utility Inc")
 static const uint8_t UTIL_BWC_OUI[][3] = {

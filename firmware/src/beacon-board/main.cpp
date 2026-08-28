@@ -34,21 +34,52 @@
 // The companion nRF updates itself over BLE DFU (its Adafruit bootloader speaks native Nordic
 // OTA); the S3 only forwards the "DFU" trigger over UART. No SWD, no embedded nRF image.
 static const int kNrfResetPin = 6;   // S3 D5 -> nRF RESET (soft-power wake; the SWRST access link)
+// setup() primes the first advertised BLE status with a battery reading after the operating radio
+// load is running. Keep the implementation beside the periodic sampler below; these declarations
+// make the startup ordering explicit in this .cpp file (unlike an Arduino .ino, prototypes are
+// not generated for us).
+static int readBatteryPct();
+static bool readBatteryCharging();
+// WiFi.mode()/promiscuous startup returns with the radio enabled, but leave one short electrical
+// settling interval before the first ADC seed. This is far below the nRF's ~2 s boot time, so it
+// does not create a meaningful unpolled-UART window.
+static const uint32_t kBatteryStartupSettleMs = 100;
 #endif
 
 // Scanner sink: send each detection to the app, the buzzer, and serial.
-// In Desert mode the tracker/body-cam classifiers run regardless of their toggle
-// (so real types still show), but the toggle keeps gating whether we ALERT.
+// In Desert mode the classifiers run regardless of their toggle (so real types still show), but
+// the toggle keeps gating whether we ALERT.
 // (Motorola/LE-gear OUI hits report as ACAB_AXON_BODYCAM, so the body-cam case
 // gates them too - there is no separate police type.)
+//
+// EVERY DESERT-FORCED CLASSIFIER NEEDS AN ARM HERE. flock, drone, glasses, tracker and axon all
+// self-gate with `if (!gEnabled && !desertIsEnabled()) return false;`, so with Desert on they
+// emit with their category toggle OFF and this gate is the toggle's only remaining job. Until
+// 2026-08-25 the switch covered 3 of the 7 toggle-bearing types, so ACAB_FLOCK_CAMERA /
+// ACAB_FLOCK_RAVEN / ACAB_DRONE / ACAB_GLASSES fell through to `default: return true` and a board
+// whose owner had switched "ALPR cameras" (or drones, or glasses) off still cawed at every Flock
+// camera it passed: exactly the "why is it beeping" failure the netcam note below says this layer
+// must not leave to the detector. ACAB_NEARBY_DEVICE and ACAB_WATCHED stay on the default on
+// purpose - Desert itself and starring a MAC ARE the opt-in, so there is no separate toggle to
+// honour.
 static bool alertTypeEnabled(AcabDeviceType t) {
+    // A new device class must be considered here, not silently inherit "alert anyway". This trips
+    // the build rather than letting the next type ship as a muted-category beep.
+    static_assert(ACAB_TYPE_COUNT == 11,
+                  "new AcabDeviceType: give it an arm in alertTypeEnabled, or confirm that "
+                  "alerting regardless of any toggle is right for it, then bump this count");
     switch (t) {
         case ACAB_TRACKER:      return trackerIsEnabled();
         case ACAB_AXON_BODYCAM: return axonIsEnabled();
-        // Network cameras are opt-in like the two above, so the BUZZER honours the same toggle.
-        // The detector self-gates upstream, so nothing should reach here with the opt-in off, but
-        // this layer should not depend on that: an alert path that beeps for a category the user
-        // switched off is the kind of thing that only shows up as "why is it beeping at my house".
+        case ACAB_FLOCK_CAMERA:                       // one "ALPR cameras" toggle covers both
+        case ACAB_FLOCK_RAVEN:  return flockIsEnabled();
+        case ACAB_DRONE:        return droneIsEnabled();
+        case ACAB_GLASSES:      return glassesIsEnabled();
+        // Network cameras are opt-in like the categories above, so the BUZZER honours the same
+        // toggle. The detector self-gates upstream, so nothing should reach here with the opt-in
+        // off, but this layer should not depend on that: an alert path that beeps for a category
+        // the user switched off is the kind of thing that only shows up as "why is it beeping at
+        // my house".
         case ACAB_NETCAM:       return netcamIsEnabled();
         default:                return true;
     }
@@ -119,7 +150,14 @@ bool acabNrfDfuActive() { return gNrfDfuMs != 0 && (millis() - gNrfDfuMs) < 3000
 
 static void parseAdvLine(const char* s) {
     if (s[0] == 'V') {                          // nRF app version: "V<n>" (boot banner + 'V' reply)
-        gNrfVersion = atoi(s + 1);
+        // Clamp at the untrusted boundary: this is atoi of whatever the UART delivered, and the
+        // real domain is a small monotonic int (NRF_APP_VERSION, currently 2). Anything negative
+        // (garbled line) normalizes to -1 = "not heard", which keeps the 2 s re-query below alive
+        // and the status "nrfv" emit suppressed, exactly as if the line never arrived; anything
+        // past 9999 saturates. The 4-digit cap is what the status budget
+        // (test_acab_ble_service.cpp) declares for "nrfv", and the emit site re-caps it too.
+        int v = atoi(s + 1);
+        gNrfVersion = v < 0 ? -1 : (v > 9999 ? 9999 : v);
         Serial.printf("[nrf] co-processor app version %d\n", gNrfVersion);
         // A fresh version report means the co-processor's new app booted and is speaking again, so
         // any in-flight BLE DFU just succeeded. Close the fault-mute window now (event-driven) so
@@ -138,7 +176,14 @@ static void parseAdvLine(const char* s) {
         uint32_t adv = strtoul(p, &p, 10);
         uint32_t fwd = strtoul(p, &p, 10);
         int scn = (int)strtol(p, &p, 10);
+        // Clamp at the UART boundary, exactly like the "V" line's version above: BB_SLOTS is
+        // enforced on the FAR side of this link (nrf-ble-scan's own ring), so the S3 cannot
+        // treat it as a bound on what it just read. A garbled or hostile D line would otherwise
+        // emit up to 10 digits for "nbb" against the 5-digit width the status budget declares
+        // (test_acab_ble_service.cpp), spending spare bytes the budget proves it does not need.
+        // 65535 saturates: it is above any real BB_SLOTS value and stays inside 5 digits.
         uint32_t bb = strtoul(p, &p, 10);
+        if (bb > 65535) bb = 65535;
         acabScannerSetCoProcStats(adv, fwd, scn != 0, bb);
         return;
     }
@@ -278,7 +323,15 @@ static const gpio_num_t kSwSensePin = GPIO_NUM_9;   // XIAO D10 (RTC-capable, no
 // CONSEQUENCE TO KNOW: a rev-B unit that has NEVER been plugged into USB runs slide semantics, so
 // its momentary button reads as "off" and it parks. Every board is USB-flashed at build time, so the
 // latch happens in the factory - but if a rev-B board ever acts dead on battery, plug it in once.
-// OVERRIDE: -DACAB_FORCE_REV_B=1 (or =0) at build time, or "revb 1" / "revb 0" on USB serial.
+// OVERRIDE: -DACAB_FORCE_REV_B=1 (or =0) at build time. THAT IS THE ONLY OVERRIDE.
+// This line used to also offer "revb 1" / "revb 0" on USB serial, and there was never a parser for
+// it: nrfConsolePoll() has a 16-byte buffer and recognises exactly one token, "nrfdfu". The
+// setter it named had no declaration in any header and no caller anywhere in the repo. Documenting
+// a recovery that silently does nothing is worse than documenting none, because this block is what
+// someone reads when a board "looks bricked" - so the clause and the unreachable setter both went
+// (2026-08-25). Nothing needs them today: ACAB_REV_DETECT is defined by no env, so boardProbeRevB
+// never runs and the #else branch below already heals a stale latch on every boot. If the probe is
+// ever enabled for real rev-B boards, add a serial escape back AT THE SAME TIME, with a parser.
 static const int kVbusSensePin = 1;      // D0 / GPIO1 / ADC1_CH0 , rev-B VBUS divider node
 static int8_t gBoardRevB = -1;           // -1 unknown, 0 rev-A, 1 rev-B
 
@@ -375,13 +428,6 @@ static void boardRevDetect() {
 
 // Public: true when this carrier is rev-B (momentary button + real VBUS sense).
 bool acabBoardIsRevB() { return gBoardRevB == 1; }
-
-// Manual override, e.g. after a mis-latch or for bench work. persist=true writes NVS.
-void acabBoardSetRevB(bool revb, bool persist) {
-    gBoardRevB = revb ? 1 : 0;
-    if (persist) { Preferences w; w.begin("acab-board", false); w.putChar("revb", revb ? 1 : 0); w.end(); }
-    Serial.printf("[board] revision override -> rev-%s%s\n", revb ? "B" : "A", persist ? " (saved)" : "");
-}
 
 static void nrfResetPulse();   // defined below; powerOffDeepSleep uses it for DFU-bootloader rescue
 
@@ -597,13 +643,79 @@ static void nrfConsolePoll() {
 }
 #endif // ACAB_DUAL_RADIO
 
+// Is THIS S3 image good enough to keep? Wired into ota_update as the health check, so it decides
+// whether a freshly-flashed trial image is confirmed or rolled back.
+//
+// THE CO-PROCESSOR IS A PREFERRED SIGNAL, NOT A VETO (2026-08-25). This used to end in
+// `return gNrfVersion >= 0 && acabScannerCoProcAlive()`, which an nRF that is dead, absent, or
+// parked in its bootloader with its app erased - the documented outcome of a failed Android BLE
+// DFU - can never satisfy. On such a board otaMarkHealthy() never succeeded, loop() hit its 60 s
+// deadline and called ESP.restart(), and the NEXT boot's otaBootCheck reached tries==2 and
+// switched back to the previous slot: roughly a minute plus a boot after an update that reported
+// success. {"ota":{"confirm":true}} could not rescue it either - that also runs through
+// otaHealthReady and answered "health-wait" forever. So the boards most in need of an
+// over-the-air fix, the ones whose radio half is broken, were the only boards that could not
+// receive one. The co-processor's state belongs in the diagnostics the status doc already
+// publishes ("co", "nrfup"), not in the gate that decides whether the S3's own image survives.
+//
+// So: confirm immediately once BOTH radios are up (the good case, and the common one), keep
+// waiting while there is real room before loop()'s 60 s rollback deadline, and past that confirm
+// on the S3's own evidence and let the app show the co-processor fault it already surfaces. A
+// co-processor that is mid-BLE-DFU never blocks at all - it is SUPPOSED to be silent then, and
+// acabNrfDfuActive() is the same signal the status doc uses to suppress the nRF-fault banner.
+//
+// WHAT THAT COSTS, STATED PLAINLY. The UART evidence was the only automatic detection that a new
+// image can still TALK to the co-processor, so an S3 image that regresses the link itself (a
+// changed pin or baud, a broken "V<n>" parse in parseAdvLine) now confirms on its own uptime
+// instead of being reverted on the next boot, and BLE detection - which is entirely the nRF's on
+// this board, cfg.enableBLE is false below - stays dead until someone pushes another OTA or
+// reflashes over USB. That trade is deliberate (a dead nRF must not be able to revert a good S3
+// image), so what is owed is EVIDENCE, not silence: the fallthrough says so on the console once
+// per boot, and the status doc still carries the fact for the app to surface ("co":false, with
+// "nrfv" simply absent for as long as no version has been heard).
 static bool otaRuntimeHealthy() {
     if (millis() < 20000 || !acabScannerHealthy()) return false;
 #ifdef ACAB_DUAL_RADIO
-    // The dual-radio image is not healthy until the companion has actually spoken on UART. The
-    // version proves the parser/link path, and liveness rejects a co-processor that spoke once and
-    // then died before confirmation.
-    return gNrfVersion >= 0 && acabScannerCoProcAlive();
+    // The version proves the parser/link path end to end, and liveness rejects a co-processor that
+    // spoke once and then died before confirmation.
+    if (gNrfVersion >= 0 && acabScannerCoProcAlive()) return true;
+    if (acabNrfDfuActive()) return true;   // legitimately silent: rebooting into/out of its bootloader
+    // Deadline for a co-processor that simply is not coming back. 30 s is deliberate on both
+    // sides: loop() makes its first otaMarkHealthy() attempt at 20 s, which is already past
+    // acabScannerCoProcAlive()'s own 20 s boot grace, so ten more seconds is a genuine extra
+    // chance rather than a token one - and it leaves 30 s before loop()'s 60 s ESP.restart(),
+    // so the confirmation lands well inside the bounded confirm-retry window both apps run and
+    // the user sees "updated", not an unexplained "the board did not confirm".
+    static const uint32_t kOtaCoProcWaitMs = 30000;
+    if (millis() < kOtaCoProcWaitMs) return false;
+    // Past the bound: confirm, but SAY WHAT WAS MISSING, and say it precisely enough to act on.
+    // Confirming silently is what makes an image that broke the UART link look identical on the
+    // console to a healthy board with no co-processor fitted, and loop()'s next line prints "trial
+    // image healthy" either way. The two values printed split the causes, because uartIngestPoll()
+    // calls acabScannerNoteCoProcRx() for ANY complete line, BEFORE parseAdvLine sees it:
+    // BOTH values are needed to split the causes: acabScannerCoProcAlive() is false until a "D "
+    // stats line has PARSED (it gates on gHasCo), so it cannot on its own tell a silent nRF from a
+    // broken parser in this image. acabScannerHasCoProc() is that parse latch:
+    //   hasco=1, alive=1, nrfv=-1  stats parse, no "V<n>" does -> suspect THIS image's V parser
+    //   hasco=1, alive=0           it spoke and then went silent (a reboot outside a DFU window)
+    //   hasco=0, nrfv>=0           a version arrived but no stats line -> suspect the "D " parser
+    //   hasco=0, nrfv=-1           nothing parsed at all -> dead/absent nRF, wrong pins or baud,
+    //                              or an image whose UART ingest regressed wholesale
+    // Latched, so this costs one line per boot rather than one per otaMarkHealthy() retry.
+    static bool sSaidNoCoProc = false;
+    if (!sSaidNoCoProc) {
+        sSaidNoCoProc = true;
+        Serial.printf("[ota] co-processor gave no evidence in %lus (nrfv=%d alive=%d); confirming "
+                      "on the S3's own health anyway, so a dead or absent nRF cannot revert a good "
+                      "image. BLE detection is DOWN until it answers, and this line is the only "
+                      "automatic notice of it. hasco=1 means a stats line parsed, so the link "
+                      "works and the gap is narrower; hasco=0 with nrfv=-1 means nothing parsed "
+                      "at all (dead or absent nRF, wrong pins or baud, or this image's UART "
+                      "ingest).\n",
+                      (unsigned long)(kOtaCoProcWaitMs / 1000), gNrfVersion,
+                      (int)acabScannerCoProcAlive(), (int)acabScannerHasCoProc());
+    }
+    return true;
 #else
     return true;
 #endif
@@ -722,8 +834,9 @@ void setup() {
     // (-> the user must KEEP holding for kBtnOnHoldMs, which is what makes a bump-in-a-pocket
     // unable to switch it on). Either way, no hold = straight back to sleep.
     //
-    // EXCEPT after a SOFTWARE reset. An OTA finishing calls ESP.restart() (acab_ble_service.cpp:355,
-    // ota_update.cpp:212/367) with nobody touching the button, so the hold test would fail and the
+    // EXCEPT after a SOFTWARE reset. An OTA finishing calls ESP.restart() (handleOtaControl's end
+    // branch in acab_ble_service.cpp; otaWrite's deferred finish and otaBootCheck's rollback in
+    // ota_update.cpp) with nobody touching the button, so the hold test would fail and the
     // unit would park itself the instant it booted the new image - it would read as "the update
     // bricked it". A software reset means the unit was already ON and chose to reboot, so the power
     // decision was made long ago; honour it and skip the gate. Only the genuine power-on and
@@ -774,9 +887,10 @@ void setup() {
         // ACK CHIRP at the commit (2026-08-12, from a real build: power-on "took 5-8s"). Without it
         // the user's only feedback is the boot jingle, which plays after the release-wait below
         // plus the radio bring-up - so they held the whole time and the board felt slow. One short
-        // beep the instant the hold passes says "on - let go now". Queued/non-blocking, honors
-        // mute/volume, and can never fire on a pocket bump (the hold above already passed).
-        alertsBeepTest();
+        // beep the instant the hold passes says "on - let go now". Queued/non-blocking, bypasses
+        // detection-alert mute at the saved nonzero volume, and can never fire on a pocket bump
+        // (the hold above already passed).
+        alertsPowerOnAck();
         // THE RECOVERY PATH the apps instruct. Soft-off is deep sleep, so this wakes with
         // ESP_RST_DEEPSLEEP, never ESP_RST_POWERON - which is exactly why the old reset-reason
         // test never opened a window here and "turn it off and on" did not work.
@@ -825,6 +939,12 @@ void setup() {
 #ifdef ACAB_DUAL_RADIO
     const char* kBleName = "beacon";
 #ifdef ACAB_FW_LABEL
+    // 23 chars is the label bound the status "fw" budget is built on: fwbuf in acabBleUpdateStatus
+    // is sized for label(<=23) + ' ' + version(<=8), and this build flag (platformio.ini) is the
+    // one label the compiler can't see the length of at that site. Growing it past 23 would
+    // silently truncate the VERSION off the end of "fw", which both apps parse.
+    static_assert(sizeof(ACAB_FW_LABEL) <= 24, "ACAB_FW_LABEL longer than 23 chars - resize fwbuf "
+                  "and the host-test fw width (test_acab_ble_service.cpp) together");
     const char* kFwLabel = ACAB_FW_LABEL;
 #else
     const char* kFwLabel = "beacon board";
@@ -938,11 +1058,23 @@ void setup() {
     acabScannerSendCoProcCmd("V");   // mutex sink, same interleave class as the DFU relay fix
 #endif
 
+    // Compute the physical-start decision before the boot motif as well as the pairing gate, so
+    // both consume the one tested rule. NOTE (2026-08-24): the jingle no longer varies its AUDIO on
+    // it - mute always wins there, because POWERON on a button-less deploy can be an unattended
+    // power restore rather than a hand on the plug (see alertsBootJingle).
+    const esp_reset_reason_t rr2 = esp_reset_reason();
+    const bool physicalStart = acabPhysicalStart(rr2 == ESP_RST_POWERON,
+                                                 rr2 == ESP_RST_DEEPSLEEP,
+                                                 pwrCellAbsent, pwrButtonHeld,
+                                                 pwrSwitchLow, pwrBenchBuild);
+
     // Boot jingle. Since the 2026-08-14 gate reorder the soft-power gate runs FIRST (near the top of
     // setup), so a parked boot deep-sleeps long before here and never reaches this - the jingle no
     // longer gates or shortens the turn-on hold (the 2026-08-12 note about that is history). It now
     // simply marks "committed, radios up"; the ack chirp at the gate's commit is the fast feedback.
-    alertsBootJingle();
+    // The jingle honors detection-alert mute on EVERY boot, physical or warm; the mute-bypassing
+    // confirmation of a deliberate start is the gate's ack chirp, which cannot fire unattended.
+    alertsBootJingle(physicalStart);
 
     // Open the new-phone pairing window, ONCE, and only now: every path above this line can still
     // decide the board should be off (switch off at boot, button not held, cell absent), and a
@@ -980,11 +1112,8 @@ void setup() {
     // that into "did a person start this board" lives in acabPhysicalStart and is host-tested.
     // The reset reason is one INPUT here, not the whole answer. See acabPhysicalStart for the two
     // wrong versions this replaced and why each failed.
-    const esp_reset_reason_t rr2 = esp_reset_reason();
-    const bool physicalStart = acabPhysicalStart(rr2 == ESP_RST_POWERON,
-                                                 rr2 == ESP_RST_DEEPSLEEP,
-                                                 pwrCellAbsent, pwrButtonHeld,
-                                                 pwrSwitchLow, pwrBenchBuild);
+    // `physicalStart` was calculated before the boot cue so this gate and the sound cannot drift
+    // into two different definitions of a deliberate power-on.
     acabBlePairGateEnable();
     if (physicalStart) {
         acabBleOpenPairingWindow();
@@ -992,11 +1121,28 @@ void setup() {
         Serial.println("[pair] warm continuation (not a physical start) - window NOT opened; "
                        "enforcement is ON, bonded phones still reconnect");
     }
-    // Only NOW go on air: the board has committed to staying powered and the pairing gate is
-    // configured, so there is no window in which a phone can reach a board that has not decided.
-    acabBleStartAdvertising();
-
+    // The board may go on air now that it has committed to staying powered and the pairing gate is
+    // configured; the dual-radio path first performs its loaded battery prime immediately below.
+#ifdef ACAB_DUAL_RADIO
+    // Start the real operating load BEFORE seeding readBatteryPct's voltage EMA and percent slew
+    // state. The first 2.0.6 implementation sampled up near the BLE identity block, while WiFi was
+    // still off and the companion nRF was still parked. That unloaded rail read high; because the
+    // display deliberately falls by only 1 point per six 5-second ticks, the false-high seed then
+    // survived for minutes. Bring up WiFi/promiscuous RX, let the rail settle briefly, rebuild the
+    // Status characteristic with that loaded reading, and only then advertise. This preserves the
+    // original fix: the first phone read still contains `bat`, rather than waiting for loop's first
+    // periodic status. A USB-only SKU returns -1 and continues to omit the key.
     acabScannerBegin(cfg, onDetection);
+    delay(kBatteryStartupSettleMs);
+    acabBleSetBatteryPct(readBatteryPct());
+    acabBleSetCharging(readBatteryCharging());
+    acabBleUpdateStatus();
+    acabBleStartAdvertising();
+#else
+    // Keep the established single-radio ordering: it has no battery rail to prime.
+    acabBleStartAdvertising();
+    acabScannerBegin(cfg, onDetection);
+#endif
 
     // Task watchdog on the loop task. 30s timeout with panic=true so a genuine wedge reboots into
     // a clean image. loop() never blocks for long - the companion nRF self-updates over BLE DFU,
@@ -1049,20 +1195,35 @@ static int readBatteryPct() {
       int vbus = (int)(vs / 8) * 2;
       gBatCharging = (vbus > 3000); }          // 3.0 V threshold: clean gap between ~5000 and ~0
     } else {
-    // Charging detect with hysteresis: a USB float can park the smoothed rail right around 4200 mV,
-    // so a single threshold flaps the chg flag. Assert charging only above ~4250 mV (held a few
-    // reads, this runs every 5s, so a brief WiFi-TX spike can't false-positive), and don't deassert
-    // until the rail drops below ~4150 mV. The dead band between keeps the indicator steady.
+    // Top-of-charge float rule, with hysteresis: assert charging above ~4250 mV held a few reads
+    // (this runs every 5 s, so a brief WiFi-TX spike cannot false-positive), and do not deassert
+    // until the rail drops below ~4150 mV, so a rail parked near the threshold cannot flap the
+    // flag. DEAD ON THIS HARDWARE, and left in place deliberately: the 2026-07-24 calibration
+    // below measured a full cell at ~4008 mV PLUGGED, so `mv` never reaches 4250 and `hi` never
+    // reaches 3. The thresholds are kept rather than re-guessed downward (see the note on the
+    // rise-rate rule); what actually covers the boot-on-a-charger case is the USB-host test below.
     static int hi = 0;
     if (mv > 4250) { if (hi < 3) hi++; } else { hi = 0; }
-    // Rise-rate charging detect (in addition to the top-of-charge float rule below): mid-charge at
+    // Rise-rate charging detect (in addition to the top-of-charge float rule above): mid-charge at
     // 3.9-4.1 V the rail never reaches 4250, so the old float-only rule left chg=false and the app
     // showed a charge-inflated % as if it were a resting number (observed: plug-in stepped 62->76).
     // A resting/draining cell only ever drifts DOWN; only a charger steps the smoothed rail up
     // ~80-150 mV in seconds. Track a recent-min that creeps up 2 mV/tick (fast enough to follow the
     // ~30-50 mV post-load rebound so it can't false-trip), and assert charging on a >=60 mV jump
-    // above it. Deassert on the unplug sag: >=40 mV drop from the charging peak. NOTE: this is a
-    // best-effort proxy; the rev-B VBUS pin above replaces it with a real signal.
+    // above it. Deassert on the unplug sag: >=25 mV drop from the charging peak.
+    //
+    // BE CLEAR ABOUT THE SHAPE OF THIS RULE: it is TRANSITION-TRIGGERED, not a plug-state test. The
+    // creep is 2 mV/tick = 24 mV/min while a real CC charge moves the rail about 5 mV/min, so the
+    // 60 mV gap can only open on the STEP of a plug-in seen while running. The float rule above
+    // cannot stand in for it either - its 4250 mV threshold is unreachable on this hardware, whose
+    // own calibration note below says a full cell reads ~4008 mV plugged. Retuning that threshold
+    // downward is NOT done here: the gap between a charger-held rail and a rested full cell under
+    // scan load is only ~65 mV, measured on one cell, and a false assert would strip 90 mV off a
+    // full RESTING cell - about 34 points the other way, on the reading users check most. That
+    // wants a bench measurement, not a guess.
+    // Which leaves a board that BOOTS already on a charger with no step to observe - handled by the
+    // USB-host test below. NOTE: all of this is a best-effort proxy; the rev-B VBUS pin above
+    // replaces it with a real signal.
     static int minMv = 0, peakMv = 0;
     if (minMv == 0) minMv = mv;
     if (!gBatCharging) {
@@ -1074,6 +1235,51 @@ static int readBatteryPct() {
         // spent still flagged charging applies the WRONG-SIGN offset to a falling rail (the 74->62
         // unplug dip). 25 exits ~2x sooner and still clears CV-taper ripple by a wide margin.
         if (peakMv - mv >= 25 && mv < 4150) { gBatCharging = false; minMv = mv; }
+    }
+    // USB HOST ATTACHED: the one plug signal rev-A hardware can read, and the answer to the
+    // boot-on-the-charger hole the transition rules leave. The S3's USB Serial/JTAG block watches
+    // for host SOF packets, so HWCDC::isPlugged() is true while a USB host is driving the bus -
+    // VBUS present, therefore charging - with no voltage inference and no threshold to calibrate.
+    // It already reads true at setup()'s battery prime, which is what stops the boot seed from
+    // being biased the wrong way: without it a board booted on USB kept gBatCharging false all
+    // session and ADDED the resting sag instead of stripping the charger push, a 160 mV error
+    // worth up to ~34 points, straight into the first advertised status with chg reported false
+    // beside it. (Keep that prime where it is. HWCDC seeds this flag TRUE at system init and only
+    // clears it after ALLOWED_NO_SOF_TICKS - 5 ms - without a SOF, so a sample taken in the first
+    // few milliseconds of boot would read plugged on a battery-only board. The prime runs after
+    // the radio bring-up, far past that window.)
+    //
+    // IT ONLY EVER ASSERTS, AND THAT IS THE WHOLE RULE. isPlugged() is a SOF-liveness test, not a
+    // VBUS test, so false does NOT mean unplugged; it means no host is talking, and three
+    // physically different states share that one reading: a real unplug, a dumb wall brick or
+    // power bank that supplies VBUS without ever enumerating, and a host that SUSPENDED the bus
+    // while still supplying VBUS (the laptop the board is charging from goes to sleep). Only the
+    // first is an unplug, and rev-A has nothing that can tell them apart, so a host that went
+    // quiet is UNKNOWN, not unplugged: the rail rules above take the state back, and their 25 mV
+    // sag off the charge peak is what ends a charge - the same release for all three, and the
+    // release this board used before there was a host test at all.
+    //
+    // DEASSERTING HERE INSTEAD IS THE ORIGINAL BUG WITH ITS SIGN FLIPPED, which is why it is not
+    // done: a sleeping laptop keeps charging while SOF stops, so cancelling on that reading ADDS
+    // BAT_REST_OFFSET_MV to a charger-held rail (the same 160 mV / ~34 points, biased high this
+    // time) on a board that IS charging, with no plug-in step left for the rise-rate rule to
+    // re-detect. It would also clear chgPeak below and restart the 3-minute "terminated" timer
+    // under a cell that is already full, dropping a settled 100% that then crawls back at the
+    // asymmetric -1 per six ticks. Waiting for the sag is not free - it is the same latency the
+    // 25 mV threshold above is justified against - but it is the exit a wall-brick unplug has
+    // always taken, and paying it on a real unplug is the cheaper error than cancelling a live
+    // charge every time a host sleeps.
+    //
+    // NOT REV-B PARITY, AND CANNOT BE: rev-B reads the real VBUS divider above, so it sees plug
+    // state directly and a suspended host never registers there. The revisions agree on plug-in,
+    // and on an already-full cell waiting out the "terminated" 3 minutes before releasing 100%.
+    // They do NOT agree on boot-on-a-charger: rev-B sees any powered rail, while rev-A only
+    // reports it when the source ENUMERATES as a USB host, so booting on a dumb wall brick or a
+    // power bank still waits for the rise-rate rule. rev-A also leans on the rail rules for the
+    // release rev-B reads straight off the pin.
+    if (HWCDC::isPlugged()) {
+        if (!gBatCharging) peakMv = mv;   // start the sag reference at the rail we begin holding
+        gBatCharging = true;
     }
     }
     // Resting-vs-rail compensation, CHARGE-STATE AWARE, BOTH directions - so the displayed % tracks
@@ -1147,6 +1353,18 @@ static int readBatteryPct() {
     else dropTick = 0;
     return shown;
 }
+
+// The shared BLE service holds its link-action lease across these callbacks. Keep every policy
+// check that precedes the physical side effect inside the callback too: returning a bool and then
+// checking OTA/revision in loop() would reopen the exact check->action boundary race the lease
+// exists to close.
+static void runRequestedNrfDfu(void*) {
+    if (!otaInProgress()) nrfEnterDfu();
+}
+
+static void runRequestedPowerOff(void*) {
+    if (acabBoardIsRevB() && !otaInProgress()) powerOffDeepSleep(true);
+}
 #endif
 
 void loop() {
@@ -1185,9 +1403,10 @@ void loop() {
     // Drain UNCONDITIONALLY so a request written mid-OTA is consumed now, not left to fire when the
     // OTA later ends or aborts. Gated on OTA: if the S3 is mid self-update, drop it (the user
     // re-taps) rather than kick the co-processor into DFU. Once triggered, the nRF reboots into its
-    // bootloader and the app drives the transfer. The take function re-checks the secure link and
-    // physical-start window, so a queued request cannot fire after that authorizing session ends.
-    { bool dfuReq = acabBleTakeNrfDfuRequest(); if (dfuReq && !otaInProgress()) nrfEnterDfu(); }
+    // bootloader and the app drives the transfer. The lease re-checks the secure link and
+    // physical-start window, and stays held through this callback, so a queued request cannot fire
+    // after that authorizing session ends.
+    acabBleRunNrfDfuRequest(runRequestedNrfDfu);
     // App-requested power-off ({"poweroff":true}) - SAME deferred-latch discipline as the nrfdfu
     // drain above, and for the same reason: powerOffDeepSleep blocks on the multi-second nRF park
     // handshake and then NEVER RETURNS, so running it on the NimBLE host task (the write callback)
@@ -1197,8 +1416,7 @@ void loop() {
     // request there (the app never offers the button on rev-A anyway). Dropped mid-OTA too, so a
     // self-update is not interrupted (the user re-taps). announce=true: this is a real running->off,
     // so the power-down cue plays, unlike a boot-gate re-sleep.
-    { bool offReq = acabBleTakePowerOffRequest();
-      if (offReq && acabBoardIsRevB() && !otaInProgress()) powerOffDeepSleep(true); }
+    acabBleRunPowerOffRequest(runRequestedPowerOff);
     // Keep asking the nRF its version until we actually have one. It announces the version at its
     // own boot AND replies to a "V" query, but a single boot-time query (setup) can be lost to the
     // advert flood or the S3-boot reset race - leaving gNrfVersion == -1, so the status doc omits
@@ -1240,6 +1458,7 @@ void loop() {
 #ifdef ACAB_CAPTURE_BUILD
                       " watch_data=%lu falcon_data=%lu falcon_mgmt=%lu falcon_macs=%lu falcon_full=%lu"
                       " axon_ble=%lu moto_ble=%lu vendor_macs=%lu vendor_full=%lu"
+                      " alpr_ble=%lu alpr_wifi=%lu alpr_macs=%lu alpr_full=%lu"
 #endif
                       "\n",
                       (unsigned long)acabScannerWifiDiagSent(),
@@ -1257,6 +1476,10 @@ void loop() {
                       , (unsigned long)acabScannerVendorMoto()
                       , (unsigned long)acabScannerVendorMacs()
                       , (unsigned long)acabScannerVendorFull()
+                      , (unsigned long)acabScannerAlprCandidateBleSeen()
+                      , (unsigned long)acabScannerAlprCandidateWifiSeen()
+                      , (unsigned long)acabScannerAlprCandidateMacs()
+                      , (unsigned long)acabScannerAlprCandidateTableFull()
 #endif
                       );
 #endif
@@ -1273,6 +1496,23 @@ void loop() {
 #endif
         acabBleUpdateStatus();
     }
+    // SECOND AT-REST SURFACE. det_log's wipe covers its own ring and nothing else, and the
+    // retained ESP-IDF core dump at 0x7F0000 is a separate flash region no path has ever erased.
+    // An ELF dump holds each task's live stack, so a panic on the NimBLE host task can leave an
+    // in-flight detection (MAC plus the phone-pushed lat/lon) or a just-decoded at-rest key in
+    // flash on a board that never opted into the buffer at all, and it would outlive both
+    // {"clearlog"} and the boot-count self-clean while each reported success. See
+    // coredump_report.h.
+    //
+    // Ride the SAME explicit user intent, so "erase what this board stored" means both regions.
+    // clearlog, a key change, and buffer:false persist a separate erase-generation token; this
+    // tick consumes it even when the ring sweep was already pending or the token was restored
+    // after power loss. A boot auto-wipe with NO explicit token still preserves the dump setup()
+    // has just printed decode instructions for. The rule lives in acabCoredumpWipeTick() rather
+    // than here because mesh-detect needs the identical behaviour, and the 64 KB cache-off erase
+    // must run on this loop task. It defers past the ring sweep that acabBleDrainTick pumps below
+    // so a normal pass never takes two block erases back to back. Free on a clean boot.
+    acabCoredumpWipeTick();
     acabBleDrainTick();   // stream buffered detections back on the app's sync request
     acabBleOtaWatchdog(); // abort + un-quiesce a stalled OTA session (missed link drop)
     delay(20);

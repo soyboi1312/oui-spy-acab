@@ -23,9 +23,13 @@
 // KEEP EVERY DOTTED FIELD UNDER 1024. acabOtaVersionPack (ota_policy.h) packs the version into
 // three 10-BIT FIELDS and REFUSES a field past 1023 as malformed (packs to 0, which every OTA
 // gate hard-rejects; it used to clamp, which aliased 2.0.1023 with 2.0.9999). A four-digit
-// field is therefore un-shippable over the air: the apps compare unclamped, would keep offering
+// field above 1023 is therefore un-shippable over the air: the apps compare unclamped, would keep offering
 // the update, and the board would refuse it forever. Bump the MINOR when the patch field runs out.
 //
+// 2.0.6: adds capture instrumentation for i-PRO BWC4000 activation accessories and Getac
+//        BC-02/BC-03 cameras plus TB/HS vehicle triggers. These are capture candidates, not
+//        production classifiers, until a ground-truthed advert supplies a stable passive value.
+//        Phone companions also expose Live Mode by default and add scoped device mutes.
 // 2.0.5: the two-review hardening round. No new detection categories; the wire, the grading and
 //        the radio hot path got safer.
 //        WIRE: `cid` (BLE manufacturer company ID) is now actually emitted in every detection
@@ -36,8 +40,9 @@
 //        sibling, so a probe REQUEST regrades to M_PROBE/72 instead of earning beacon-tier 85;
 //        both remaining raw-strncpy SSID copies clamp through acabSanitizeAscii; a Raven vendor
 //        UUID is recognized past the 16-slot svc16 cap (evidence displaces filler).
-//        HOT PATH: detLogBufferAll() no longer runs inside the dedup critical section (it takes
-//        the flash mutex; taking a semaphore with interrupts off panics assertion builds).
+//        HOT PATH: detLogBufferAll() no longer runs inside the dedup critical section (nothing
+//        but plain memory access belongs inside portENTER_CRITICAL; the flag read itself is
+//        lock-free, see its definition in det_log.cpp).
 //        PAIRING: mesh-detect now enables the connect-time pairing gate (USB replug arms the
 //        window, cellAbsent=true); previously any stranger in radio range could bond and reach
 //        clearlog/key/toggles.
@@ -98,7 +103,7 @@
 // 2.0.0: the Colonel Panic builds pick up the full v2 detection set the beacon board ships
 // with (offline buffer, watchlist/custom category, ignore list, refreshed OUIs, glasses).
 #ifndef ACAB_FW_VERSION
-#define ACAB_FW_VERSION "2.0.5"
+#define ACAB_FW_VERSION "2.0.6"
 #endif
 
 #endif // ACAB_VERSION_H

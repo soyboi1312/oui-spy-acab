@@ -48,9 +48,11 @@ const char* otaResultStr(OtaResult r);
 // Progress/result notifier: the module emits small JSON strings ("{...}") for the app.
 // Set by the BLE service; may be null.
 void otaSetNotifier(void (*fn)(const char* json));
-// Emit one JSON line through that notifier (no-op when unset). For board code that reports
-// non-session progress on the same OTA characteristic, e.g. the beacon board's blocking nRF
-// SWD reflash ({"nrf":"flashing","pct":N}) while loop()'s status notifies are stalled.
+// Emit one JSON line through that notifier (no-op when unset). Currently UNUSED: the beacon
+// board's blocking nRF SWD reflash that motivated it (non-session {"nrf":...} progress on the
+// OTA characteristic) was abandoned 2026-07-21 and its code deleted - the nRF now self-updates
+// over BLE DFU. Kept for the next non-session reporter; delete it with this comment if none
+// appears.
 void otaEmitNotify(const char* json);
 
 // Open a session. newVer must be strictly newer than the running ACAB_FW_VERSION unless
@@ -84,7 +86,10 @@ uint32_t otaReceived();          // bytes written so far this session
 
 // --- rollback / health ---
 // Register the target's real health boundary. A trial cannot be confirmed until this returns true.
-// Beacon-board includes scanner readiness plus a live/versioned nRF UART; mesh requires its scanner.
+// Beacon-board confirms fast on scanner readiness plus a live/versioned nRF UART, but the
+// co-processor is a preferred signal, not a veto: past a 30 s deadline the S3 confirms on its
+// own evidence, so a dead or absent nRF cannot revert a good image (see otaRuntimeHealthy in
+// beacon-board/main.cpp). Mesh requires its scanner.
 typedef bool (*OtaHealthCheck)();
 void otaSetHealthCheck(OtaHealthCheck fn);
 bool otaHealthReady();

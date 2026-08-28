@@ -38,26 +38,38 @@ static const size_t FLOCK_OUI_COUNT = sizeof(FLOCK_OUI) / sizeof(FLOCK_OUI[0]);
 // PROBE REQUESTS ONLY (see flockClassifyWiFi) - but note that gate distinguishes APs
 // from clients, NOT cameras from laptops: probe requests are exactly what a
 // not-yet-associated laptop emits, and Windows ships MAC randomization off, so the
-// real OUI is on the air. Only OUIs field-validated AT a live Falcon ship (ext=0).
-// Earlier unconfirmed candidates that came from community OUI lists were removed for
-// clean-room provenance. Re-add / promote an OUI only after confirming it at a live
-// Falcon in our own capture.
+// real OUI is on the air. The ship bar (ext=0) is one thing and only that thing: OUR OWN capture
+// of the OUI over probe requests at a DeFlock-confirmed Falcon. Nothing weaker has ever cleared
+// it - earlier unconfirmed candidates that came from community OUI lists were removed for
+// clean-room provenance - so re-add or promote an OUI only after capturing it yourself at a
+// Falcon, and cite that capture on its own row.
 // ext=1 = NON-SHIPPING candidate: compiled out of every build (gFlockExtendedOui in
 // flock_detect.cpp is compile-time false with no setter, NVS restore, or BLE toggle),
-// kept only as a provenance record until validated at a live Falcon.
+// kept only as a provenance record until it clears the bar above.
 struct FalconWifiOui { uint8_t b[3]; uint8_t ext; };
 static const FalconWifiOui FALCON_WIFI_OUI[] = {
-    // Shipped (ext=0): field-validated at a live Falcon over probe requests.
-    //   D8:F3:BC / C0:35:32 were 2026-06 near-Falcon-only candidates (held out as a
-    //   bystander-laptop risk); PROMOTED 2026-07-24 after our own drive recaptured
-    //   BOTH broadcasting "PROBE-FALCON" / "DATA-FALCON" SSIDs (a Flock-specific name
-    //   no bystander laptop emits), which pins the OUI to a Falcon. The probe-req gate
-    //   in flockClassifyWiFi still holds shared-silicon false positives down, and the
-    //   FLOCK_SSID_FALCON_SUFFIX name match is the stronger, safer primary signal.
-    {{0xD8,0xF3,0xBC}, 0},  // D8:F3:BC  own capture 2026-06 + 2026-07-24 (DATA-FALCON SSID)
-    {{0xC0,0x35,0x32}, 0},  // C0:35:32  own capture 2026-06 + 2026-07-24 (PROBE/DATA-FALCON SSID)
-    {{0x24,0xB2,0xB9}, 0},  // 24:B2:B9:F5:D0:43               own capture; field-validated at a live Falcon
-    {{0xF4,0x6A,0xDD}, 0},  // F4:6A:DD:62:38:5D / :5E:3A:F3   own capture; field-validated
+    // Shipped (ext=0). ONE PROVENANCE, SHARED BY ALL FOUR ROWS, and it is the whole story: each
+    // was captured by us over probe requests at a DeFlock-confirmed Falcon in 2026-06. All four
+    // landed in one commit (ca44071, labelled "Own field captures (deflock-confirmed Falcons,
+    // 2026-06)") with no ext field at all. Read that for exactly what it says: the capture ties
+    // the OUI to a site where a Falcon is mapped, not to that camera's own radio, which is why
+    // the probe-request gate above stays on and why these ride at conf 72 in flockClassifyWiFi
+    // rather than as proof.
+    //
+    // NO ROW HERE WAS EVER HELD BACK OR PROMOTED. The note this block used to carry said
+    // D8:F3:BC / C0:35:32 were held-out candidates promoted on 2026-07-24 after a drive recaptured
+    // both broadcasting "PROBE-FALCON" / "DATA-FALCON" SSIDs. Neither half happened: git shows both
+    // rows shipping unconditionally since the table was written, so there was nothing to promote,
+    // and those two strings are this firmware's OWN diagnostic labels, printed into the ssid= field
+    // of the [wifi] line only AFTER falconOui() had already matched, so they attest to nothing but
+    // this table. They are spelled "fwnote:falcon-oui-*" in acab_scanner.cpp now, precisely so the
+    // round trip cannot be made again. Behaviour of these rows is unchanged, and always was; only
+    // the story above them was wrong. Do not re-split the four on the strength of that story - the
+    // evidence behind them is one batch, so grade them together or not at all.
+    {{0xD8,0xF3,0xBC}, 0},  // D8:F3:BC:7D:D4:CF               own capture at a DeFlock-confirmed Falcon
+    {{0xC0,0x35,0x32}, 0},  // C0:35:32:AF:A3:7D               own capture at a DeFlock-confirmed Falcon
+    {{0x24,0xB2,0xB9}, 0},  // 24:B2:B9:F5:D0:43               own capture at a DeFlock-confirmed Falcon
+    {{0xF4,0x6A,0xDD}, 0},  // F4:6A:DD:62:38:5D / :5E:3A:F3   own capture at a DeFlock-confirmed Falcon
 };
 static const size_t FALCON_WIFI_OUI_COUNT = sizeof(FALCON_WIFI_OUI) / sizeof(FALCON_WIFI_OUI[0]);
 
@@ -70,14 +82,30 @@ static const size_t FALCON_WIFI_OUI_COUNT = sizeof(FALCON_WIFI_OUI) / sizeof(FAL
 //   src: ryanohoro "Spotting Flock Safety's Falcon Cameras"; GainSec WiFi research.
 #define FLOCK_SSID_PREFIX  "Flock-"
 
-// Falcon cameras also stand up per-function networks named "PROBE-FALCON" and
-// "DATA-FALCON" (own drive capture 2026-07-24, seen on the C0:35:32 / D8:F3:BC
-// Falcon OUIs below). Match any "*-FALCON" SSID: like the "Flock-" AP name it is a
-// strong, Flock-specific WiFi signal, and being name-based it needs no probe-req
-// gate, so it catches a Falcon in beacon / associated mode too (where the OUI path,
-// which is probe-request-only, cannot). Anchored as a SUFFIX so consumer names like
-// "Atlanta-Falcons" or "Millennium Falcon" do not match (see ciEndsWith use).
+// NON-SHIPPING CANDIDATE (ext=1), retired 2026-08-25. Same tier as an ext=1 OUI row: kept as a
+// provenance record, compiled out of every build. falconSsidSuffix() in flock_detect.cpp is the
+// gate, and it shares gFlockExtendedOui with the tables above.
+//
+// WHY IT WAS RETIRED. The rule said Falcon cameras stand up per-function networks named
+// "PROBE-FALCON" and "DATA-FALCON", cited to a 2026-07-24 drive. They do not, and it was not.
+// Those two strings are labels THIS FIRMWARE writes into the ssid= field of its own [wifi]
+// diagnostic line, and only after falconOui() has already matched - so a capture containing them
+// is our OUI table talking to itself. Two independent confirmations: a data frame carries no SSID
+// element at all, so "DATA-FALCON" could not have come off the air; and the one capture in the
+// repo that holds the string shows the label immediately followed by a conf=72 "Falcon probe
+// (OUI)" verdict, which is the verdict the classifier gives when the frame's own SSID does NOT
+// end in "-FALCON". The labels also predate the drive they were credited to by five weeks.
+//
+// WHAT IT COST WHILE IT SHIPPED: any AP or probe-response whose SSID ends case-insensitively in
+// "-FALCON" was reported as an ALPR camera at confidence 85 - above the field-validated Axon OUI
+// at 75 - on evidence that does not exist. The suffix anchor keeps "Atlanta-Falcons" out, but
+// not "NET-FALCON" or a router someone renamed.
+//
+// TO SHIP IT: a capture showing a real beacon (0x8) or probe-response (0x5) SSID IE ending in
+// "-FALCON", from a unit confirmed to be a Falcon by something other than this table. Then flip
+// FLOCK_SSID_FALCON_SUFFIX_EXT to 0 and cite the capture here.
 #define FLOCK_SSID_FALCON_SUFFIX  "-FALCON"
+static const uint8_t FLOCK_SSID_FALCON_SUFFIX_EXT = 1;
 
 // ---------------------------------------------------------------------------
 // BLE advertised-name patterns  (ANCHORED - see nameMatch in flock_detect.cpp)

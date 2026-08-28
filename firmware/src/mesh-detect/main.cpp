@@ -24,6 +24,7 @@
 #include "pair_window.h"   // acabPhysicalStart: the host-tested rule production must CALL, not restate
 #include "mesh_link.h"
 #include "det_log.h"
+#include "coredump_report.h"   // the retained IDF panic dump: report it, and erase it with the buffer
 #include "ota_update.h"
 #include "esp_task_wdt.h"   // task watchdog: catch a wedged loop(), same as beacon-board/oui-spy
 #include <Preferences.h>
@@ -110,6 +111,14 @@ void setup() {
     Serial.print(acabBanner());
     Serial.println("=== ACAB Mesh-Detect " ACAB_FW_VERSION " ===");
 
+    // Read the retained core dump BEFORE the heavy init that could panic, and report it. Same
+    // reason as beacon-board: the coredump partition is in this build's partition table too, the
+    // shared {"diag":true} reply already carries the cd* fields, and without this probe they are
+    // permanently absent - a mesh board that has been panicking looks clean. Prints nothing on a
+    // clean boot. See coredump_report.h.
+    acabCoredumpProbe();
+    acabCoredumpPrint();
+
     pinMode(ACAB_LED_PIN, OUTPUT);
     digitalWrite(ACAB_LED_PIN, HIGH);
     { Preferences p; p.begin("acab-led", true); gLedEnabled = p.getBool("led", true); p.end(); }
@@ -159,11 +168,13 @@ void setup() {
         Serial.println("[pair] warm continuation (not a physical start) - window NOT opened; "
                        "enforcement is ON, bonded phones still reconnect");
     }
-    acabBleStartAdvertising();
-
     // Offline detection buffer: mount the flash ring + bump the boot counter. Stays
-    // inert (no capture) until the app enables it and pushes an at-rest key.
+    // inert (no capture) until the app enables it and pushes an at-rest key. Finish the initial
+    // ring scan/config publication before advertising: otherwise a fast phone can enter config
+    // callbacks concurrently with the 24k-slot scan and observe default startup state.
     detLogBegin();
+
+    acabBleStartAdvertising();
 
     AcabScannerConfig cfg = acabScannerDefaults();
     cfg.initNimBLE = false;            // the GATT service already inited NimBLE
@@ -219,9 +230,9 @@ void setup() {
     acabScannerBegin(cfg, onDetection);
 
     // Task watchdog on the loop task, mirroring beacon-board/oui-spy. 30s timeout, panic=true so a
-    // genuinely wedged loop reboots into a clean image. Unlike beacon-board there is no bit-banged
-    // SWD reflash running inside loop() here, so this loop always feeds well inside the window; the
-    // OTA image write lands in the BLE host task, not this one, and loop() only polls (delay 50ms).
+    // genuinely wedged loop reboots into a clean image. Nothing in this loop blocks long: the
+    // OTA image write lands in the BLE host task, not this one, and loop() only polls (delay 50ms),
+    // so this loop always feeds well inside the window.
     esp_task_wdt_init(30, true);
     esp_task_wdt_add(NULL);
 
@@ -300,6 +311,14 @@ void loop() {
     }
 #endif
 
+    // SECOND AT-REST SURFACE, and this build reaches it exactly like beacon-board does: same
+    // {"clearlog"} handler, same det_log ring, same NimBLE host task parsing the phone's
+    // {"lat","lon"} onto a stack an ELF dump would capture. Without this call {"clearlog"} would
+    // report success with the panic dump still in flash. Consumes the explicit NVS-backed erase
+    // generation even after power loss or while a shared ring sweep is already pending. A plain
+    // boot auto-wipe with no explicit token preserves the dump. The physical erase defers past
+    // the ring sweep that acabBleDrainTick pumps below - see coredump_report.h.
+    acabCoredumpWipeTick();
     acabBleDrainTick();   // stream buffered detections back on the app's sync request
     acabBleOtaWatchdog(); // abort + un-quiesce a stalled OTA session (missed link drop)
     delay(50);

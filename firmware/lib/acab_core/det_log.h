@@ -38,12 +38,13 @@
 
 // One ring slot, fixed 64 bytes (static_assert enforced in det_log.cpp). seq,
 // bootCount, and crc are CLEARTEXT so the boot scan can find the head and validate
-// torn writes without the key; everything from whenMs down is the AES-CTR encrypted
-// payload (nonce = bootCount:seq, unique per record).
+// torn writes without the key; everything from whenMs down is the AES-CTR encrypted payload.
+// Its counter prefix is derived from an unpredictable durable 128-bit crypto domain plus
+// bootCount:seq, separating boards/NVS generations even though the app key is shared.
 struct __attribute__((packed)) StoredDet {
     uint32_t seq;          // monotonic: ring order + the app's sync cursor (cleartext)
     uint32_t bootCount;    // persisted monotonic boot counter, NOT random (cleartext)
-    uint16_t crc;          // CRC16 over the encrypted payload; written LAST (cleartext)
+    uint16_t crc;          // CRC16 over every stored byte except this field; written LAST
     uint16_t gpsAgeSec;    // age (s) of the GPS fix used for lat/lon (cleartext; 0 = fresh/none)
     // ---- encrypted payload (52 bytes) ----
     uint32_t whenMs;       // millis() at last sighting, this boot
@@ -56,10 +57,53 @@ struct __attribute__((packed)) StoredDet {
     char     name[6];          // truncated label for non-drones (type carries the class)
 };
 
+// Oldest phone fix a stored record may carry a coordinate from, in millis.
+//
+// It is gpsAgeSec's own uint16 range, in seconds, and NOT an independent policy number: past it
+// the age stops fitting the field, so the record would carry a real coordinate beside an age that
+// says "18h" no matter how much older it actually is. The apps render that age verbatim
+// ("location from a fix N old"), so a saturated one is a claim the board cannot support.
+// A board left out longer than this keeps recording WHAT went by and stops claiming WHERE.
+//
+// ENFORCED AT THE WRITE, inside detLogAppend, and not only at acab_scanner's read. Do NOT read
+// this as "the live phone-connected path is fresh by construction" - it is not. handleDetection
+// asks acabBleGetPhoneGps for "any age", so a phone that connects, pushes one fix and then stops
+// refreshing (backgrounded, location permission revoked, parked) leaves that stamp arbitrarily old
+// while the link stays up. Such a row still reaches this ring: it is queued to sinkTask with the
+// stamp already on it, the link drops, and the append is accepted a beat later. The write-side
+// bound is the only thing between that and a two-day-old coordinate stored beside a saturated age.
+static const uint32_t DET_LOG_GPS_MAX_AGE_MS = 0xFFFFu * 1000u;   // 65535 s ~ 18h12m
+
+// A position offered to detLogAppend ALONGSIDE the record instead of inside it, already in the
+// storage form StoredDet keeps (e7 fixed point, whole seconds), so nothing is rounded twice.
+//
+// WHY IT IS NOT SIMPLY SET ON THE AcabDetection: the only position a board can offer while its
+// owner is away is the retained phone fix (acabBleGetLastPhoneGps), and that fix must never ride
+// the object the sink hands to the BLE notify path. The SAME AcabDetection is both delivered live
+// and buffered, and the two happen on opposite sides of a connect: a row stamped while
+// disconnected can sit in the sink queue under backpressure, a phone can connect in that window,
+// the append is then refused (this ring only accepts rows while the app is away) and the live
+// notify goes out carrying the coordinate anyway - to a phone that, after a re-pair, need not even
+// be the one that supplied it. Carrying it out of band makes that shape unrepresentable instead of
+// merely guarded against.
+//
+// `valid` false = nothing offered; the record then stores whatever the detection itself carries.
+struct DetLogGpsStamp {
+    int32_t  lat_e7;
+    int32_t  lon_e7;
+    uint16_t ageSec;
+    bool     valid;
+};
+
 // A decrypted record handed back to the BLE layer for one replay frame.
 struct DetLogReplay {
     AcabDetection d;       // unpacked back into the live detection shape
     uint32_t seq;          // wire "seq"
+    // Private record-layer capability for THIS peek. It never goes on the wire. A stop followed
+    // by a new start can legitimately put the cursor back on the same seq, so seq alone cannot
+    // distinguish the old peek from the replacement drain (an ABA race). Commit must present
+    // both values; start, stop, and clear each invalidate every previously issued capability.
+    uint64_t drainGeneration;
     uint32_t atUnix;       // absolute capture time (unix seconds), or 0 when approx
     bool     approx;       // true => this boot was never anchored; the app brackets it
     // Always populated, even when approx. The board has no RTC, so an absolute time is ALWAYS
@@ -73,8 +117,10 @@ struct DetLogReplay {
 
 // Latched storage faults. These are a bitmask so one status value can report every
 // failure observed since the last fully successful clear. Faults survive reboot and
-// storage-integrity faults stop new appends. A complete physical wipe clears them;
-// merely starting a clear does not claim the storage is healthy again.
+// raw-ring integrity faults stop new appends. The NVS bit reports an offline-buffer metadata
+// load/save failure (generation, anchors, connection/privacy lifecycle, saturation, or diagnostic
+// state), but does not by itself condemn otherwise sound ring geometry. A complete physical wipe
+// clears the mask; merely starting a clear does not claim the storage is healthy again.
 enum DetLogFault : uint32_t {
     DET_LOG_FAULT_NONE    = 0,
     DET_LOG_FAULT_READ    = 1u << 0,
@@ -82,12 +128,15 @@ enum DetLogFault : uint32_t {
     DET_LOG_FAULT_WRITE   = 1u << 2,
     DET_LOG_FAULT_CORRUPT = 1u << 3,
     DET_LOG_FAULT_LOCK    = 1u << 4,
+    DET_LOG_FAULT_NVS     = 1u << 5,  // offline-buffer metadata could not be loaded or saved
+    DET_LOG_FAULT_CRYPTO  = 1u << 6,  // nonce/key hash or AES failed; evidence I/O is incomplete
 };
 
 // --- lifecycle ---
 void     detLogBegin();             // mount ring, scan for head (generation window),
                                     // bump+persist bootCount, run auto-wipe of stale records
-void     detLogSetEnabled(bool on); // opt-in master switch (persisted to NVS)
+void     detLogSetEnabled(bool on); // opt-in master switch (persisted); false also durably requests
+                                    // retained-coredump erasure, even when already disabled
 bool     detLogEnabled();
 
 // --- RECORD EVERYTHING (deploy-and-leave). Persisted to NVS, default OFF. ---
@@ -135,14 +184,13 @@ bool     detLogEnabled();
 void     detLogSetBufferAll(bool on);
 bool     detLogBufferAll();
 
-// --- ring saturation: is the TAIL of this log censored? ---
-// Once the ring is full, detLogAppend refuses further ACAB_NEARBY_DEVICE records rather than let
-// them evict signature hits. That is the right trade, but it must not be silent: without a marker
-// the owner reconnects to a full-looking log and cannot tell "nothing came by after Tuesday" from
-// "we stopped writing on Tuesday". detLogSaturated() is PERSISTED, so it survives the reboots a
-// week in the field guarantees, and is cleared only by detLogClear (a wipe starts a fresh log).
-// detLogSatDrops() counts THIS BOOT only and is for the diag line. The app must surface the flag
-// beside the log itself, not in a settings screen.
+// --- Stationary-mode capacity / censoring risk ---
+// Once Stationary capture reaches ring capacity, detLogAppend refuses further
+// ACAB_NEARBY_DEVICE records rather than let them evict signature hits. `bufsat` is raised on the
+// exact transition to full (and when bufall is enabled on an already-full ring), so it means later
+// nearby rows MAY have been omitted; it is not proof a refusal already occurred. The flag is
+// PERSISTED across deployment reboots and cleared only by detLogClear. detLogSatDrops() counts
+// actual refusals THIS BOOT for the diag line. Surface the capacity warning beside the log.
 bool     detLogSaturated();
 uint32_t detLogSatDrops();
 
@@ -166,8 +214,9 @@ uint32_t detLogSatDrops();
 //      came by".
 //   2. It records nearby radios, INCLUDING BYSTANDERS' PHONES. Say it plainly; this is the
 //      disclosure that distinguishes the mode from the rest of the product.
-//   3. Storage used, and whether it SATURATED (status "bufsat"). A saturated log is censored at
-//      the tail and the user must not read it as a complete record. Show this next to the log.
+//   3. Storage used, and whether it REACHED CAPACITY (status "bufsat"). Later nearby rows may have
+//      been omitted, so the user must not assume a full log is complete. Show this next to the log;
+//      `bufdrops` is the separate current-boot count proving actual refusals.
 //   4. Whether capture times are EXACT or APPROXIMATE. Any boot after an unattended power loss
 //      is unanchored and replays as approx (DetLogReplay.approx). "Monday and Thursday" is only
 //      guaranteed while the board stays powered or that boot received an epoch anchor.
@@ -210,30 +259,126 @@ uint32_t detLogSatDrops();
 // SHA-256 of it is persisted UNCONDITIONALLY: buffered records outlive the key (a disable
 // erases the key but not the ring), and the fingerprint is what detects a different phone's
 // key arriving for them, which would otherwise decrypt them to noise that passes the CRC. ---
-void     detLogSetKey(const uint8_t key[32]);
-void     detLogClearKey();          // forget the key (e.g. when buffering is disabled); keeps the fingerprint
+// Result of offering an at-rest key for the current authenticated config session. A key is
+// ACCEPTED only after its fingerprint is verified and it is either installed or safely staged
+// behind an already-authorized transaction. PENDING means startup/raw geometry is not authoritative
+// yet, so the caller must not use a retained RAM key to authorize replay. A different key never
+// destroys a nonempty/unknown generation unless `allowDestructiveReplacement` accompanies an
+// explicit clear request; MISMATCH preserves both the rows and their current key.
+enum DetLogKeyResult : uint8_t {
+    DET_LOG_KEY_REJECTED = 0,
+    DET_LOG_KEY_ACCEPTED = 1,
+    DET_LOG_KEY_PENDING  = 2,
+    DET_LOG_KEY_MISMATCH = 3,
+};
+DetLogKeyResult detLogSetKey(const uint8_t key[32],
+                             bool allowDestructiveReplacement = false);
+void     detLogClearKey();          // forget the key; keeps the fingerprint. Normal disable callers
+                                    // use detLogSetEnabled(false), which also requests dump erasure
 bool     detLogHaveKey();
+// Called after BLE authentication but before config writes are admitted. Durably pins one
+// retained-coredump erase generation for the whole physical boot before keys/config can enter
+// parser/callback stacks; subsequent sessions reuse it to avoid NVS churn. False means NVS could
+// not establish that privacy boundary and the caller must reject/disconnect the session.
+bool     detLogPrepareConfigSession();
+// Paired with the BLE session gate. If buffering stayed disabled and this link supplied a replay
+// key, forget its live/staged copies without NVS writes or another erase generation; the
+// boot-lifetime exposure hold and already-durable token remain the panic-dump backstop.
+void     detLogEndConfigSession();
 
 // --- wall-clock anchor: app-pushed epoch for this boot (mirrors the GPS push) ---
 void     detLogSetEpoch(uint32_t unixSec);
 
-// --- capture: called from acab_scanner.cpp handleDetection while disconnected.
-// No-op unless enabled AND a key is present AND this is the device's first sighting
-// this boot (e->count == 0). ---
-void     detLogAppend(const AcabDetection& d);
+// Start an authenticated-owner OR disconnect boundary before clearing session GPS or doing
+// config-session NVS work. This advances the scanner-to-flash epoch and blocks every append/live
+// delivery until the corresponding admit. The scanner publishes a zero sentinel on queue claims
+// while the block is held, so old and newly queued items are both refused. Returns 0 on lock
+// failure, leaving capture fail-closed.
+uint32_t detLogBlockCaptureForOwnerSession();
+
+// Finish a reserved boundary after prior-owner state is cleared. Authentication calls this after
+// the config-session privacy pre-arm is durable; disconnect calls it after GPS/replay/key teardown
+// and keeps its service gate raised until scanner epoch+generation publication. `epoch` must be the
+// nonzero token returned above. False leaves capture/delivery fail-closed.
+bool     detLogAdmitCaptureForOwnerSession(uint32_t epoch);
+
+// Recover a disconnect boundary when its normal Block reservation was unavailable. The ordinary
+// path uses Block before connection teardown and Admit afterward, then publishes that reserved
+// epoch with the scanner generation in one critical section. This one-step advance remains the
+// fail-closed fallback: it never returns an unchanged token as success. Returns 0 on lock failure;
+// 0 is never a live admission token.
+uint32_t detLogAdvanceCaptureEpoch();
+
+// Run a queued live-delivery callback only if its scanner-stamped owner epoch is still current.
+// Validation and callback execution share a dedicated owner-delivery mutex with authentication /
+// disconnect epoch changes, so a prior owner's queued item cannot pass a check and then notify a
+// newly admitted owner in the gap afterward. gIoMutex is released before `deliver`, so ordinary
+// detLog status reads from the sink are safe; the callback must not recursively call these three
+// owner-boundary/delivery APIs. A zero/stale epoch, an authentication-preparation block, or lock
+// failure returns false without invoking the callback.
+typedef void (*DetLogCaptureDelivery)(void* context);
+bool     detLogDeliverIfCaptureEpochCurrent(uint32_t epoch,
+                                            DetLogCaptureDelivery deliver,
+                                            void* context);
+
+// --- capture: called from acab_scanner.cpp's sinkTask, off both radio paths.
+// No-op unless buffering is enabled AND a key is present AND the ring mounted AND no app is
+// connected. WHICH detections get here at all is the caller's decision (shouldBuffer in
+// handleDetection): once per device per capture generation, no Desert rows unless the owner
+// turned on "record everything".
+//
+// `gps`, when non-null and valid, supplies the position for THIS record only - see DetLogGpsStamp
+// for why the retained phone fix arrives beside the detection rather than on it. A detection that
+// already carries its own coordinate (a drone's broadcast position, an onboard fix) keeps it. ---
+enum DetLogAppendResult : uint8_t {
+    DET_LOG_APPEND_STORED,          // row is durably present in the raw ring
+    DET_LOG_APPEND_RETRY,           // transient refusal; caller should release its capture claim
+    DET_LOG_APPEND_NOT_ARMED,       // stable off/link/key/storage refusal; claim stays consumed
+    DET_LOG_APPEND_CAPACITY_DROP,   // intentional full-ring nearby refusal; claim stays consumed
+};
+inline bool detLogAppendReleasesClaim(DetLogAppendResult result) {
+    return result == DET_LOG_APPEND_RETRY;
+}
+DetLogAppendResult detLogAppend(const AcabDetection& d,
+                                const DetLogGpsStamp* gps = nullptr);
+DetLogAppendResult detLogAppendClaimed(const AcabDetection& d,
+                                       const DetLogGpsStamp* gps,
+                                       uint32_t captureEpoch);
 
 // --- replay: the BLE service owns the NOTIFY stream and pulls records from here.
 // Delivery is UNACKNOWLEDGED notify; reliability is the per-record seq plus the {"hist":"end","n"}
 // count, which let the app spot a gap and re-sync (it is NOT an acknowledged INDICATE stream).
-// detLogStartDrain sets the cursor to the app's lastSeq; detLogNextForDrain decrypts
-// and unpacks the next record (returns false when the drain is complete). ---
-void     detLogStartDrain(uint32_t lastSeq);
+// detLogStartDrain accepts the cursor only when the app's durable log generation matches the
+// board. A missing/zero/mismatched generation rebases to the retained ring floor, because seq
+// values overlap after a clear and cannot safely identify a generation by themselves. Replay is
+// deliberately two-phase:
+// detLogPeekForDrain decrypts/unpacks the next record WITHOUT advancing the cursor, and the BLE
+// service calls detLogCommitDrain only after it has built a frame that fits and queued the notify.
+// An MTU/schema regression can therefore block a drain and remain visible, but can never consume
+// evidence the phone did not receive. A repeated peek before commit returns the same seq. ---
+enum DetLogDrainStartResult : uint8_t {
+    DET_LOG_DRAIN_STARTED,
+    DET_LOG_DRAIN_EMPTY,
+    DET_LOG_DRAIN_PENDING,
+    DET_LOG_DRAIN_REJECTED,
+};
+DetLogDrainStartResult detLogStartDrain(uint32_t lastSeq, uint32_t clientLogGeneration);
+// Internal/backward-compatible convenience for callers that already share board state. Wire
+// parsers must pass the client's explicit generation (zero when absent), never use this overload.
+uint32_t detLogGeneration();
+inline DetLogDrainStartResult detLogStartDrain(uint32_t lastSeq) {
+    return detLogStartDrain(lastSeq, detLogGeneration());
+}
+bool     detLogDrainStartPending();
 bool     detLogDraining();
 void     detLogStopDrain();   // abort an in-flight drain on a link drop; next {sync} re-arms it
-bool     detLogNextForDrain(DetLogReplay* out);
+bool     detLogPeekForDrain(DetLogReplay* out);
+bool     detLogCommitDrain(uint32_t seq, uint64_t drainGeneration);
+                                    // false unless both values came from the current matching peek
 
 // --- maintenance ---
-void     detLogClear();             // logical clear now; REAL erase of the whole ring deferred, chunked across loop ticks
+void     detLogClear();             // logical clear now; ring erase deferred/chunked, plus a durable
+                                    // retained-coredump erase generation consumed from loop()
 uint32_t detLogCount();             // stored record count (surfaced as status "buf")
 uint32_t detLogPendingDrain();      // records queued for the CURRENT drain (valid after
                                     // detLogStartDrain; = what the replay will actually send)
@@ -244,6 +389,16 @@ uint32_t detLogFaults();            // latched DetLogFault bitmask; 0 means no k
 void     detLogEraseTick();
 bool     detLogWipePending();
 uint32_t detLogDrainFrom();
+
+// A retained IDF core dump is a second sensitive at-rest surface: task stacks can contain the
+// buffer key, a decrypted record, or phone coordinates. User-driven destructive actions therefore
+// persist an independent erase-generation token instead of asking coredump_report to infer intent
+// from the shared ring-wipe level (which also represents auto-wipes and resumed sweeps). The token
+// survives power loss; completion clears it only if no newer request superseded `generation`.
+// Production callers are coredump_report.cpp only. Exposed here so the host persistence suite can
+// prove the contract against the real Preferences-backed implementation.
+uint32_t detLogSensitiveErasePending();
+void     detLogSensitiveEraseComplete(uint32_t generation);
 
 #ifdef ACAB_HOST_TEST
 // Drops only process-local state. The host partition and Preferences stores survive,

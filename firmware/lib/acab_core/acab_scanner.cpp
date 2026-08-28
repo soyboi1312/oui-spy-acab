@@ -23,6 +23,15 @@
 #include "sink_claim.h"   // acabClaimRollbackAllowed: the ABA-safe rollback decision
 #include "dedup_key.h"    // acabDedupKey: ONE derivation, shared with the host tests
 #include "acab_ble_service.h"
+#ifdef ACAB_CAPTURE_BUILD
+#include "alpr_candidates.h"  // exact-width registered-prefix watchlist; never a classifier
+#endif
+// Same guard as the shared advName buffer in acabScannerIngestBLE: the capture build's body-cam
+// name candidates AND the ACAB_DIAG Pigvision marker both match against it, and ACAB_DIAG can be
+// set on its own (nothing forces it to imply a capture build).
+#if defined(ACAB_CAPTURE_BUILD) || defined(ACAB_DIAG)
+#include "ascii_match.h"      // shared acabAsciiCiContains (capture/diag name annotations)
+#endif
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -79,7 +88,7 @@ struct DedupEntry {
     uint16_t      count;
     uint32_t      loggedGen;   // capture generation this entry last buffered in (0 = never)
     uint32_t      logClaim;    // token of the claim that set loggedGen (see sink_claim.h)
-    bool          alerted;     // tracker buzzer debounce: has the post-debounce alert fired yet
+    bool          alerted;     // tracker capture debounce: has the post-debounce `new` edge fired
     int16_t       hnext;       // next entry index in this slot's hash bucket chain (-1 = end)
 };
 // NOT sized to hold every device Desert mode sees, and it cannot be: entries are only ever
@@ -103,17 +112,21 @@ static inline uint32_t dedupHash(AcabDeviceType type, const uint8_t mac[6]) {
     return h;
 }
 
-// BUZZER DEBOUNCE ONLY. This does NOT decide whether a tracker is following you, and the board
+// CAPTURE DEBOUNCE ONLY. This does NOT decide whether a tracker is following you, and the board
 // cannot decide that: judging "following" needs your LOCATION OVER TIME and this board has no GPS
 // and no wall clock. That call is made in the app, which has both. See docs/ble-protocol.md.
 //
-// What this does: hold the buzzer for the first minute of a tracker's life so a tag you drift past
-// in a parking lot stays quiet, while the detection is still DELIVERED to the app immediately.
-// Delivery and alerting are deliberately decoupled (see the gate below) , the app needs the early
-// sightings to build its location trail, so suppressing delivery would blind the very thing that
-// makes the judgement. The old code returned early here and the phone never saw those sightings.
+// The name is historical and the buzzer is not what it buys: ACAB_TRACKER's case in alerts.cpp is
+// an empty pattern and alertsSignal excludes the type from the reveal sting, so a tracker makes no
+// sound whatever this constant does. What this does hold, for the first minute of a tracker's life,
+// is the wire `new` flag and the offline-buffer write, so a tag you drift past in a parking lot
+// does not spend the board's capture, while the detection is still DELIVERED to the app
+// immediately. Delivery and capture are deliberately decoupled (see the gate below) , the app needs
+// the early sightings to build its location trail, so suppressing delivery would blind the very
+// thing that makes the judgement. The old code returned early here and the phone never saw those
+// sightings.
 //
-// 60s, not the old 5s: five seconds silences nothing real. It is also not an attempt at a
+// 60s, not the old 5s: five seconds holds back nothing real. It is also not an attempt at a
 // follow-me threshold, since Apple's own equivalent runs 8 hours by day and ~30 minutes at night
 // against signals we do not have. 60s is simply longer than a traffic light next to a parked car.
 // Trackers ONLY: other surveillance gear alerts on first sight, since a Flock/drone/body-cam you
@@ -122,6 +135,15 @@ static const uint32_t TRACKER_ALERT_DEBOUNCE_MS = 60000;
 // Offline-capture generation: bumped on each BLE disconnect so the first sighting of
 // every device AFTER the app leaves buffers once more, not just once per boot.
 static volatile uint32_t gCaptureGen = 1;
+// Owner/link admission is distinct from capture cadence. gCaptureGen also advances every 15
+// minutes in Stationary mode; that periodic re-arm must not invalidate a legitimate queued row.
+// Authentication and disconnect publish det_log-owned owner-admission epochs here, under the same
+// dedup lock used to stamp SinkItem claims. Periodic capture cadence never touches this value.
+static uint32_t gAdmissionEpoch = 1;
+// Reserved by the det_log boundary while authentication or disconnect clears prior-owner state.
+// Scanner claims are stamped 0 during that window; only the explicit auth admit or disconnect
+// re-arm step publishes this nonzero token.
+static uint32_t gPendingAdmissionEpoch = 0;
 // Monotonic token stamped on every offline-buffer claim. Only ever read/incremented while holding
 // gDedupMux, so a plain uint32_t is correct and an atomic would be misleading about the locking.
 // Wraparound is a non-issue: it would take ~4.3 billion buffered claims in one power cycle, and a
@@ -201,8 +223,12 @@ static void loadIgnoreList() {
     if (n > ACAB_IGNORE_MAX) n = ACAB_IGNORE_MAX;
     if (n > 0) p.getBytes("macs", gIgnore, (size_t)n * 6);
     p.end();
-    gIgnoreCount = n;
+    // Sort BEFORE the count goes live: isIgnored binary-searches on the other core without
+    // taking a lock here, so publishing n first let a boot-time reader bisect a partly-sorted
+    // array and answer wrongly for a MAC that is on the list. The comment above promises the
+    // count is held at 0 for the whole load; the load includes the sort.
     qsort(gIgnore, n, 6, macCmp);   // keep sorted for binary-search isIgnored (old blobs may be unsorted)
+    gIgnoreCount = n;
 }
 
 // Persist the watchlist to NVS so starred devices survive reboots (own namespace).
@@ -223,8 +249,9 @@ static void loadWatchList() {
     if (n > ACAB_WATCH_MAX) n = ACAB_WATCH_MAX;
     if (n > 0) p.getBytes("macs", gWatch, (size_t)n * 6);
     p.end();
-    gWatchCount = n;
+    // Same order rule as loadIgnoreList above: sort first, then publish the count.
     qsort(gWatch, n, 6, macCmp);   // keep sorted for binary-search isWatched (old blobs may be unsorted)
+    gWatchCount = n;
 }
 
 // The entry for (type, mac), creating/evicting as needed. Caller holds gDedupMux and passes
@@ -263,7 +290,17 @@ static void claimTableRestore(void*, uint32_t loggedGen) {
 }
 static uint32_t claimTableGenNow(void*) { return gCaptureGen; }
 
-static DedupEntry* dedupFind(AcabDeviceType type, const uint8_t mac[6], uint32_t bucket) {
+static bool rollbackBufferClaim(const AcabSinkClaim& claim) {
+    static const AcabClaimTable kTable{ claimTableLookup, claimTableRestore,
+                                        claimTableGenNow, nullptr };
+    portENTER_CRITICAL(&gDedupMux);
+    const bool restored = acabSinkClaimRollback(claim, kTable);
+    portEXIT_CRITICAL(&gDedupMux);
+    return restored;
+}
+
+static DedupEntry* dedupFind(AcabDeviceType type, const uint8_t mac[6], uint32_t bucket,
+                             uint32_t now) {
     // fast path: already tracked -> walk just this bucket's chain
     for (int16_t i = gDedupBucket[bucket]; i >= 0; i = gDedup[i].hnext) {
         DedupEntry* e = &gDedup[i];
@@ -275,13 +312,27 @@ static DedupEntry* dedupFind(AcabDeviceType type, const uint8_t mac[6], uint32_t
     // on one-shot phone entries and keep re-admitting (and so re-arming) the cameras/trackers
     // this exists to track. Evict the oldest NEARBY_DEVICE first, and only fall back to the
     // oldest entry overall once the table holds nothing but real matches.
+    //
+    // "Oldest" is measured as ELAPSED AGE (now - lastSeen), never by comparing the raw stamps.
+    // millis() wraps every ~49.7 days and this table has NO time-based expiry - entries leave
+    // only by eviction - so a raw `<` inverts across the wrap: an entry stamped just before it
+    // (~0xFFFFFFxx) reads as the newest forever and is never chosen, while every freshly stamped
+    // entry looks oldest and is evicted the moment the next new key arrives. On a deploy-and-
+    // leave unit that collapses the table to the handful of post-wrap slots, and a real camera or
+    // tracker then gets re-admitted instead of refreshed - which zeroes count (so it re-alerts the
+    // buzzer, defeating the tracker dwell gate) and zeroes loggedGen (so the offline flash ring
+    // refills with duplicates of one device and wraps away the evidence). The unsigned subtraction
+    // below is wrap-correct, matching the `now - e->lastSeen > gCfg.dedupWindowMs` test in
+    // handleDetection that already gets this right.
     int freeIdx = -1, oldestIdx = -1, oldestNearbyIdx = -1;
+    uint32_t oldestAge = 0, oldestNearbyAge = 0;
     for (int i = 0; i < ACAB_DEDUP_MAX; i++) {
         DedupEntry* e = &gDedup[i];
         if (!e->used) { freeIdx = i; break; }
-        if (oldestIdx < 0 || e->lastSeen < gDedup[oldestIdx].lastSeen) oldestIdx = i;
+        const uint32_t age = now - e->lastSeen;
+        if (oldestIdx < 0 || age > oldestAge) { oldestIdx = i; oldestAge = age; }
         if (e->type == ACAB_NEARBY_DEVICE &&
-            (oldestNearbyIdx < 0 || e->lastSeen < gDedup[oldestNearbyIdx].lastSeen)) oldestNearbyIdx = i;
+            (oldestNearbyIdx < 0 || age > oldestNearbyAge)) { oldestNearbyIdx = i; oldestNearbyAge = age; }
     }
     int idx = (freeIdx >= 0) ? freeIdx : (oldestNearbyIdx >= 0 ? oldestNearbyIdx : oldestIdx);
     DedupEntry* slot = &gDedup[idx];
@@ -315,7 +366,46 @@ static DedupEntry* dedupFind(AcabDeviceType type, const uint8_t mac[6], uint32_t
 // buffering is deliberately not gated on deliver, and detLogBufferAll() now admits a throttled
 // Desert ACAB_NEARBY_DEVICE to the buffer as well. Treat the two flags as genuinely independent -
 // which is what the code has always actually done, both here and in sinkTask.
-struct SinkItem { AcabDetection d; bool isNew; bool deliver; bool buffer; };
+//
+// `bufGps` rides BESIDE `d`, never inside it. It is the retained phone fix, the only position a
+// board can offer once its owner has walked away, and the notify path must not be able to reach
+// it: `d` is the very object gSink hands to acabBleNotifyDetection, and `buffer` and `deliver` are
+// resolved on opposite sides of a possible connect. See the stamp in handleDetection and
+// DetLogGpsStamp in det_log.h for the failure this shape rules out.
+//
+// THE COST OF CARRYING IT, since this struct is what sets the queue's heap budget: SinkItem is
+// 272 B (224 of AcabDetection, 3 flag bytes, a 12-byte DetLogGpsStamp, the 32-byte ABA-safe claim,
+// and padding), so xQueueCreate below takes 32 * 272 = 8,704 B of heap. The claim must travel to
+// the sink: a successful queue send is not evidence that the later flash append was accepted.
+// The stamp holds StoredDet's own e7/whole-second units rather than the live doubles precisely to
+// keep that number down: two doubles plus the age would be 20 B rather than 12, so after padding
+// that is a further 16 B per queue item (512 B of heap) for no precision at all, since det_log
+// truncates to e7 on the way in regardless.
+struct SinkItem {
+    AcabDetection d;
+    bool isNew;
+    bool deliver;
+    bool buffer;
+    DetLogGpsStamp bufGps;
+    AcabSinkClaim claim;
+};
+// Self-checking, in the same spirit as the sizeof(AcabDetection) assert in detection.h: the two
+// figures in the paragraph above are the queue's heap budget, and a silently grown SinkItem is
+// exactly how a budget comment goes stale.
+static_assert(sizeof(SinkItem) == 272,
+              "SinkItem size changed; re-measure the ACAB_SINK_Q_LEN heap budget above "
+              "(and the derived figure in detection.h) before bumping this.");
+
+struct SinkDeliveryContext {
+    AcabDetectionSink sink;
+    const AcabDetection* detection;
+    bool isNew;
+};
+
+static void deliverSinkItem(void* raw) {
+    SinkDeliveryContext* context = static_cast<SinkDeliveryContext*>(raw);
+    context->sink(*context->detection, context->isNew);
+}
 
 static void sinkTask(void*) {
     SinkItem it;
@@ -331,8 +421,32 @@ static void sinkTask(void*) {
         // Never ship: this would drop most of a real capture on the floor.
         vTaskDelay(pdMS_TO_TICKS(50));
 #endif
-        if (it.buffer) detLogAppend(it.d);
-        if (it.deliver && gSink) gSink(it.d, it.isNew);
+        // bufGps is handed to the RING and is never merged into it.d, so the retained phone fix
+        // it may carry cannot reach the sink below - which is where a notify is built. That is the
+        // whole reason it travels as a separate argument; see the stamp in handleDetection.
+        if (it.buffer) {
+            const DetLogAppendResult result =
+                detLogAppendClaimed(it.d, &it.bufGps, it.claim.admissionEpoch);
+            if (detLogAppendReleasesClaim(result)) {
+                // Queue admission was only the first asynchronous boundary. Startup/key/NVS/wipe
+                // state can change before this task reaches flash; a retryable refusal must release
+                // the exact claim so the same device can buffer later this generation. The claim
+                // token prevents a late sink result from undoing a newer successful ABA claim.
+                rollbackBufferClaim(it.claim);
+            }
+            // CAPACITY_DROP is intentional Stationary-mode censorship: keep the claim consumed or
+            // every advert would hammer the full ring and inflate bufdrops indefinitely.
+        }
+        if (it.deliver && gSink) {
+            // Append rejection alone is insufficient: the same queued object feeds BLE/mesh and
+            // may carry prior-owner live GPS. Validate at the final delivery boundary and keep the
+            // dedicated owner-delivery mutex through the callback, so disconnect/authentication
+            // cannot pass a check and then hand the row to the next phone. det_log's flash mutex is
+            // released first, preserving the BLE JSON-pool lock order.
+            SinkDeliveryContext context{gSink, &it.d, it.isNew};
+            detLogDeliverIfCaptureEpochCurrent(it.claim.admissionEpoch,
+                                               deliverSinkItem, &context);
+        }
     }
 }
 
@@ -382,7 +496,13 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
         d.replay = true;
         // replay delivers to the app but never buffers (no re-buffering of recovered records)
         if (gSinkQ) {
-            SinkItem it{d, false, true, false};
+            SinkItem it{d, false, true, false, {}, {}};
+            // nRF black-box replay shares the asynchronous sink queue, so it needs the same owner
+            // token even though it never claims an offline-buffer row. Otherwise A can request a
+            // dump, disconnect, and have the delayed item notify B.
+            portENTER_CRITICAL(&gDedupMux);
+            it.claim.admissionEpoch = gAdmissionEpoch;
+            portEXIT_CRITICAL(&gDedupMux);
             // A dropped REPLAY record is lost from THIS dump attempt only - bbDump() does not
             // erase the nRF ring (BCLR is a separate command), and the whole black box is a
             // bench-only capture build. Counted, but not permanent loss; do not describe it as one.
@@ -398,22 +518,27 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
     const uint8_t* key = dedupKey(d, keyScratch);
     // hash the key OFF the lock (no shared state) so the critical section stays short
     uint32_t bucket = dedupHash(d.type, key) & (ACAB_DEDUP_BUCKETS - 1);
-    // Read the "record everything" flag OFF the lock too. detLogBufferAll() takes gIoMutex with
-    // portMAX_DELAY, and detLogAppend holds that same mutex across a 4 KB sector erase, so calling
-    // it inside portENTER_CRITICAL blocks on a semaphore with interrupts disabled: the scheduler
-    // cannot run to hand the mutex over, and assertion-enabled builds panic. The flag only changes
-    // on an app config write, so a one-advert-stale read is harmless.
+    // Read the "record everything" flag OFF the lock too. detLogBufferAll() is a deliberately
+    // LOCK-FREE read of a volatile bool (see the rationale on its definition in det_log.cpp - it
+    // is lock-free precisely BECAUSE this radio hot path calls it, and gIoMutex is held across
+    // multi-ms flash erases). The flag only changes on an app config write, so a one-advert-stale
+    // read is harmless. Keep the call out here anyway: nothing but plain memory access belongs
+    // inside portENTER_CRITICAL, and this is the last place that should acquire the habit of
+    // calling into another module with interrupts disabled.
     const bool bufferAll = detLogBufferAll();
 
     portENTER_CRITICAL(&gDedupMux);
-    DedupEntry* e = dedupFind(d.type, key, bucket);
+    DedupEntry* e = dedupFind(d.type, key, bucket, now);
     isNew = (e->count == 0) || (now - e->lastSeen > gCfg.dedupWindowMs);
     if (e->count == 0) e->firstSeen = now;
     e->lastSeen = now;
     if (e->count < 0xFFFF) e->count++;
-    // Tracker BUZZER debounce. Silences the piezo for the first TRACKER_ALERT_DEBOUNCE_MS of a
-    // tracker's life, and NOTHING ELSE , the detection is still delivered to the app on every
-    // sighting from the very first one.
+    // Tracker capture debounce. Named for the buzzer, but the buzzer is not what it buys: the
+    // ACAB_TRACKER case in alerts.cpp is an empty pattern and alertsSignal excludes the type from
+    // the reveal sting, so a tracker is silent for its whole life whatever this does. What the
+    // first TRACKER_ALERT_DEBOUNCE_MS actually holds back is the wire `new` flag and the
+    // offline-buffer write (both below); the detection itself is still delivered to the app on
+    // every sighting from the very first one.
     //
     // This used to `return` early (see the deleted line below the critical section), which also
     // skipped the GPS stamp and the sink enqueue, so the phone never saw a sub-dwell tracker at
@@ -421,9 +546,10 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
     // it needs location-over-time to do it, and the early sightings are exactly the data it needs.
     // Suppressing delivery blinded the judgement it was meant to support.
     //
-    // Mechanism: clear isNew while debouncing (the sink buzzes on isNew), so the row is delivered
-    // silently. shouldBuffer stays gated on it so the offline flash ring does not fill with tags
-    // you merely walked past.
+    // Mechanism: clear isNew while debouncing. isNew is what the sink hands alertsSignal and what
+    // acabBleNotifyDetection serializes as `new`, so the row goes out as a repeat sighting; the
+    // first sighting past the window sets it true once, via the `alerted` latch. shouldBuffer
+    // stays gated on it so the offline flash ring does not fill with tags you merely walked past.
     bool debouncing = false;
     if (d.type == ACAB_TRACKER) {
         if (now - e->firstSeen < TRACKER_ALERT_DEBOUNCE_MS) { debouncing = true; isNew = false; }
@@ -484,6 +610,7 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
     claim.bucket         = bucket;
     claim.priorLoggedGen = priorLoggedGen;
     claim.captureGen     = claimGen;
+    claim.admissionEpoch = gAdmissionEpoch;
     claim.active         = shouldBuffer;
     if (shouldBuffer) {
         e->loggedGen = gCaptureGen;
@@ -496,12 +623,42 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
     d.count     = e->count;
     portEXIT_CRITICAL(&gDedupMux);
     // (No early return for a debouncing tracker. It falls through to the GPS stamp and the sink
-    // exactly like any other detection, just with isNew cleared so the buzzer stays quiet.)
+    // exactly like any other detection, just with isNew cleared so it goes out as a repeat
+    // sighting and stays out of the offline buffer.)
 
-    // Stamp non-drone hits with a GPS fix so buffered/offline records carry a location
-    // (drones broadcast their own). Prefer a fresh onboard/forwarded fix; else fall back
-    // to the LAST known phone fix however old, recording its age so the app can show
-    // "location as of N ago".
+    // Stamp EVERY non-drone hit with a GPS fix (drones broadcast their own) and record the fix's
+    // age, so the app can say "location from a fix N old" instead of implying it is live.
+    //
+    // Two sources go ON the detection:
+    //   1. gSelfGPSValid - an onboard or nRF-forwarded fix. NO CALLER TODAY: acabScannerSetSelfGPS
+    //      has never been wired up by any main, and the nRF forward frame carries no coordinates,
+    //      so on every shipped board this arm is false and the stamp comes from the phone.
+    //   2. the live phone fix, which exists only while a phone is connected. It is taken at "any
+    //      age" - see DET_LOG_GPS_MAX_AGE_MS, which is NOT a bound on this arm.
+    //
+    // And one source goes BESIDE it, never on it:
+    //   3. THE OFFLINE-BUFFER PATH. acabBleGetPhoneGps is cleared on disconnect, and det_log
+    //      accepts rows only while the phone is away, so 1 and 2 together stamped nothing at all
+    //      onto a buffered record: a deploy-and-leave capture recorded what went by and lost
+    //      where, which is half of what it was left there to record. The retained fix
+    //      (acabBleGetLastPhoneGps) fills that in, but it may reach the encrypted ring and NOTHING
+    //      ELSE, so it goes into bufGps rather than into d.
+    //
+    //      IT IS NOT ENOUGH TO GUARD THE NOTIFY. `d` is the same object sinkTask hands to gSink,
+    //      and buffering and delivery are decided here but happen there: a buffer-bearing item
+    //      takes ~10 ms of deliberate backpressure while the sink is mid flash-erase, a phone can
+    //      finish connecting inside that window, and then detLogAppend correctly REFUSES the row
+    //      (the ring only accepts while the app is away) while the notify goes out anyway. That
+    //      notify could carry previous-session coordinates across an owner handoff. The final
+    //      owner-admission guard now drops the whole stale SinkItem too; keeping the fix out of `d`
+    //      makes the coordinate leak unrepresentable even if another delivery call site appears.
+    //
+    //      Two further conditions, both load-bearing: only while genuinely disconnected (a
+    //      connected board with no fix means the app is not sharing location right now, and a fix
+    //      from an earlier session must not be passed off as this one's), and only when this row
+    //      is actually going to the ring - a Desert row that is delivered but not buffered has no
+    //      sanctioned use for the retained fix, so it must not even read it.
+    DetLogGpsStamp bufGps{};
     if (d.type != ACAB_DRONE && d.lat == 0 && d.lon == 0) {
         if (gSelfGPSValid) {
             d.lat = gSelfLat;
@@ -512,6 +669,15 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
                 d.lat = la;
                 d.lon = lo;
                 d.gpsAgeMs = ageMs;
+            } else if (shouldBuffer && !acabBleClientConnected() &&
+                       acabBleGetLastPhoneGps(&la, &lo, DET_LOG_GPS_MAX_AGE_MS, &ageMs)) {
+                // Converted to StoredDet's own units here so det_log stores exactly what was
+                // read, and so this struct cannot be mistaken for something a live path may use.
+                // The getter's maxAgeMs bound is what makes ageSec fit a uint16 without clamping.
+                bufGps.lat_e7 = (int32_t)(la * 1e7);
+                bufGps.lon_e7 = (int32_t)(lo * 1e7);
+                bufGps.ageSec = (uint16_t)(ageMs / 1000);
+                bufGps.valid  = true;
             }
         }
     }
@@ -544,7 +710,7 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
     // Hand off to the sink task: it (not this radio path) does the det_log flash write
     // (PERF-2) and calls the firmware sink. Only queue when there is something to do.
     if (gSinkQ && (deliver || shouldBuffer)) {
-        SinkItem it{d, isNew, deliver, shouldBuffer};
+        SinkItem it{d, isNew, deliver, shouldBuffer, bufGps, claim};
         // buffer-bearing items get brief backpressure (~10ms) rather than a silent drop: shouldBuffer
         // committed loggedGen at ingest, so a dropped buffer item would be a non-retryable evidence
         // loss for this capture generation. deliver-only items still drop on overflow (a missed live
@@ -567,11 +733,7 @@ static void handleDetection(AcabDetection& d, bool isReplay = false) {
                 // copied at claim time. There is no AcabDetection in its scope, so reaching for
                 // d.mac here (the shipped bug, which made the rollback a no-op for every Remote ID
                 // drone) is now a compile error rather than a judgement call. See sink_claim.h.
-                static const AcabClaimTable kTable{ claimTableLookup, claimTableRestore,
-                                                    claimTableGenNow, nullptr };
-                portENTER_CRITICAL(&gDedupMux);
-                acabSinkClaimRollback(claim, kTable);
-                portEXIT_CRITICAL(&gDedupMux);
+                rollbackBufferClaim(claim);
                 gSinkDropBuffered.fetch_add(1, std::memory_order_relaxed);
             } else {
                 gSinkDropDeliverOnly.fetch_add(1, std::memory_order_relaxed);
@@ -637,6 +799,51 @@ static bool isSiblingBoard(const uint8_t* adv, size_t advLen) {
     const char* self = gCfg.bleDeviceName;
     return self && *self && strcmp(name, self) == 0;
 }
+
+#ifdef ACAB_CAPTURE_BUILD
+static std::atomic<uint32_t> gAlprCandidateBleSeen{0};
+static std::atomic<uint32_t> gAlprCandidateWifiSeen{0};
+static std::atomic<uint32_t> gAlprCandidateMacs{0};
+static std::atomic<uint32_t> gAlprCandidateTableFull{0};
+
+uint32_t acabScannerAlprCandidateBleSeen()  { return gAlprCandidateBleSeen.load(); }
+uint32_t acabScannerAlprCandidateWifiSeen() { return gAlprCandidateWifiSeen.load(); }
+
+// Official product documentation confirms that these camera and activation systems use BLE,
+// but it does not publish a stable company ID, UUID, payload or advertised name. Do NOT turn
+// these strings into production detections: model-like local names are useful capture leads,
+// not yet ground truth. The capture build calls them out so a bracketed visit can establish the
+// full advert and what disappears when the equipment leaves.
+struct BodyCamNameCandidate { const char* needle; const char* label; };
+static const BodyCamNameCandidate BODYCAM_NAME_CANDIDATES[] = {
+    // Needles are matched as case-insensitive SUBSTRINGS and the loop returns on the FIRST hit, so
+    // a needle that contains another row's needle can never be reached. "WV-BWC4000" used to sit
+    // here below the bare "BWC4000" and was dead weight. If a future row needs to distinguish a
+    // prefixed model, put the LONGER needle first and give it its own label so the match shows up.
+    { "BWC4000", "i-PRO BWC4000 camera" },
+    { "IPS-BTS", "i-PRO activation accessory" },
+    { "BC-02", "Getac BC-02 camera" },
+    { "BC-03", "Getac BC-03 camera" },
+    { "BC-04", "Getac BC-04 camera" },
+    { "TB-02", "Getac vehicle trigger" },
+    { "TB-03", "Getac vehicle trigger" },
+    { "HS-01", "Getac holster trigger" },
+};
+
+// Takes the advert name already parsed by the caller (acabScannerIngestBLE parses it once
+// per live packet and shares the buffer with every capture/diag consumer).
+static void logBodyCamNameCandidate(const uint8_t mac[6], const char* name, int rssi) {
+    if (!name[0]) return;
+    for (const auto& candidate : BODYCAM_NAME_CANDIDATES) {
+        if (!acabAsciiCiContains(name, candidate.needle)) continue;
+        Serial.printf("[ble] *** BODYCAM CAPTURE CANDIDATE *** kind=\"%s\" "
+                      "%02X:%02X:%02X:%02X:%02X:%02X rssi=%d name=\"%s\"\n",
+                      candidate.label, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                      rssi, name);
+        return;
+    }
+}
+#endif
 
 // Shared BLE classifier funnel: run every BLE detector on one advert (most-
 // specific first) and push any match into handleDetection(). Called by the
@@ -931,7 +1138,22 @@ static void markNote(const uint8_t* mac, int rssi, const char* name,
 
 void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t plen, int rssi, bool isReplay) {
     gBleSeen++;
+#if defined(ACAB_CAPTURE_BUILD) || defined(ACAB_DIAG)
+    // Parse the advert's local name ONCE per live packet and share the buffer. Capture builds
+    // otherwise paid this payload walk up to three times per advert (the body-cam candidate
+    // annotation, the [ble] raw line, the marker window) - real money at drive-test advert
+    // rates. Live builds (neither define set) compile this out entirely.
+    char advName[32];
+    advName[0] = 0;
+    if (!isReplay) bleWatchName(payload, plen, advName, sizeof(advName));
+#endif
 #ifdef ACAB_CAPTURE_BUILD
+    // OUI candidates are a capture annotation only. They do not join the classifier chain below,
+    // do not fill AcabDetection, and never reach the apps. Keep the pointer for the existing raw
+    // [ble] line so annotating a candidate adds no second high-rate serial record.
+    const AcabAlprCandidate* alprCandidate = isReplay ? nullptr : acabAlprCandidateMatch(mac);
+    if (alprCandidate) gAlprCandidateBleSeen++;
+    if (!isReplay && payload && plen) logBodyCamNameCandidate(mac, advName, rssi);
     // Vendor-identifier scan. Logs, never classifies, never reaches the apps. Runs before the
     // classifier chain so a device that ALSO matches a shipping signature is still recorded here:
     // the co-occurrence (which identifier travels with which existing detection) is one of the
@@ -979,7 +1201,6 @@ void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t p
                 emit = false;   // the notice above replaces the per-device line
             }
             if (emit) {
-                char nm[32]; bleWatchName(payload, plen, nm, sizeof(nm));
                 // TWO masks, deliberately. `packet=` is what THIS advert carried; `seen=` is every
                 // identifier this MAC has ever shown. They differ constantly, because a device
                 // routinely splits its company ID, its service UUIDs and its name across separate
@@ -1007,7 +1228,7 @@ void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t p
                               pk[0] ? pk : "-", sn[0] ? sn : "-",
                               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi,
                               (unsigned long)v->n, (unsigned long)((nowMs - v->firstMs) / 1000),
-                              (int)v->best, nm);
+                              (int)v->best, advName);
             }
         }
     }
@@ -1016,17 +1237,66 @@ void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t p
     // Ground-truth trace (bench/drive builds only): one line per LIVE advert, matched or not, with
     // the decoded local name if the advert carries one (AD 0x08/0x09) - the nRF-Connect-style name.
     // This is the SHARED path, so it fires for BOTH the S3's own scan (oui-spy) AND the nRF-
-    // forwarded adverts (dual-radio board over UART) - the S3 onResult diag block does not.
+    // forwarded adverts (dual-radio board over UART). There is deliberately NO diag block left in
+    // AcabAdvCallbacks::onResult: the capture envs that define ACAB_DIAG clear cfg.enableBLE, so
+    // that callback is never installed and anything logged from it would be dead code.
     // Scan-response-only names appear here only in a -DACAB_ACTIVE_SCAN capture build (RF-loud).
     if (!isReplay) {
-        char nm[32]; bleWatchName(payload, plen, nm, sizeof(nm));
+#ifdef ACAB_CAPTURE_BUILD
+        // Candidate annotations add useful context, but raw evidence still comes first. This holds
+        // the full hex for a 255-byte scanner payload plus the longest candidate preamble. If a
+        // future scanner forwards more, the line says exactly how many bytes were retained.
+        char line[768];
+#else
         char line[240];
-        int p = snprintf(line, sizeof(line),
+#endif
+        int p;
+#ifdef ACAB_CAPTURE_BUILD
+        if (alprCandidate) {
+            p = snprintf(line, sizeof(line),
+                         "[ble] %02X:%02X:%02X:%02X:%02X:%02X rssi=%d name=\"%s\" "
+                         "note=\"vendor prefix candidate; product unknown\" "
+                         "addr_type=unknown candidate=\"%s/%s/%u\" adv=",
+                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi, advName,
+                         alprCandidate->tag,
+                         acabAlprCandidateRegistryLabel(alprCandidate->registry),
+                         (unsigned)alprCandidate->prefixBits);
+        } else
+#endif
+        {
+            p = snprintf(line, sizeof(line),
                          "[ble] %02X:%02X:%02X:%02X:%02X:%02X rssi=%d name=\"%s\" adv=",
-                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi, nm);
-        for (size_t k = 0; k < plen && p < (int)sizeof(line) - 3; k++)
-            p += snprintf(line + p, sizeof(line) - p, "%02X", payload[k]);
+                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi, advName);
+        }
+        size_t used = p > 0 ? (size_t)p : 0;
+        if (used >= sizeof(line)) used = sizeof(line) - 1;
+        const size_t rawRoom = sizeof(line) - 1 - used;
+        const size_t truncNoteRoom = 64;
+        size_t shown = payload ? plen : 0;
+        if (shown > rawRoom / 2)
+            shown = rawRoom > truncNoteRoom ? (rawRoom - truncNoteRoom) / 2 : 0;
+        static const char HEX_DIGIT[] = "0123456789ABCDEF";
+        for (size_t k = 0; k < shown; k++) {
+            line[used++] = HEX_DIGIT[payload[k] >> 4];
+            line[used++] = HEX_DIGIT[payload[k] & 0x0f];
+        }
+        line[used] = 0;
+        if (shown < plen)
+            snprintf(line + used, sizeof(line) - used,
+                     " [adv_truncated shown=%lu total=%lu]",
+                     (unsigned long)shown, (unsigned long)plen);
         Serial.println(line);
+        // "Pigvision" is a candidate Flock BLE name we have not field-confirmed yet, so it is
+        // deliberately NOT in the production name table (FLOCK_NAME_PATTERNS, flock_signatures.h).
+        // Flag it loudly so a bracketed capture next to a real unit is the signal to promote it.
+        // This lives on the SHARED funnel, not in AcabAdvCallbacks::onResult where it started: the
+        // only envs that define ACAB_DIAG are the dual-radio capture builds, and those clear
+        // cfg.enableBLE (the nRF does the BLE scanning), so the callback is never installed and the
+        // marker could not fire in any checked-in configuration. Reuses advName, parsed once above,
+        // so the check costs no second payload walk and no per-advert allocation.
+        if (acabAsciiCiContains(advName, "pigvision"))
+            Serial.printf("[ble] *** PIGVISION CANDIDATE *** %02X:%02X:%02X:%02X:%02X:%02X rssi=%d name=\"%s\"\n",
+                          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi, advName);
     }
 #endif
     AcabDetection d;
@@ -1049,8 +1319,9 @@ void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t p
     // confirmed vendor identifier" is precisely the row that justifies a new signature, and
     // "classifier=Body camera" is the row that says one already exists.
     if (!isReplay && payload && plen) {
-        char mnm[24]; bleWatchName(payload, plen, mnm, sizeof(mnm));
-        markNote(mac, rssi, mnm, vendorHit, vendorSol, matched,
+        // advName may run longer than the mark table's 24-byte field; acabMarkNote clamps on
+        // copy, and the sanitizer maps bytes 1:1, so the stored prefix is identical either way.
+        markNote(mac, rssi, advName, vendorHit, vendorSol, matched,
                  matched ? (uint8_t)d.type : (uint8_t)0xFF);
     }
 #endif
@@ -1094,26 +1365,10 @@ public:
 
         // The per-advert "[ble] ... name=... adv=..." diag line now lives in the SHARED
         // acabScannerIngestBLE (below), so it covers the dual-radio UART path too, not just
-        // this S3-only scan. It decodes the local name there. Nothing to log here.
-
-#ifdef ACAB_DIAG
-        // Watchlist (diag only): "Pigvision" is a candidate Flock BLE name we have not
-        // field-confirmed yet, so it is deliberately NOT in the production name table.
-        // Flag it loudly here; a real sighting is the signal to promote it into
-        // FLOCK_NAME_PATTERNS (flock_signatures.h). Case-insensitive substring, no deps.
-        {
-            std::string nm = dev->getName();
-            bool pig = false;
-            for (const char* p = nm.c_str(); *p && !pig; p++) {
-                const char* a = p; const char* w = "pigvision";
-                while (*w) { char c = *a; if (c >= 'A' && c <= 'Z') c += 32; if (c != *w) break; a++; w++; }
-                if (!*w) pig = true;
-            }
-            if (pig)
-                Serial.printf("[ble] *** PIGVISION CANDIDATE *** %02X:%02X:%02X:%02X:%02X:%02X rssi=%d name=\"%s\"\n",
-                              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi, nm.c_str());
-        }
-#endif
+        // this S3-only scan. It decodes the local name there. The Pigvision candidate marker
+        // moved with it, for a stronger version of the same reason: ACAB_DIAG is only ever
+        // defined by the dual-radio capture envs, which clear cfg.enableBLE, so this callback
+        // is not even installed there and anything left behind here is dead. Nothing to log here.
 
         // Hand the advert to the shared classifier chain (kept in one place so the
         // dual-radio UART path runs the exact same detectors).
@@ -1140,7 +1395,9 @@ static void bleScanTask(void*) {
 // Bench diagnostic: log every beacon / probe-response (BSSID + SSID + RSSI), so a
 // field test next to a pole-mounted camera can spot its WiFi presence, if any.
 // Parsing + serial run off the promiscuous callback via a queue and task.
-struct WifiDiagItem { uint8_t bssid[6]; int8_t rssi; char ssid[33]; };
+// The first 33 bytes still hold every legal SSID. Capture-only annotations need enough room to
+// state the evidence boundary in the log itself: vendor prefix candidate, product unknown.
+struct WifiDiagItem { uint8_t bssid[6]; int8_t rssi; char ssid[128]; };
 static QueueHandle_t gWifiDiagQ = nullptr;
 
 // EVERY diagnostic enqueue goes through wifiDiagPush so a full queue is COUNTED, never silently
@@ -1166,6 +1423,123 @@ static void wifiDiagTask(void*) {
                           it.bssid[0], it.bssid[1], it.bssid[2], it.bssid[3], it.bssid[4],
                           it.bssid[5], it.rssi, it.ssid);
 }
+
+#ifdef ACAB_CAPTURE_BUILD
+// Registered ALPR-vendor prefixes, capture builds only. This is deliberately separate from the
+// older diagnostic watchlist: these rows have exact IEEE widths and a named registrant, while the
+// WATCH row is one ambiguous shared-silicon lead. Neither produces a detection.
+//
+// Data traffic can arrive hundreds of times a second. Keep one record per exact MAC and emit its
+// first frame plus one summary every five seconds. The counters remain exact even when output is
+// throttled, and alpr_full on the [diag] heartbeat says when the distinct-device count is only a
+// floor. Management frames also pass through this throttle because the ordinary [wifi] line still
+// preserves every beacon/probe; the extra ALPR line is an index, not the evidence itself.
+struct AlprWifiRec {
+    uint8_t  mac[6];
+    uint32_t count;
+    uint32_t data;
+    uint32_t mgmt;
+    uint16_t subtypes;
+    int8_t   best;
+    uint8_t  addrMask;
+    uint32_t lastLogMs;
+    bool     used;
+};
+static const size_t ALPR_WIFI_MAX = 24;
+static const uint32_t ALPR_WIFI_LOG_EVERY_MS = 5000;
+static AlprWifiRec gAlprWifi[ALPR_WIFI_MAX];
+
+uint32_t acabScannerAlprCandidateMacs() {
+    return gAlprCandidateMacs.load();
+}
+uint32_t acabScannerAlprCandidateTableFull() { return gAlprCandidateTableFull.load(); }
+
+static AlprWifiRec* alprWifiFind(const uint8_t mac[6]) {
+    AlprWifiRec* freeSlot = nullptr;
+    for (size_t i = 0; i < ALPR_WIFI_MAX; i++) {
+        if (gAlprWifi[i].used && memcmp(gAlprWifi[i].mac, mac, 6) == 0) return &gAlprWifi[i];
+        if (!gAlprWifi[i].used && !freeSlot) freeSlot = &gAlprWifi[i];
+    }
+    if (!freeSlot) { gAlprCandidateTableFull++; return nullptr; }
+    memset(freeSlot, 0, sizeof(*freeSlot));
+    memcpy(freeSlot->mac, mac, 6);
+    freeSlot->best = -127;
+    freeSlot->used = true;
+    gAlprCandidateMacs++;
+    return freeSlot;
+}
+
+static bool alprWifiNote(const uint8_t mac[6], uint8_t addressMask, bool data,
+                         uint8_t frameControl, int rssi) {
+    const AcabAlprCandidate* candidate = acabAlprCandidateMatch(mac);
+    if (!candidate) return false;
+    gAlprCandidateWifiSeen++;
+
+    AlprWifiRec* rec = alprWifiFind(mac);
+    const uint32_t nowMs = millis();
+    bool emit = false;
+    if (rec) {
+        rec->count++;
+        if (data) rec->data++;
+        else {
+            rec->mgmt++;
+            rec->subtypes |= (uint16_t)(1u << ((frameControl >> 4) & 0x0f));
+        }
+        if ((int8_t)rssi > rec->best) rec->best = (int8_t)rssi;
+        rec->addrMask |= addressMask;
+        emit = (rec->count == 1) || (nowMs - rec->lastLogMs >= ALPR_WIFI_LOG_EVERY_MS);
+        if (emit) rec->lastLogMs = nowMs;
+    } else {
+        // A full table must not make the untracked device the loudest one in the log. Throttle the
+        // warning itself, matching the established WATCH/Falcon overflow policy.
+        static uint32_t fullLastMs = 0;
+        if (nowMs - fullLastMs >= ALPR_WIFI_LOG_EVERY_MS) {
+            fullLastMs = nowMs;
+            WifiDiagItem it; memcpy(it.bssid, mac, 6); it.rssi = (int8_t)rssi;
+            snprintf(it.ssid, sizeof(it.ssid),
+                     "vendor prefix candidate TABLEFULL product unknown dropped=%lu",
+                     (unsigned long)gAlprCandidateTableFull.load());
+            wifiDiagPush(it);
+        }
+    }
+    if (emit) {
+        WifiDiagItem it; memcpy(it.bssid, mac, 6); it.rssi = (int8_t)rssi;
+        snprintf(it.ssid, sizeof(it.ssid),
+                 "vendor prefix candidate %s/%s/%u product unknown n=%lu d=%lu m=%lu "
+                 "st=%04X best=%d a=%X",
+                 candidate->tag, acabAlprCandidateRegistryLabel(candidate->registry),
+                 (unsigned)candidate->prefixBits, (unsigned long)rec->count,
+                 (unsigned long)rec->data, (unsigned long)rec->mgmt,
+                 (unsigned)rec->subtypes, (int)rec->best, (unsigned)rec->addrMask);
+        wifiDiagPush(it);
+    }
+    return true;
+}
+
+// Inspect every address the delivered 802.11 header actually carries. addr2 is the transmitter on
+// management frames; on data frames the candidate can be addr1, addr2, addr3, or addr4 depending
+// on ToDS/FromDS. The log's a= mask preserves where it matched instead of pretending every address
+// was the source. Repeated copies of the same MAC in one header count once, while their complete
+// union of address-field roles is retained.
+static bool alprWifiScanAddresses(const uint8_t* frame, size_t len, bool data, int rssi) {
+    if (!frame || len < 24) return false;
+    const uint8_t* addr[4] = { frame + 4, frame + 10, frame + 16, nullptr };
+    size_t count = 3;
+    if (data && len >= 30 && (frame[1] & 0x03) == 0x03) addr[count++] = frame + 24;
+    bool any = false;
+    for (size_t i = 0; i < count; i++) {
+        bool duplicate = false;
+        for (size_t j = 0; j < i; j++)
+            if (memcmp(addr[i], addr[j], 6) == 0) { duplicate = true; break; }
+        if (duplicate) continue;
+        uint8_t addressMask = 0;
+        for (size_t j = i; j < count; j++)
+            if (memcmp(addr[i], addr[j], 6) == 0) addressMask |= (uint8_t)(1u << j);
+        if (alprWifiNote(addr[i], addressMask, data, frame[0], rssi)) any = true;
+    }
+    return any;
+}
+#endif
 
 // Flock Falcon Wi-Fi OUIs seen in the field (own captures, 2026-06),
 // all Liteon allocations. Liteon is shared silicon = FP-prone (bench only); a
@@ -1249,7 +1623,8 @@ static WatchRec* watchFind(const uint8_t* mac) {
 // more common than a probing one, so a bare OUI match on data frames is a WORSE false-positive
 // magnet than the probe gate it would relax. So measure the false-positive population and the
 // dwell separation first, which is the same discipline flock_signatures.h already demands
-// ("confirm at a live Falcon in our own capture") and police_signatures.h's field-validation queue.
+// ("confirm at a live Falcon in our own capture") and bodycam_vendor_signatures.h's
+// field-validation queue.
 //
 // What to read off a capture, per Falcon-OUI MAC: DATA frame count, MGMT frame count and WHICH
 // subtypes, the dwell span, and the best RSSI. A pole-mounted camera should show a long dwell and
@@ -1339,6 +1714,9 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
         // single most valuable thing this capture path could ever record, and it was the one
         // case suppressed. loggedAnything exists ONLY to suppress the generic DATA-sample below.
         bool loggedAnything = false;
+#ifdef ACAB_CAPTURE_BUILD
+        loggedAnything = alprWifiScanAddresses(payload, (size_t)len, /*data=*/true, rssi);
+#endif
         for (int k = 0; k < 3; k++) {
             const uint8_t* m = aa[k];
             if (!falconOui(m)) continue;
@@ -1391,7 +1769,14 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
             WifiDiagItem it;
             memcpy(it.bssid, m, 6);
             it.rssi = (int8_t)rssi;
-            memcpy(it.ssid, "DATA-FALCON", 12);
+            // "fwnote:" prefix, NOT a bare word. This label lands in the ssid= field of the
+            // [wifi] diagnostic line, and it only prints once falconOui() has already matched,
+            // so it says nothing the OUI table did not already say. The old spelling was
+            // "DATA-FALCON", which read back out of a capture as a broadcast SSID and became the
+            // sole evidence for a shipping conf-85 "*-FALCON" SSID rule (now ext=1; see
+            // FLOCK_SSID_FALCON_SUFFIX). Keep any label written here impossible to mistake for
+            // an SSID the air actually carried.
+            memcpy(it.ssid, "fwnote:falcon-oui-data", sizeof("fwnote:falcon-oui-data"));
             wifiDiagPush(it);
 #endif
             loggedAnything = true;
@@ -1497,7 +1882,11 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
             memcpy(it.bssid, payload + 10, 6);
             it.rssi = (int8_t)rssi;
             if (known) {
-                memcpy(it.ssid, "PROBE-FALCON", 13);
+                // "fwnote:" prefix for the same reason as the data-frame label above: this is
+                // OUR note about OUR OUI match, not an SSID the frame carried. The old spelling
+                // "PROBE-FALCON" was read back out of a capture as a broadcast SSID and became
+                // the evidence for a conf-85 rule (now ext=1; see FLOCK_SSID_FALCON_SUFFIX).
+                memcpy(it.ssid, "fwnote:falcon-oui-probe", sizeof("fwnote:falcon-oui-probe"));
             } else {
                 // "PROBE:<ssid>", or "PROBE:*" for the broadcast (wildcard) probe every client
                 // sends. SSID IE sits at [24] for a probe request: tag 0x00, len, then the name.
@@ -1511,6 +1900,10 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
         }
     }
 #ifdef ACAB_CAPTURE_BUILD
+    // Exact-width ALPR vendor-prefix annotations are an independent capture surface. They never
+    // short-circuit the generic probe/beacon trace or any shipping classifier below.
+    if (gWifiDiagQ) alprWifiScanAddresses(payload, (size_t)len, /*data=*/false, rssi);
+
     // Diagnostic watchlist (see diagWatchOui): log the FRAME TYPE, so the capture shows whether
     // the MAC is currently acting as an access point (0x80 beacon), as a client hunting for one
     // (0x40 probe request), or as an associated client (data, logged on the other path).
@@ -1531,9 +1924,9 @@ static void IRAM_ATTR wifiRxCallback(void* buf, wifi_promiscuous_pkt_type_t type
         wifiDiagPush(it);
     }
     // Falcon OUI on a MANAGEMENT frame, ANY subtype (see FalconRec). The probe-request arm below
-    // prints PROBE-FALCON and is the form the shipping rule keys on; this records the frame TYPE
-    // for every mgmt frame instead, because the distinction is the whole question: probing
-    // (subtype 0x4, scanning, the only form we have ever detected), beaconing (0x8, standing up
+    // notes "fwnote:falcon-oui-probe" and is the form the shipping OUI rule keys on; this records
+    // the frame TYPE for every mgmt frame instead, because the distinction is the whole question:
+    // probing (subtype 0x4, scanning, the only form we have ever detected), beaconing (0x8, standing up
     // its own AP), or answering (0x5). Which of those a unit is doing decides whether the
     // data-frame rule is needed at all, and no capture so far has recorded it.
     //
@@ -1626,6 +2019,13 @@ void acabScannerSetWifiEco(int sec) {
 int acabScannerWifiEco() { return gWifiEcoSec; }
 static void restoreWifiEco() {
     Preferences p; p.begin(WIFI_ECO_NS, true); gWifiEcoSec = p.getInt("eco", 0); p.end();
+#ifdef ACAB_CAPTURE_BUILD
+    // Announce the mismatch once, in the capture log itself, so an operator who sees the app
+    // report eco>0 knows why the RX never actually sleeps (see wifiHopTask).
+    if (gWifiEcoSec > 0)
+        Serial.printf("[capture] stored wifiEco=%ds IGNORED - capture builds never sleep the WiFi RX\n",
+                      (int)gWifiEcoSec);
+#endif
 }
 
 static void wifiHopTask(void*) {
@@ -1641,7 +2041,15 @@ static void wifiHopTask(void*) {
                 // promiscuous RX is the board's biggest single draw). BLE keeps running throughout.
                 // Skip while the WiFi toggle is off (its own promiscuous(false) owns the radio then),
                 // and re-check both flags every 100ms so a config change interrupts the sleep early.
+#ifdef ACAB_CAPTURE_BUILD
+                // Capture builds never sleep the receiver. The NVS eco level survives the
+                // reflash from a shipping image, and honoring it here would punch eco-sized
+                // holes in the exact firehose this build exists to record. The stored value
+                // is left alone (and still shows in the app) for the shipping image later.
+                const int eco = 0;
+#else
                 int eco = gWifiEcoSec;
+#endif
                 if (eco > 0 && gWifiEnabled) {
                     if (gWifiModeMux) xSemaphoreTake(gWifiModeMux, portMAX_DELAY);
                     const bool shouldSleep = gWifiEnabled && gWifiEcoSec > 0;
@@ -1684,9 +2092,87 @@ void acabScannerSetSelfGPS(double lat, double lon, bool valid) {
     gSelfLat = lat; gSelfLon = lon; gSelfGPSValid = valid;
 }
 
-// Re-arm offline capture: bump the generation so the next sighting of every device
-// buffers once more. Called from the BLE disconnect callback (the app just left).
-void acabScannerReArmCapture() {
+bool acabScannerBlockCaptureForOwnerSession() {
+    // Reserve the det_log epoch first, then publish NO admissible scanner token while prior-owner
+    // GPS/config privacy preparation runs. An item queued in either publication window is refused:
+    // before this store det_log is already blocked; afterward its claim carries the zero sentinel.
+    const uint32_t nextAdmissionEpoch = detLogBlockCaptureForOwnerSession();
+    portENTER_CRITICAL(&gDedupMux);
+    gPendingAdmissionEpoch = nextAdmissionEpoch;
+    gAdmissionEpoch = 0;
+    portEXIT_CRITICAL(&gDedupMux);
+    return nextAdmissionEpoch != 0;
+}
+
+bool acabScannerAdmitCaptureForOwnerSession() {
+    uint32_t pending;
+    portENTER_CRITICAL(&gDedupMux);
+    pending = gPendingAdmissionEpoch;
+    portEXIT_CRITICAL(&gDedupMux);
+    if (pending == 0 || !detLogAdmitCaptureForOwnerSession(pending)) return false;
+
+    // det_log is now open for this exact owner token. Publish it only after the service has made
+    // gConnected=true; a claim stamped in the tiny window before this store still carries 0 and
+    // is discarded rather than inheriting pre-authentication GPS/state.
+    portENTER_CRITICAL(&gDedupMux);
+    if (gPendingAdmissionEpoch != pending) {
+        gAdmissionEpoch = 0;
+        portEXIT_CRITICAL(&gDedupMux);
+        return false;
+    }
+    gAdmissionEpoch = pending;
+    gPendingAdmissionEpoch = 0;
+    portEXIT_CRITICAL(&gDedupMux);
+    return true;
+}
+
+// Finish the two-phase disconnect boundary: publish the already-reserved away-session epoch and
+// bump the generation so the next sighting of every device buffers once more. onDisconnect calls
+// Block before publishing connection teardown, then calls this only after GPS/replay/key cleanup.
+bool acabScannerReArmCapture(volatile bool* ownerCaptureBlocked) {
+    if (!ownerCaptureBlocked) return false;
+    uint32_t pending;
+    portENTER_CRITICAL(&gDedupMux);
+    pending = gPendingAdmissionEpoch;
+    portEXIT_CRITICAL(&gDedupMux);
+
+    // Ordinarily Block already advanced det_log and left this exact token closed. Admit it only
+    // after all link-owned state has been torn down. The fallback repairs a failed/missing reserve
+    // without ever treating an unchanged token as live; both det_log calls return a zero/failure
+    // sentinel if their owner-delivery or flash-state lock cannot be acquired.
+    uint32_t nextAdmissionEpoch = 0;
+    if (pending != 0) {
+        if (detLogAdmitCaptureForOwnerSession(pending)) nextAdmissionEpoch = pending;
+    } else {
+        nextAdmissionEpoch = detLogAdvanceCaptureEpoch();
+    }
+
+    // Scanner ingest takes this same lock when it snapshots capture generation + admission epoch.
+    // Publishing both together closes the old race: nothing can claim the NEW away generation
+    // while connected still reads true, receive NOT_ARMED, and stay consumed for the away session.
+    bool published = false;
+    portENTER_CRITICAL(&gDedupMux);
+    gCaptureGen++;
+    if (gPendingAdmissionEpoch == pending) {
+        gAdmissionEpoch = nextAdmissionEpoch;
+        gPendingAdmissionEpoch = 0;
+        if (nextAdmissionEpoch != 0) {
+            // This store must remain inside gDedupMux and AFTER both publications. Radio ingest
+            // uses the same lock, so it cannot claim the new generation until the service-side
+            // connected gate is false as well. On failure the caller's true value is untouched.
+            *ownerCaptureBlocked = false;
+            published = true;
+        }
+    } else {
+        // A superseding owner boundary is not expected because NimBLE serializes its callbacks,
+        // but never publish a completion against the wrong reservation if that invariant changes.
+        gAdmissionEpoch = 0;
+    }
+    portEXIT_CRITICAL(&gDedupMux);
+    return published;
+}
+
+static void rearmCaptureCadenceOnly() {
     portENTER_CRITICAL(&gDedupMux);
     gCaptureGen++;
     portEXIT_CRITICAL(&gDedupMux);
@@ -1741,7 +2227,7 @@ void acabScannerBufferAllTick() {
     if (lastReArm == 0) { lastReArm = now; return; }   // first call sets the phase, never fires
     if (now - lastReArm < REBUFFER_AFTER_MS) return;
     lastReArm = now;
-    acabScannerReArmCapture();
+    rearmCaptureCadenceOnly();
 }
 
 // Single-writer discipline for the co-processor UART line stream. gCmdSink lines are emitted

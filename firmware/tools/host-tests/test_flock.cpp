@@ -1,8 +1,11 @@
 // Host regression test for the Flock/ALPR classifier - the detector this product is named for.
 //
 // WHY THIS EXISTS: flock_detect.cpp is the one file where a silent regression costs the most. It
-// has five ranked match branches on BLE and four on WiFi, and every one of them was narrowed at
-// least once after a field false positive (the OUI superset was deleted, name matching went from
+// has ranked match branches on both radios (today: Raven svc-UUID / name / mfg-ID / OUI on BLE,
+// and six written WiFi branches - "Flock-" SSID, "*-FALCON" SSID, probe-SSID regrade, Falcon-OUI
+// probe, wildcard probe, OUI - with the "*-FALCON" SSID forms ext=1-gated out of shipping
+// builds), and these branches keep getting narrowed after field false positives (the OUI
+// superset was deleted, name matching went from
 // substring-anywhere to anchored, the beacon IE offset was split off from the probe-request one).
 // Every one of those narrowings is invisible to the compiler: widen a pattern by accident and the
 // field failure is a false alert, narrow one by accident and the field failure is SILENCE.
@@ -419,18 +422,19 @@ int main() {
       chk("lowercase 'flock-' -> NO hit (case sensitive)", runWiFi(f, &d), false); }
     { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "MyFlock-a1b2c3");
       chk("'Flock-' not at the start -> no hit", runWiFi(f, &d), false); }
+    // The "*-FALCON" SSID rule is RETIRED to ext=1 (2026-08-25) and compiled out: its evidence was
+    // the firmware's own "PROBE-FALCON"/"DATA-FALCON" diagnostic label read back out of a capture
+    // as though it were a broadcast SSID. These three assert that NOTHING on the air reaches the
+    // 85 tier by name alone any more; they are the regression guard against re-shipping it without
+    // a real capture. Provenance and the bar to re-ship: FLOCK_SSID_FALCON_SUFFIX.
     { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "DATA-FALCON");
-      chk("'DATA-FALCON' suffix = 85", runWiFi(f, &d), true, d.confidence, 85, d.detail, ""); }
+      chk("'DATA-FALCON' beacon -> no hit (rule is ext=1)", runWiFi(f, &d), false); }
     { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "probe-falcon");
-      chk("Falcon suffix IS case-insensitive", runWiFi(f, &d), true, d.confidence, 85, d.detail); }
-    // Same self-attestation rule as the "Flock-" branch: a probe REQUEST names the network sought,
-    // not the transmitter, so the FALCON suffix cannot carry the 85 tier either. It regrades to the
-    // probe tier beside the "Flock-" probe form above. This used to assert 85 on a 0x4 frame, which
-    // pinned the missing gate in place.
+      chk("lowercase '-falcon' beacon -> no hit", runWiFi(f, &d), false); }
     { std::vector<uint8_t> f = mgmt(0x4, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "probe-falcon");
-      chk("probe-request '*-FALCON' -> probe tier, not 85", runWiFi(f, &d), true,
-          d.confidence, 72, d.detail, "probing for a Flock network"); }
-    // Anchored as a suffix precisely so the sports team and the spaceship do not alert.
+      chk("'-falcon' probe request -> no hit", runWiFi(f, &d), false); }
+    // Anchored as a suffix precisely so the sports team and the spaceship do not alert. They stay
+    // here because the anchor still has to hold on the day the rule is re-armed with real evidence.
     { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Atlanta-Falcons");
       chk("'Atlanta-Falcons' -> no hit", runWiFi(f, &d), false); }
     { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Millennium Falcon");
@@ -453,16 +457,16 @@ int main() {
       chk("same OUI in a probe RESPONSE -> no hit", runWiFi(f, &d), false); }
     { std::vector<uint8_t> f = mgmt(0x4, MAC_FALCONNM, BCAST); addSSID(f, "HomeWiFi");
       chk("neighbouring OUI d8:f3:bd -> no hit", runWiFi(f, &d), false); }
-    // SSID outranks the OUI path. On a SELF-ATTESTED frame (beacon) a Falcon broadcasting its own
-    // name reports 85. On a probe REQUEST the same SSID can only reach the probe tier (the frame
-    // names the network sought, not the transmitter), and the SSID regrade still outranks the
-    // Falcon-OUI branch, so the detail says which signal won.
+    // With the "*-FALCON" name rule retired to ext=1, the SSID no longer adds anything to a
+    // Falcon-OUI frame: the probe-request gate on the OUI is the whole signal. A beacon from the
+    // same OUI still does not report, and a probe request reports at the OUI tier with the OUI's
+    // own detail. That is the exact shape the retirement was meant to leave behind - a lone
+    // "-FALCON" name can no longer promote anything.
     { std::vector<uint8_t> f = mgmt(0x8, MAC_FALCON, MAC_FALCON); addSSID(f, "PROBE-FALCON");
-      chk("Falcon OUI + '-FALCON' SSID in a beacon -> SSID wins (85)", runWiFi(f, &d), true,
-          d.confidence, 85, d.detail, ""); }
+      chk("Falcon OUI + '-FALCON' SSID in a beacon -> no hit", runWiFi(f, &d), false); }
     { std::vector<uint8_t> f = mgmt(0x4, MAC_FALCON, BCAST); addSSID(f, "PROBE-FALCON");
-      chk("Falcon OUI + '-FALCON' SSID in a probe request -> probe tier, SSID detail",
-          runWiFi(f, &d), true, d.confidence, 72, d.detail, "probing for a Flock network"); }
+      chk("Falcon OUI + '-FALCON' SSID in a probe request -> OUI tier",
+          runWiFi(f, &d), true, d.confidence, 72, d.detail, "Falcon probe (OUI)"); }
 
     // -- WiFi: Flock's own OUI ----------------------------------------------
     printf("\n  -- WiFi: b4:1e:52 OUI --\n");

@@ -15,7 +15,7 @@
 // flagged CONCERN below and both are asserted as-is, not as I think they should be.
 #include "police_detect.h"
 #include <Preferences.h>   // wipeAll(): the stub stores for real now
-#include "police_signatures.h"
+#include "bodycam_vendor_signatures.h"
 #include "axon_detect.h"     // for the axonIsEnabled() declaration this file has to satisfy
 #include "desert_detect.h"   // ditto desertIsEnabled()
 #include "detection.h"
@@ -176,7 +176,8 @@ int main() {
     // ---------------------------------------------------------------------------------------
     // 3. EVERY OUI IN THE TABLE. There is one signature class here (a corporate OUI prefix),
     // so the positive-match coverage is "each of the seven blocks still resolves". A typo in
-    // one row of police_signatures.h compiles perfectly and just stops seeing that product line.
+    // one row of bodycam_vendor_signatures.h compiles perfectly and just stops seeing that
+    // product line.
     // ---------------------------------------------------------------------------------------
     chkVal("table still holds seven OUI blocks", (long)POLICE_OUI_COUNT, 7);
     for (size_t i = 0; i < POLICE_OUI_COUNT; i++) {

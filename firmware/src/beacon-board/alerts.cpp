@@ -16,6 +16,10 @@
 #define BUZZER_LEDC_CHANNEL 0
 #define BUZZER_LEDC_RES     8       // 8-bit duty (0..255)
 #define BUZZER_DUTY_MAX     128     // ~50% duty = loudest into a piezo
+// This constant only started actually reaching the LEDC timer on 2026-08-25, when buzzerTone()
+// stopped going through ledcWriteTone (which forced the channel to 10-bit - see the note there).
+// Every cue and pattern now drives 4x the duty it did before at the same volume setting, so the
+// 60% scalePct the boot and power-down cues pass still wants a bench listen on real hardware.
 
 static QueueHandle_t gAlertQ = nullptr;
 static TaskHandle_t  gAlertTask = nullptr;   // kept so shutdown can suspend it and own the buzzer alone
@@ -35,6 +39,12 @@ static volatile bool    gLedEnabled = true;
 static const AcabDeviceType ACAB_ALERT_TEST    = (AcabDeviceType)0xFE;   // volume preview
 static const AcabDeviceType ACAB_ALERT_CONNECT = (AcabDeviceType)0xFD;   // app linked
 static const AcabDeviceType ACAB_ALERT_REVEAL  = (AcabDeviceType)0xFC;   // first catch of a session
+static const AcabDeviceType ACAB_ALERT_POWER_ON = (AcabDeviceType)0xFB;  // button-hold accepted
+
+// Alert mode controls detection/session noise, not deliberate on/off feedback. Keep that choice
+// explicit per call instead of temporarily flipping gBuzzer: the alert task runs concurrently,
+// and a global override could let a queued detection sound during a power cue.
+enum class AudioPurpose : uint8_t { UserAlert, PowerState };
 
 // Armed at boot and on each app connection; the next NEW detection plays the "reveal"
 // sting in place of its class pattern, so the first catch of a session lands like the
@@ -93,18 +103,31 @@ bool alertsLedEnabled() { return gLedEnabled; }
 static void buzzerOff() { ledcWrite(BUZZER_LEDC_CHANNEL, 0); }
 
 // Start a tone at `freq`, scaled to the current volume, then by an optional per-call scale
-// (0-100%, default full). scalePct lets a specific cue play softer than the user's volume
-// without touching every other alert - used by the boot whoosh. Stays silent (LED-only alerts
-// still work) when audio is off or volume is 0.
-static void buzzerTone(int freq, int scalePct = 100) {
-    if (!gBuzzer || gVolume == 0 || freq <= 0) { buzzerOff(); return; }
-    ledcWriteTone(BUZZER_LEDC_CHANNEL, freq);
+// (0-100%, default full). Power-state cues bypass the detection-alert mute so a battery unit can
+// always confirm a deliberate on/off action. Volume 0 remains absolute silence for users who need
+// it, and LED output stays independently governed by the lights-out setting.
+static void buzzerTone(int freq, int scalePct = 100,
+                       AudioPurpose purpose = AudioPurpose::UserAlert) {
+    bool mutedAlert = !gBuzzer && purpose == AudioPurpose::UserAlert;
+    if (mutedAlert || gVolume == 0 || freq <= 0) { buzzerOff(); return; }
+    // ledcSetup, NEVER ledcWriteTone. ledcWriteTone hard-codes duty_resolution = 10 and stamps
+    // channels_resolution[chan] = 10 (framework-arduinoespressif32 3.20017,
+    // cores/esp32/esp32-hal-ledc.c:118-148), so it silently retimed this channel to 10-bit behind
+    // the 8-bit BUZZER_DUTY_MAX below and undid the ledcSetup in alertsInit() before the first
+    // note was ever heard: the duty written on the next line landed as 128/1024 = 12.5% instead of
+    // the intended 128/256 = 50%, a quarter of the design duty (~8 dB down at the fundamental), so
+    // no volume setting could reach the piezo's loud point. It also writes a duty of its own
+    // (0x1FF) that we then have to overwrite. ledcSetup programs the same timer frequency at OUR
+    // resolution and writes no duty, and costs the same - both are one ledc_timer_config call, so
+    // nothing new lands on the per-note path (caw() re-enters here every 8 ms).
+    ledcSetup(BUZZER_LEDC_CHANNEL, freq, BUZZER_LEDC_RES);
     uint32_t duty = (uint32_t)gVolume * scalePct / 100 * BUZZER_DUTY_MAX / 100;
     ledcWrite(BUZZER_LEDC_CHANNEL, duty);
 }
 
-static void beep(int freq, int durMs, int scalePct = 100) {
-    buzzerTone(freq, scalePct);
+static void beep(int freq, int durMs, int scalePct = 100,
+                 AudioPurpose purpose = AudioPurpose::UserAlert) {
+    buzzerTone(freq, scalePct, purpose);
     ledOn();
     vTaskDelay(pdMS_TO_TICKS(durMs));
     ledOff();
@@ -113,7 +136,8 @@ static void beep(int freq, int durMs, int scalePct = 100) {
 
 // Harsh descending sweep - the crow "caw" used for Flock. scalePct softens it for the boot
 // whoosh only (Flock passes 100 by default, so its loudness is unchanged).
-static void caw(int startF, int endF, int durMs, int scalePct = 100) {
+static void caw(int startF, int endF, int durMs, int scalePct = 100,
+                AudioPurpose purpose = AudioPurpose::UserAlert) {
     int steps = durMs / 8;
     if (steps < 1) steps = 1;
     float fStep = (float)(endF - startF) / steps;
@@ -121,7 +145,7 @@ static void caw(int startF, int endF, int durMs, int scalePct = 100) {
     for (int i = 0; i < steps; i++) {
         int f = startF + (int)(fStep * i);
         if (f < 100) f = 100;
-        buzzerTone(f, scalePct);
+        buzzerTone(f, scalePct, purpose);
         vTaskDelay(pdMS_TO_TICKS(8));
     }
     buzzerOff();
@@ -130,13 +154,14 @@ static void caw(int startF, int endF, int durMs, int scalePct = 100) {
 
 // KITT "voice modulator": wobble the pitch fast around a center. A vibrato the piezo
 // can actually voice (one tone, just modulated), LED steady on through the wobble.
-static void warble(int centerF, int depth, int cycles, int halfMs, int scalePct = 100) {
+static void warble(int centerF, int depth, int cycles, int halfMs, int scalePct = 100,
+                   AudioPurpose purpose = AudioPurpose::UserAlert) {
     if (halfMs < 1) halfMs = 1;
     ledOn();
     for (int i = 0; i < cycles; i++) {
-        buzzerTone(centerF + depth, scalePct);
+        buzzerTone(centerF + depth, scalePct, purpose);
         vTaskDelay(pdMS_TO_TICKS(halfMs));
-        buzzerTone(centerF - depth, scalePct);
+        buzzerTone(centerF - depth, scalePct, purpose);
         vTaskDelay(pdMS_TO_TICKS(halfMs));
     }
     buzzerOff();
@@ -164,6 +189,12 @@ static void playReveal() {
     vTaskDelay(pdMS_TO_TICKS(35));
     caw(2800, 3900, 170);                // resolve: the thing is revealed
     ledOff();
+}
+
+// Immediate confirmation that the rev-B hold-to-start gate committed to ON. This is separate from
+// the volume-preview beep, which must remain silent when detection alerts are muted.
+static void playPowerOnAck() {
+    beep(3000, 130, 100, AudioPurpose::PowerState);
 }
 
 // A different sound per target class.
@@ -218,10 +249,11 @@ static void alertTask(void*) {
     AcabDeviceType type;
     for (;;) {
         if (xQueueReceive(gAlertQ, &type, pdMS_TO_TICKS(ACAB_LED_HEARTBEAT_MS)) == pdTRUE) {
-            if      (type == ACAB_ALERT_TEST)    beep(3000, 130);   // volume preview (near piezo peak)
-            else if (type == ACAB_ALERT_CONNECT) playConnect();
-            else if (type == ACAB_ALERT_REVEAL)  playReveal();
-            else                                 playPattern(type);
+            if      (type == ACAB_ALERT_TEST)     beep(3000, 130);   // volume preview (near piezo peak)
+            else if (type == ACAB_ALERT_CONNECT)  playConnect();
+            else if (type == ACAB_ALERT_REVEAL)   playReveal();
+            else if (type == ACAB_ALERT_POWER_ON) playPowerOnAck();
+            else                                  playPattern(type);
         } else {
             ledOn();                          // idle heartbeat: a brief flash, then back to dark
             vTaskDelay(pdMS_TO_TICKS(25));
@@ -246,7 +278,7 @@ void alertsInit() {
     gArmReveal = true;   // a standalone (no-app) board still reveals its first catch
 }
 
-void alertsBootJingle() {
+void alertsBootJingle(bool physicalStart) {
     // "Johnny Five wakes up" (2026-07-26, replaces the KITT whoosh - its symmetric up/down sweep
     // pairs read as a COP SIREN, the one thing this product must never sound like). Johnny Five's
     // voice is the opposite of a siren: asymmetric, bouncy, staccato, ending on a rising
@@ -258,13 +290,23 @@ void alertsBootJingle() {
     // ~0.9s total (the whoosh was ~2.8s - snappier fits the character). Cues at 60% scale
     // (30 -> 60 2026-07-26, user wanted it louder); detection alerts untouched. Band stays
     // 500-2500 Hz, below the piezo's shrieky ~4k resonance - never above ~2500 (whoosh-era rule).
-    caw(500, 1050, 140, 60);                 // 1. servo "vwip"
+    // MUTE ALWAYS WINS HERE (2026-08-24). An earlier draft let physicalStart bypass alert mute as
+    // a PowerState cue, but physicalStart counts EVERY ESP_RST_POWERON as deliberate - and on the
+    // button-less deploys (slim always-on SKU, USB wall power, covert installs) an unattended
+    // power interruption and restore is indistinguishable from a hand on the plug, so a MUTED
+    // board would have announced itself at the saved volume at 3am. A muted board never plays the
+    // boot jingle. The PowerState bypass stays reserved for cues that always follow an explicit
+    // user action (the hold-to-start ack, the app-driven shutdown). physicalStart still feeds the
+    // pairing window in setup(); for audio it is deliberately unused.
+    (void)physicalStart;
+    constexpr AudioPurpose purpose = AudioPurpose::UserAlert;
+    caw(500, 1050, 140, 60, purpose);                 // 1. servo "vwip"
     vTaskDelay(pdMS_TO_TICKS(40));
-    beep(1150, 60, 60); vTaskDelay(pdMS_TO_TICKS(30));   // 2. da
-    beep(1450, 60, 60); vTaskDelay(pdMS_TO_TICKS(30));   //    da
-    beep(1850, 95, 60); vTaskDelay(pdMS_TO_TICKS(50));   //    DEE
-    warble(1700, 220, 3, 22, 60);            // 3. head-cock trill
-    caw(1500, 2500, 170, 60);                // 4. "...alive?" - ends high, never resolves down
+    beep(1150, 60, 60, purpose); vTaskDelay(pdMS_TO_TICKS(30));   // 2. da
+    beep(1450, 60, 60, purpose); vTaskDelay(pdMS_TO_TICKS(30));   //    da
+    beep(1850, 95, 60, purpose); vTaskDelay(pdMS_TO_TICKS(50));   //    DEE
+    warble(1700, 220, 3, 22, 60, purpose);            // 3. head-cock trill
+    caw(1500, 2500, 170, 60, purpose);                // 4. "...alive?" - ends high, never resolves down
 }
 
 void alertsPowerDown() {
@@ -281,15 +323,21 @@ void alertsPowerDown() {
     // UP (da-da-DEE) and ends on a rising, unresolved "...alive?", this steps DOWN and settles to the
     // floor - the ear reads "off" the moment it resolves low. Same 500-2500 Hz band and 60% scale as
     // boot; and it still obeys the whoosh-era rule that nothing SWEEPS BACK UP (a symmetric up/down
-    // pair reads as a siren) - this only ever descends. beep/caw/warble honor the buzzer + LED master
-    // flags, so "lights out" leaves it silent and dark, and the board's BLE drop is that user's off
-    // signal. ~0.7s, and it runs before the multi-second nRF park handshake, so deep sleep never
-    // clips it.
-    beep(1850, 90, 60); vTaskDelay(pdMS_TO_TICKS(30));   // DEE   - boot's top note, now the START
-    beep(1450, 70, 60); vTaskDelay(pdMS_TO_TICKS(30));   //  da   - stepping down (boot stepped up)
-    beep(1150, 70, 60); vTaskDelay(pdMS_TO_TICKS(40));   //   da
-    warble(950, 160, 3, 26, 60);                          // slowing "spin-down" wobble, lower + lazier
-    caw(1400, 500, 220, 60);                              // settle: sweep DOWN to the floor, ends low = off
+    // pair reads as a siren) - this only ever descends. The LED master still governs the light,
+    // but detection-alert mute does not suppress this deliberate off confirmation. Volume 0 is
+    // still fully silent. ~0.7s, before the nRF park handshake, so deep sleep never clips it.
+    constexpr AudioPurpose purpose = AudioPurpose::PowerState;
+    beep(1850, 90, 60, purpose); vTaskDelay(pdMS_TO_TICKS(30));   // DEE   - boot's top note, now the START
+    beep(1450, 70, 60, purpose); vTaskDelay(pdMS_TO_TICKS(30));   //  da   - stepping down (boot stepped up)
+    beep(1150, 70, 60, purpose); vTaskDelay(pdMS_TO_TICKS(40));   //   da
+    warble(950, 160, 3, 26, 60, purpose);                          // slowing "spin-down" wobble, lower + lazier
+    caw(1400, 500, 220, 60, purpose);                              // settle: sweep DOWN to the floor, ends low = off
+}
+
+void alertsPowerOnAck() {
+    if (!gAlertQ) return;
+    AcabDeviceType t = ACAB_ALERT_POWER_ON;
+    xQueueSend(gAlertQ, &t, 0);
 }
 
 // Fire the "app linked" chirp and re-arm the first-catch reveal for this session.
@@ -305,9 +353,12 @@ void alertsSignal(AcabDeviceType type, bool isNew) {
     if (!isNew || !gAlertQ) return;       // only beep on the first sighting
 
     // First real infrastructure hit of a session earns the "reveal" sting. Trackers are
-    // opt-in and often the user's own AirTag, so they don't spend the reveal , it waits
-    // for actual surveillance gear. (Called on the single sink task, so no lock needed.)
-    if (gArmReveal && type != ACAB_TRACKER) {
+    // opt-in and often the user's own AirTag, so they do not spend the reveal: it waits
+    // for actual surveillance gear. Desert nearby rows do not spend it either - Desert is
+    // the opt-in report-everything mode, and a board that boots into persisted Desert
+    // would otherwise burn the session's one sting on the first passing phone.
+    // (Called on the single sink task, so no lock needed.)
+    if (gArmReveal && type != ACAB_TRACKER && type != ACAB_NEARBY_DEVICE) {
         gArmReveal = false;
         if (type < ACAB_TYPE_COUNT) gLastAlertMs[type] = millis();   // open its coalesce window too
         AcabDeviceType r = ACAB_ALERT_REVEAL;

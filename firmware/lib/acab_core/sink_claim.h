@@ -88,6 +88,7 @@ struct AcabSinkClaim {
     uint32_t bucket;            ///< bucket derived from that same key
     uint32_t priorLoggedGen;    ///< value to restore; NOT a sentinel, see the rollback comment
     uint32_t captureGen;        ///< gCaptureGen as read when the claim was made
+    uint32_t admissionEpoch;    ///< owner/link epoch checked atomically by det_log at append
     uint32_t token;             ///< monotonic claim token, the ABA guard
     bool     active;            ///< false when the detection was not buffer-bearing: nothing to undo
 };

@@ -11,8 +11,8 @@
 # the irreversible steps.
 #
 # INTERIM SEQUENCE, and why it is not the ideal one. web/build-flasher.sh and
-# ../soyboi.tech/firmware/build-beacon-flasher.sh each run `pio` themselves. Rev-B is the one
-# deliberate additional build because the sibling stager knows only rev-A. The right end state is
+# ../soyboi.tech/firmware/build-beacon-flasher.sh each run `pio` themselves; the sibling stager
+# builds and transactionally stages BOTH beacon revisions plus the nRF package. The right end state is
 #   build once -> stage from the build dir -> verify a temp release dir -> promote (atomic move)
 # which needs both stagers refactored. Until then the order below is the correct one for the
 # scripts as they actually exist.
@@ -23,6 +23,8 @@
 #   ./release.sh --profile beacon              # the dual-radio board
 #   ./release.sh --profile colonel-panic       # oui-spy + mesh-detect
 #   ./release.sh --profile all --with-apps     # everything, including the phone test suites
+#   ./release.sh --profile all --offline       # cut with no network: the upstream drift watch
+#                                              # is skipped, on the record, instead of failing
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename "$0")"
@@ -34,6 +36,7 @@ PROFILE=""
 ALLOW_DIRTY=0
 WITH_APPS=0
 UNSIGNED_USB_ONLY=0
+OFFLINE=0
 
 die() { echo "!! $*" >&2; exit 1; }
 step() { echo; echo "=== $* ==="; }
@@ -44,7 +47,12 @@ while [ $# -gt 0 ]; do
         --allow-dirty) ALLOW_DIRTY=1; shift ;;
         --with-apps) WITH_APPS=1; shift ;;
         --unsigned-usb-only) UNSIGNED_USB_ONLY=1; shift ;;
-        -h|--help) sed -n '2,24p' "$SCRIPT_PATH"; exit 0 ;;
+        --offline) OFFLINE=1; shift ;;
+        # Ends at the first line that is not a comment, rather than at a hardcoded line number.
+        # The old fixed 2,24p range stopped one line short of the last usage example, so a usage
+        # line could be written and never printed - and adding one below would have widened that
+        # silently.
+        -h|--help) sed -n '2,${/^#/!q;p;}' "$SCRIPT_PATH"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -103,7 +111,16 @@ echo "   profile=$PROFILE apps=$WITH_APPS signed=$SIGNED_LABEL"
 step "2/5 tests"
 # ---------------------------------------------------------------------------
 ./host-tests/run.sh
-python3 ./check-signature-drift.py   # signatures.md must still describe the shipped tables
+# signatures.md must still describe the shipped tables. The drift check FAILS on an unreachable
+# api.github.com rather than warning (a watcher that skipped itself has watched nothing), and its
+# own remedy line tells the operator to "pass --offline". This script has to be able to, or that
+# remedy is a lie here: without the forward, a genuinely offline release cut could only get past
+# step 2 by running the drift check by hand outside the orchestrator.
+if [ "$OFFLINE" -eq 1 ]; then
+    python3 ./check-signature-drift.py --offline
+else
+    python3 ./check-signature-drift.py
+fi
 # The release-tooling suite gates the very scripts the steps below run. Sibling-dependent case
 # skips itself when soyboi.tech is absent.
 python3 -m unittest discover -s tests -p 'test_*.py'
@@ -124,8 +141,9 @@ fi
 # ---------------------------------------------------------------------------
 step "3/5 build and stage"
 # ---------------------------------------------------------------------------
-# The existing stagers build their own environments. Rev-B is built explicitly because the
-# sibling stager cannot build or name it, and a distinct image is mandatory for its hardware.
+# The existing stagers build their own environments. The sibling beacon stager owns rev-A, rev-B
+# and the common nRF package as one rollback-guarded unit; invoking the rev-B stager again here
+# would only re-sign/rewrite the same bytes outside that transaction.
 if [ "$PROFILE" = "colonel-panic" ] || [ "$PROFILE" = "all" ]; then
     # Forward the unsigned opt-in: build-flasher.sh now fails closed on a missing signing key,
     # matching this script's own posture.
@@ -136,22 +154,13 @@ if [ "$PROFILE" = "colonel-panic" ] || [ "$PROFILE" = "all" ]; then
     fi
 fi
 if [ "$PROFILE" = "beacon" ] || [ "$PROFILE" = "all" ]; then
-    ( cd "$REPO/firmware" && pio run -e beacon-board-revb )
-    ( cd "$SITE/firmware" && ./build-beacon-flasher.sh )
-    BOOT_APP0="$(find "$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions" \
-        -name boot_app0.bin -print -quit 2>/dev/null)"
-    [ -n "$BOOT_APP0" ] || die "boot_app0.bin not found after the rev-B build"
-    REV_B_ARGS=(
-        --firmware-dir "$REPO/firmware"
-        --site-dir "$SITE"
-        --boot-app0 "$BOOT_APP0"
-    )
+    # USB-only is an explicit output mode, not permission to sign opportunistically when a key
+    # happens to be present. Forward it to the sibling stager so rev-A, rev-B and nRF all agree.
     if [ "$UNSIGNED_USB_ONLY" -eq 1 ]; then
-        REV_B_ARGS+=(--unsigned-usb-only)
+        ( cd "$SITE/firmware" && ./build-beacon-flasher.sh --unsigned-usb-only )
     else
-        REV_B_ARGS+=(--signing-key "$KEY")
+        ( cd "$SITE/firmware" && ./build-beacon-flasher.sh )
     fi
-    python3 ./stage_beacon_revb.py "${REV_B_ARGS[@]}"
 fi
 
 # ---------------------------------------------------------------------------

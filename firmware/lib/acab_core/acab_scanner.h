@@ -2,12 +2,18 @@
  * ACAB - Unified scanner.
  *
  * Owns the radios and runs every detector at once:
- *   - NimBLE active scan            -> drone (RID) + Flock + Axon, per advert
+ *   - NimBLE PASSIVE scan           -> drone (RID) + Flock + Axon, per advert
  *   - 802.11 promiscuous + hopping  -> drone (RID) + Flock, per mgmt frame
  *
- * De-dupes by (type, MAC) and calls the firmware-supplied sink once per new
- * sighting (and again on refresh after the dedup window). The two builds
- * (OUI-Spy, Mesh-Detect) differ only in the sink they register.
+ * Both radios only listen. The BLE half goes active ONLY in a capture build that opts
+ * in with -DACAB_ACTIVE_SCAN, which the #error below refuses to compile without an
+ * explicit -DACAB_CAPTURE_BUILD; a shipped image never transmits a SCAN_REQ.
+ *
+ * De-dupes by (type, dedup key) and calls the firmware-supplied sink once per new
+ * sighting (and again on refresh after the dedup window). The key is the MAC for
+ * everything except a Remote ID drone that broadcasts a UAS ID: drones rotate MACs across
+ * both radios, so those are keyed by a hash of the UAS ID instead - see dedup_key.h. The
+ * two builds (OUI-Spy, Mesh-Detect) differ only in the sink they register.
  */
 // Capture-build guard for the ESP32 side, mirroring the one in nrf-ble-scan/src/main.cpp.
 // This header is pulled in by acab_scanner.cpp, which every ESP32 env compiles, so the guard
@@ -67,9 +73,22 @@ void acabScannerSetSelfGPS(double lat, double lon, bool valid);
 // polluting the live dedup table / gTotal / offline buffer (see AcabDetection::replay).
 void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t plen, int rssi, bool isReplay = false);
 
-// Re-arm offline-buffer capture (call when the app disconnects): the first sighting of
-// each device after this buffers once more, so capture isn't a single per-boot event.
-void acabScannerReArmCapture();
+// Finish the two-phase app-disconnect boundary. Call Block below before publishing connection
+// teardown, clear all link-owned GPS/replay/key state, then call ReArm: it consumes the reserved
+// det_log epoch and atomically publishes that away-session admission token with a fresh capture
+// generation before clearing the required non-null service-side owner gate through the supplied
+// pointer under the same scanner lock. Thus a sighting during teardown cannot consume the
+// generation intended for away capture. False leaves that gate true and the scanner admission
+// token at the zero fail-closed sentinel.
+bool acabScannerReArmCapture(volatile bool* ownerCaptureBlocked);
+
+// Owner-session boundary shared by authentication and disconnect. Block reserves a fresh det_log
+// admission epoch but publishes no live scanner stamp while prior-owner state is in flight. During
+// authentication, Admit publishes that epoch only after preparation succeeds and does not re-arm
+// dedup capture. During disconnect, ReArm above publishes it only after teardown and does re-arm.
+// False means the boundary failed; authentication must reject and disconnect remains fail-closed.
+bool acabScannerBlockCaptureForOwnerSession();
+bool acabScannerAdmitCaptureForOwnerSession();
 
 // Periodic re-arm while "record everything" is on (detLogBufferAll, det_log.h). Call once per
 // main-loop tick; it self-throttles to REBUFFER_AFTER_MS and no-ops when the mode is off or a
@@ -79,7 +98,8 @@ void acabScannerReArmCapture();
 void acabScannerBufferAllTick();
 
 // Whitelist: silently drop detections from these MACs (no report/beep/mesh).
-// App-pushed over config; held in RAM (the app re-sends on reconnect).
+// App-pushed over config; held in RAM + persisted to NVS across boots (the app also
+// re-sends on reconnect).
 void acabScannerSetIgnoreList(const uint8_t macs[][6], int count);
 
 // How many MACs are currently on the ignore list (for app reconciliation).
@@ -197,6 +217,13 @@ uint32_t acabScannerVendorAxon();
 uint32_t acabScannerVendorMoto();
 uint32_t acabScannerVendorMacs();
 uint32_t acabScannerVendorFull();
+// Exact-width ALPR vendor-prefix annotations. These counters describe capture instrumentation,
+// not detections: no candidate enters handleDetection or reaches an app. alpr_full > 0 means the
+// WiFi per-MAC table overflowed and alpr_macs is a floor.
+uint32_t acabScannerAlprCandidateBleSeen();
+uint32_t acabScannerAlprCandidateWifiSeen();
+uint32_t acabScannerAlprCandidateMacs();
+uint32_t acabScannerAlprCandidateTableFull();
 
 // Ground-truth marker window. {"mark":"<label>"} over config calls this: it CLOSES the open window
 // and prints its per-device summary, then opens a new one under the new label.

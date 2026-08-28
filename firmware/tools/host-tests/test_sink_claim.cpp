@@ -10,6 +10,7 @@
 // claim can have stopped belonging to the failed send, and each one has a test below.
 #include "../../lib/acab_core/sink_claim.h"
 #include "../../lib/acab_core/dedup_key.h"
+#include "../../lib/acab_core/det_log.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -127,11 +128,36 @@ static AcabClaimCheck ok() {
 int main() {
     printf("\n=== sink-queue claim rollback ===\n");
 
+    chk("claim carries separate capture and owner-admission epochs",
+        sizeof(AcabSinkClaim) == 32, true);
+    AcabSinkClaim epochClaim{};
+    epochClaim.captureGen = 5;
+    epochClaim.admissionEpoch = 9;
+    const uint32_t periodicCaptureGen = 6;
+    const uint32_t sameOwnerAdmissionEpoch = 9;
+    chk("periodic dedup rearm preserves queued owner admission",
+        periodicCaptureGen != epochClaim.captureGen &&
+        sameOwnerAdmissionEpoch == epochClaim.admissionEpoch, true);
+    chk("disconnect owner epoch invalidates the queued claim",
+        (sameOwnerAdmissionEpoch + 1) == epochClaim.admissionEpoch, false);
+
     // The whole point: a buffer-bearing item that failed to enqueue must release its claim, or the
     // device reads as "already buffered this generation" with nothing written and stays that way
     // until the app disconnects.
     chk("failed buffered enqueue -> rollback allowed (device re-arms)",
         acabClaimRollbackAllowed(ok()), true);
+
+    // Only a transient det_log refusal releases an already-queued claim. Deliberately disabled,
+    // connected, keyless, unavailable, or fault-blocked logging is stable until a separate capture
+    // generation boundary; releasing in those states makes every advert hammer the sink queue.
+    chk("transient append refusal releases the scanner claim",
+        detLogAppendReleasesClaim(DET_LOG_APPEND_RETRY), true);
+    chk("stored append keeps the scanner claim consumed",
+        detLogAppendReleasesClaim(DET_LOG_APPEND_STORED), false);
+    chk("stable not-armed refusal keeps the scanner claim consumed",
+        detLogAppendReleasesClaim(DET_LOG_APPEND_NOT_ARMED), false);
+    chk("capacity refusal keeps the scanner claim consumed",
+        detLogAppendReleasesClaim(DET_LOG_APPEND_CAPACITY_DROP), false);
 
     // THE ABA CASE. Slot evicted under table pressure, same device re-admitted, its newer sighting
     // claimed successfully - then our stale failure arrives. Rolling back here would re-arm a
@@ -176,6 +202,35 @@ int main() {
     { AcabClaimCheck c = ok(); c.entryLoggedGen = 0; c.captureGenNow = 0; c.captureGenAtClaim = 0;
       chk("generation 0 carries no sentinel meaning -> still allowed",
           acabClaimRollbackAllowed(c), true); }
+
+    // The sink queue can accept an item while det_log is still startup/NVS/wipe-blocked. A later
+    // RETRY result must release the carried claim, so the same device's next sighting can claim and
+    // buffer in this capture generation after readiness recovers. This is the second asynchronous
+    // boundary; enqueue-failure rollback alone does not cover it.
+    {
+        const uint8_t key[6] = {1,2,3,4,5,6};
+        AcabSinkClaim claim{};
+        claim.type = 1;
+        memcpy(claim.key, key, sizeof(key));
+        claim.bucket = 7;
+        claim.priorLoggedGen = 0;
+        claim.captureGen = 5;
+        claim.token = 42;
+        claim.active = true;
+        FakeTable t{};
+        memcpy(t.key, key, sizeof(key));
+        t.type = claim.type;
+        t.present = true;
+        t.loggedGen = 5;
+        t.logClaim = 42;
+        t.genNow = 5;
+        AcabClaimTable api{ fakeLookup, fakeRestore, fakeGenNow, &t };
+        const bool released = acabSinkClaimRollback(claim, api);
+        if (released) t.loggedGen = t.restoredTo;  // production restore mutates the actual entry
+        const bool sameDeviceCanClaimAfterRecovery = t.loggedGen != t.genNow;
+        chk("retryable sink append rejection re-arms same-generation device",
+            released && sameDeviceCanClaimAfterRecovery, true);
+    }
 
     // ---- key plumbing: the rollback must look up the key the claim used ----------------------
     printf("\n  -- rollback key plumbing --\n");

@@ -2,10 +2,10 @@
  * ACAB - Motorola Solutions gear detector (a law-enforcement-equipment proxy).
  * Matches are reported under the BODY-CAM device type, so the apps fold them into the
  * "Body cam" category (the separate police-gear category is merged into body cam).
- * Signatures in police_signatures.h, sourced from the IEEE OUI registry.
+ * Signatures in bodycam_vendor_signatures.h, sourced from the IEEE OUI registry.
  */
 #include "police_detect.h"
-#include "police_signatures.h"
+#include "bodycam_vendor_signatures.h"
 #include "axon_detect.h"     // parent category switch: this is a SUB-toggle of body cam
 #include "desert_detect.h"   // Desert mode forces classification even when toggled off
 #include <Preferences.h>     // persist the Motorola sub-toggle across reboots (NVS)
@@ -13,7 +13,11 @@
 #include <stdio.h>
 
 static bool gEnabled = false;   // module default off; main.cpp restores the persisted
-                                // value at boot (default ON on beacon-board/oui-spy)
+                                // value at boot, and EVERY board passes false - both
+                                // beacon-board and mesh-detect call
+                                // policeRestoreEnabled(false). Opt-in since the
+                                // 2026-07-23 ground truth; see the banner in
+                                // bodycam_vendor_signatures.h.
 
 void policeSetEnabled(bool enabled) {
     if (enabled == gEnabled) return;

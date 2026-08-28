@@ -16,10 +16,26 @@ from typing import Iterable, List, Optional, Tuple, TypeVar, Union
 
 ESP_IMAGE_MAGIC = 0xE9
 ESP_APP_DESC_MAGIC = 0xABCD5432
+# Each dotted field packs into 10 bits. acabOtaVersionPack (firmware/lib/acab_core/ota_policy.h)
+# returns 0 for a field past this, and acabOtaAuthenticatedVersionAllowed hard-rejects 0, so a
+# field above 1023 is not a cosmetic version: it is a fully signed, fully staged release that no
+# board will ever install over the air while both apps go on offering it forever. acab_version.h
+# states the rule in prose ("KEEP EVERY DOTTED FIELD UNDER 1024"); every parser in the tooling was
+# looser than the prose, so the release could be cut. USB recovery still works, so this is a dead
+# OTA path, not a brick.
+OTA_VERSION_FIELD_MAX = 1023
+# The board packs at most three dotted numeric fields. Both apps deliberately strip only a
+# dash-prefixed suffix before validating/comparing the numeric core, so this is the one source
+# grammar every release surface can interpret identically. Keep it ASCII-only: these values are
+# copied into esp_app_desc and cross an attacker-influenced status boundary later.
+OTA_VERSION_RE = re.compile(
+    r"(?P<core>[0-9]+(?:\.[0-9]+){0,2})(?:-(?P<suffix>[0-9A-Za-z][0-9A-Za-z.-]*))?\Z"
+)
 ESP_APP_DESC_OFFSET = 24 + 8
 ESP_APP_VERSION_OFFSET = ESP_APP_DESC_OFFSET + 16
 ESP_APP_PROJECT_OFFSET = ESP_APP_VERSION_OFFSET + 32
 ESP_APP_TEXT_FIELD_SIZE = 32
+OTA_FIRMWARE_BASE_URL = "https://soyboi.tech/firmware/"
 
 
 class ReleaseToolError(RuntimeError):
@@ -245,14 +261,198 @@ def read_nrf_dfu_application_version(path: Union[os.PathLike, str]) -> int:
     return version
 
 
+def read_nrf_source_version(path: Union[os.PathLike, str]) -> int:
+    """Read the one integer ``NRF_APP_VERSION`` shipped by the co-processor source.
+
+    The DFU package carries this number in both manifest.json and its legacy init packet. Reading
+    the source independently lets the release gate distinguish a self-consistent OLD package from
+    one rebuilt after the current nRF source changed.
+    """
+    source = Path(path)
+    try:
+        text = source.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise ReleaseToolError(f"cannot read nRF source version from {source}: {exc}") from exc
+    matches = re.findall(
+        r"(?m)^\s*#define\s+NRF_APP_VERSION\s+([0-9]+)\s*(?://[^\r\n]*)?$", text
+    )
+    if len(matches) != 1:
+        raise ReleaseToolError(
+            f"{source} must declare exactly one integer NRF_APP_VERSION (found {len(matches)})"
+        )
+    version = int(matches[0])
+    if version > 0xFFFFFFFF:
+        raise ReleaseToolError(f"{source} NRF_APP_VERSION {version} exceeds uint32")
+    return version
+
+
+def require_manifest_builds(manifest: object, labels: Iterable[str], source: str) -> dict:
+    """Return a schema-1 app-manifest build map with every profile-required label.
+
+    Both phone apps reject the whole document before consulting ``builds`` unless ``schema`` is
+    exactly the integer 1. Keep that adoption gate here, in the validator shared by the stager and
+    production verifier, so a self-consistent set of signed artifacts cannot be published inside
+    a manifest neither app will accept.
+    """
+    if not isinstance(manifest, dict):
+        raise ReleaseToolError(f"{source} is not an object")
+    if type(manifest.get("schema")) is not int or manifest.get("schema") != 1:
+        raise ReleaseToolError(f"{source} schema must be exactly integer 1")
+    if not isinstance(manifest.get("builds"), dict):
+        raise ReleaseToolError(f"{source} has no builds object")
+    builds = manifest["builds"]
+    missing = [label for label in labels if not isinstance(builds.get(label), dict)]
+    if missing:
+        raise ReleaseToolError(f"{source} is missing required build key(s): {', '.join(missing)}")
+    return builds
+
+
+def require_ota_firmware_url(url: object, filename: str, source: str) -> str:
+    """Require the URL the apps fetch to name the exact file this release gate verifies locally."""
+    expected = OTA_FIRMWARE_BASE_URL + filename
+    if url != expected:
+        raise ReleaseToolError(f"{source} URL {url!r} must equal {expected!r}")
+    return expected
+
+
+def read_baked_ota_public_key_der(path: Union[os.PathLike, str]) -> bytes:
+    """Read the SubjectPublicKeyInfo DER byte array enforced by the firmware."""
+    header = Path(path)
+    try:
+        text = header.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise ReleaseToolError(f"cannot read OTA public-key header {header}: {exc}") from exc
+    match = re.search(r"ACAB_OTA_PUBKEY_DER\[\]\s*=\s*\{(.*?)\};", text, re.S)
+    if not match:
+        raise ReleaseToolError(f"{header} has no ACAB_OTA_PUBKEY_DER byte array")
+    values = re.findall(r"0x([0-9A-Fa-f]{2})", match.group(1))
+    if not values:
+        raise ReleaseToolError(f"{header} ACAB_OTA_PUBKEY_DER is empty")
+    return bytes(int(value, 16) for value in values)
+
+
+def require_ota_signing_key_identity(
+    key_path: Union[os.PathLike, str], header_path: Union[os.PathLike, str]
+) -> str:
+    """Require a usable, unencrypted private key rooted in the public key boards enforce.
+
+    Release scripts deliberately have no passphrase channel. ``-passin pass:`` makes an encrypted
+    key fail without opening an interactive prompt, while a normal offline key derives its SPKI
+    public DER. Comparing those bytes directly to the firmware header catches a valid key from a
+    different checkout before it signs and stages a release every fielded board would reject.
+    Returns the matching key fingerprint for the release log.
+    """
+    key = Path(key_path)
+    if not key.is_file():
+        raise ReleaseToolError(f"OTA signing key is missing: {key}")
+    try:
+        result = subprocess.run(
+            [
+                "openssl", "pkey", "-in", os.fspath(key), "-passin", "pass:",
+                "-pubout", "-outform", "DER",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        raise ReleaseToolError(f"cannot run openssl to inspect OTA signing key: {exc}") from exc
+    if result.returncode != 0 or not result.stdout:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise ReleaseToolError(
+            f"cannot derive public key from {key}: {detail or 'empty public key'}"
+        )
+    baked = read_baked_ota_public_key_der(header_path)
+    if result.stdout != baked:
+        actual = hashlib.sha256(result.stdout).hexdigest()[:12]
+        expected = hashlib.sha256(baked).hexdigest()[:12]
+        raise ReleaseToolError(
+            f"{key} does not match the OTA trust root baked into {header_path} "
+            f"({actual} vs {expected})"
+        )
+    return hashlib.sha256(baked).hexdigest()
+
+
+def require_usb_only_manifest_build(build: object, source: str) -> dict:
+    """Require an explicitly unsigned build that neither app can offer over the air.
+
+    USB-only is an operator-selected release mode, not a fallback for a missing key. Its manifest
+    must therefore describe that mode unambiguously even when a usable signing key happens to be
+    present on the build machine. Companion nRF DFU is app-delivered too, so it must not be
+    advertised by a USB-only cut.
+    """
+    if not isinstance(build, dict):
+        raise ReleaseToolError(f"{source} build must be an object")
+    app = build.get("app")
+    if not isinstance(app, dict):
+        raise ReleaseToolError(f"{source} app must be an object")
+    if build.get("ota") is not False:
+        raise ReleaseToolError(f"{source} ota must be exactly false for a USB-only cut")
+    if app.get("sig") != "":
+        raise ReleaseToolError(f"{source} app.sig must be exactly empty for a USB-only cut")
+    if "nrf" in build:
+        raise ReleaseToolError(f"{source} must not advertise nRF DFU in a USB-only cut")
+    return build
+
+
+def require_ota_packable_version(version: str, source: str) -> str:
+    """Require one version spelling the board and both apps interpret identically.
+
+    The numeric core is one to three nonempty dotted ASCII fields. A nonempty dash suffix is
+    allowed because the board packer and both app OTA gates deliberately ignore it. Everything
+    else is rejected in full rather than letting the packer's prefix parsing silently reinterpret
+    a release label. The packed value must also be nonzero: every OTA gate reserves zero for a
+    malformed version.
+    """
+    match = OTA_VERSION_RE.fullmatch(version)
+    if not match:
+        raise ReleaseToolError(
+            f"{source} declares version {version!r}: expected 1-3 dotted ASCII numeric fields "
+            "with an optional nonempty '-suffix'"
+        )
+    if len(version.encode("ascii")) >= ESP_APP_TEXT_FIELD_SIZE:
+        raise ReleaseToolError(
+            f"{source} declares version {version!r}: it does not fit the "
+            f"{ESP_APP_TEXT_FIELD_SIZE - 1}-byte esp_app_desc version field"
+        )
+
+    fields = [int(field) for field in match.group("core").split(".")]
+    for field in fields:
+        if field > OTA_VERSION_FIELD_MAX:
+            raise ReleaseToolError(
+                f"{source} declares version {version!r}: field {field} exceeds "
+                f"{OTA_VERSION_FIELD_MAX}, which acabOtaVersionPack packs to 0 and every OTA gate "
+                f"rejects. Bump the minor instead."
+            )
+    if not any(fields):
+        raise ReleaseToolError(
+            f"{source} declares version {version!r}: acabOtaVersionPack reserves packed value 0 "
+            "for malformed versions and every OTA gate rejects it"
+        )
+    return version
+
+
 def _version_from_header(firmware_dir: Path) -> str:
     header = (firmware_dir / "lib/acab_core/acab_version.h").read_text(
         encoding="utf-8", errors="replace"
     )
-    match = re.search(r'#define\s+ACAB_FW_VERSION\s+"([0-9][0-9A-Za-z.+-]*)"', header)
+    match = re.search(r'#define\s+ACAB_FW_VERSION\s+"([^"\r\n]+)"', header)
     if not match:
         raise ReleaseToolError("could not read ACAB_FW_VERSION from acab_version.h")
-    return match.group(1)
+    return require_ota_packable_version(match.group(1), "acab_version.h")
+
+
+def _platformio_define_value(raw: str) -> str:
+    """Remove only balanced quoting wrappers from one PlatformIO build-flag value."""
+    value = raw
+    wrappers = ((r'\"', r'\"'), ('"', '"'), ("'", "'"))
+    while True:
+        for opening, closing in wrappers:
+            if len(value) >= len(opening) + len(closing) and value.startswith(opening) and value.endswith(closing):
+                value = value[len(opening):-len(closing)]
+                break
+        else:
+            return value
 
 
 def declared_versions(firmware_dir: Union[os.PathLike, str]) -> Tuple[str, str]:
@@ -265,11 +465,20 @@ def declared_versions(firmware_dir: Union[os.PathLike, str]) -> Tuple[str, str]:
     )
     if not section_match:
         raise ReleaseToolError("platformio.ini has no [env:beacon-board] section")
-    version_match = re.search(
-        r'-DACAB_FW_VERSION=(?:\\?"|\'"|"\')*([0-9][0-9A-Za-z.+-]*)',
-        section_match.group("body"),
+    # Capture the WHOLE non-whitespace build-flag value, then unwrap only balanced quoting.
+    # Stopping at the first backslash/quote accepted a valid prefix of an invalid or unterminated
+    # value (for example ``2.0.6\\garbage``), defeating the full-match validator below.
+    version_match = re.search(r'-DACAB_FW_VERSION=([^\s;#]+)', section_match.group("body"))
+    # The beacon board carries its OWN version here, and it is the one the OTA gate on shipping
+    # hardware compares, so it needs the same bound as the header default above.
+    beacon = (
+        require_ota_packable_version(
+            _platformio_define_value(version_match.group(1)),
+            "platformio.ini [env:beacon-board]",
+        )
+        if version_match
+        else shared
     )
-    beacon = version_match.group(1) if version_match else shared
     return shared, beacon
 
 

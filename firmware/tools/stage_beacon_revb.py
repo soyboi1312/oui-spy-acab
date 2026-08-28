@@ -16,7 +16,13 @@ import sys
 import tempfile
 from typing import Optional
 
-from release_tools import ReleaseToolError, declared_versions, parse_esp_app_desc
+from release_tools import (
+    ReleaseToolError,
+    declared_versions,
+    parse_esp_app_desc,
+    require_manifest_builds,
+    require_ota_signing_key_identity,
+)
 
 
 REV_B_LABEL = "beacon board rev-B"
@@ -56,8 +62,7 @@ def check_site_contract(site_dir: Path) -> None:
         manifest = json.loads(latest.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ReleaseToolError(f"cannot parse {latest}: {exc}") from exc
-    if manifest.get("schema") != 1 or not isinstance(manifest.get("builds"), dict):
-        raise ReleaseToolError(f"{latest} is not a schema 1 firmware manifest")
+    require_manifest_builds(manifest, (), os.fspath(latest))
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -80,7 +85,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 def _sign(image: bytes, key: Path) -> str:
     result = subprocess.run(
-        ["openssl", "dgst", "-sha256", "-sign", os.fspath(key)],
+        ["openssl", "dgst", "-sha256", "-passin", "pass:", "-sign", os.fspath(key)],
         input=image,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -100,6 +105,13 @@ def stage_rev_b(
     unsigned_usb_only: bool = False,
 ) -> None:
     check_site_contract(site_dir)
+    if not unsigned_usb_only:
+        if signing_key is None:
+            raise ReleaseToolError("the rev-B OTA signing key is missing")
+        require_ota_signing_key_identity(
+            signing_key, firmware_dir / "lib/acab_core/ota_pubkey.h"
+        )
+
     build_dir = firmware_dir / ".pio/build/beacon-board-revb"
     sources = {
         "bootloader": build_dir / "bootloader.bin",
@@ -131,8 +143,6 @@ def stage_rev_b(
     if unsigned_usb_only:
         signature = ""
     else:
-        if signing_key is None or not signing_key.is_file():
-            raise ReleaseToolError("the rev-B OTA signing key is missing")
         signature = _sign(payloads["firmware"], signing_key)
 
     firmware_site = site_dir / "firmware"
@@ -152,7 +162,9 @@ def stage_rev_b(
         "flasher": REV_B_FLASHER,
         "notes": "rev-B carrier only. Do not install this image on rev-A hardware.",
     }
-    if isinstance(rev_a.get("nrf"), dict):
+    # nRF DFU is delivered by the phone, not by the USB flasher. An explicitly USB-only cut must
+    # not inherit a stale/signed companion offer even if rev-A's previous manifest still has one.
+    if not unsigned_usb_only and isinstance(rev_a.get("nrf"), dict):
         entry["nrf"] = copy.deepcopy(rev_a["nrf"])
     latest["builds"][REV_B_LABEL] = entry
     latest["updated"] = datetime.date.today().isoformat()

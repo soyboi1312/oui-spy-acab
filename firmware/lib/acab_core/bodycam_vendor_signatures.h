@@ -1,5 +1,5 @@
 /*
- * ACAB - Police / Motorola Solutions gear signatures (clean-room).
+ * ACAB - Body-camera-category vendor and accessory research signatures (clean-room).
  *
  * Matching these OUIs flags a Motorola Solutions WiFi/BLE device nearby. Motorola
  * Solutions is the dominant US public-safety comms vendor, but the same corporate
@@ -7,9 +7,9 @@
  * retail, school, and venue staff, so a hit is "Motorola Solutions gear", not proof of
  * a camera. It is NOT ALPR-specific, and NOT their LMR radios (700/800 MHz, off this
  * 2.4 GHz board). Broad by nature, so it sits behind its OWN sub-toggle underneath the
- * body-cam category ({"motorola":bool}, default ON on beacon-board/oui-spy, OFF on
- * mesh-detect) and emits below the apps' weak-match threshold (<50) so it always
- * renders as "verify this".
+ * body-cam category ({"motorola":bool}, OPT-IN: default OFF on EVERY board, per the
+ * 2026-07-23 ground truth recorded below) and emits below the apps' weak-match
+ * threshold (<50) so it always renders as "verify this".
  *
  * The sub-toggle exists because this match and the Axon BWCDEVICE tag used to share one
  * switch: a user turning "body cam" off to quiet THIS broad match also silenced the
@@ -17,8 +17,8 @@
  * Now "body cam off" kills the whole category, and "motorola off" quiets only this.
  * Full notes in docs/signatures.md.
  */
-#ifndef ACAB_POLICE_SIGNATURES_H
-#define ACAB_POLICE_SIGNATURES_H
+#ifndef ACAB_BODYCAM_VENDOR_SIGNATURES_H
+#define ACAB_BODYCAM_VENDOR_SIGNATURES_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -118,6 +118,9 @@ static const size_t POLICE_OUI_COUNT = sizeof(POLICE_OUI) / sizeof(POLICE_OUI[0]
 //   Motorola Holster Aware
 //   Reveal Bluetooth trigger accessories
 //   Axis body-camera activation sensors
+//   i-PRO IPS-BTS-SENSOR                    (BWC4000 holster activation accessory)
+//   Getac TB-02 / TB-03                     (vehicle lightbar/door/weapon triggers)
+//   Getac HS-01                             (holster trigger paired through BC-03)
 //
 // No values here yet, on purpose: nobody has observed one of these adverts. The Axon and Motorola
 // SIG identifiers already in the capture build (VENDOR_BLE_ID in acab_scanner.cpp) are the likely
@@ -127,6 +130,14 @@ static const size_t POLICE_OUI_COUNT = sizeof(POLICE_OUI) / sizeof(POLICE_OUI[0]
 // sensor is not a camera, and calling it one is the same category error this file already spends
 // forty lines warning about, with the twist that it would mislabel the MORE interesting finding as
 // the less interesting one.
+//
+// i-PRO / GETAC CAPTURE SUPPORT (2.0.6): the capture build loudly annotates local names containing
+// BWC4000, IPS-BTS, BC-02/03/04, TB-02/03 or HS-01. This is diagnostic instrumentation only.
+// Official manuals establish that the products use BLE/WLAN and that the trigger boxes connect to
+// lightbars, vehicle doors and weapon releases, but publish no passive identifier. Getac's corporate
+// OUIs are deliberately excluded: the same blocks cover its rugged laptops and tablets. Bracket a
+// confirmed unit with {"mark":"ipro-getac-near"}, {"mark":"left"}, {"mark":"end"}; promote only a
+// value that survives that ground-truth comparison.
 //
 // ---------------------------------------------------------------------------------------------
 // PUBLIC-SAFETY DRONES: THERE IS NO OUI TO ADD. SDPD's published technology inventory lists BRINC
@@ -152,4 +163,4 @@ static const size_t POLICE_OUI_COUNT = sizeof(POLICE_OUI) / sizeof(POLICE_OUI[0]
 // capture is the correct bounded choice. The city owning the equipment is not, by itself,
 // evidence of anything.
 
-#endif // ACAB_POLICE_SIGNATURES_H
+#endif // ACAB_BODYCAM_VENDOR_SIGNATURES_H

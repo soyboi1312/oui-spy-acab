@@ -17,7 +17,8 @@
 #include <stddef.h>
 
 // Master on/off. Default is set by the caller's trackerRestoreEnabled(defaultEnabled):
-// beacon-board / oui-spy pass ON (since 2026-07-24); mesh-detect passes OFF (mesh uplink
+// beacon-board passes OFF (briefly ON 2026-07-24, reverted 2026-07-25 on field data - see
+// main.cpp); mesh-detect passes OFF (mesh uplink
 // bandwidth). trackerSetEnabled persists the choice to NVS; trackerRestoreEnabled reloads
 // it on boot so an app-set toggle survives a reboot instead of reverting to the default.
 void trackerSetEnabled(bool enabled);

@@ -2,9 +2,10 @@
  * ACAB - Axon body-worn camera detector (field-validated, on by default).
  *
  * Default signature is the inert STUB (matches nothing). axonUseRegistryCandidate()
- * loads the field-validated OUI 00:25:DF (see axon_signatures.h). When the advert
- * also carries the "BWCDEVICE" service-data tag, classify() confirms it as a body
- * cam (vs other Axon gear) and raises confidence; set usePayload=true to require it.
+ * loads the field-validated OUI 00:25:DF (see axon_signatures.h). The "BWCDEVICE"
+ * service-data tag is a STANDALONE, MAC-independent match (conf 90, with or without
+ * the OUI - Axon is moving to rotating BLE MACs, which breaks the OUI path); set
+ * usePayload=true to require the tag on the signature-table match too.
  *
  * Validating against a real unit:
  *   1. Put a BLE sniffer next to a powered Axon body cam.
@@ -16,7 +17,7 @@
 #include "axon_detect.h"
 #include "axon_signatures.h"
 #include "acab_scanner.h"    // acabSanitizeAscii: clamp attacker-sourced names on ingest
-#include "ascii_match.h"     // shared acabBytesContainAscii (Axon "BWCDEVICE" tag, both byte orders)
+#include "ascii_match.h"     // shared acabBytesContainAscii ("BWCDEVICE" tag) + acabAsciiCiContains
 #include "desert_detect.h"   // Desert mode forces classification even when toggled off
 #include <Preferences.h>     // persist the body-cam toggle across reboots (NVS)
 #include <ctype.h>
@@ -76,18 +77,8 @@ void axonRestoreEnabled(bool defaultEnabled) {
 }
 
 // ---- local helpers (same AD parsing as flock_detect, kept separate) ----
-static bool ciContains(const char* hay, const char* needle) {
-    if (!hay || !needle || !*needle) return false;
-    for (const char* p = hay; *p; p++) {
-        const char* a = p; const char* b = needle;
-        while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) { a++; b++; }
-        if (!*b) return true;
-    }
-    return false;
-}
-
-// ASCII-in-bytes matching (Axon's "BWCDEVICE" service-data tag, checked in both byte
-// orders) now lives in the shared ascii_match.h -> acabBytesContainAscii().
+// ASCII matching (the "BWCDEVICE" service-data tag in both byte orders, and the
+// case-insensitive name substring) lives in the shared ascii_match.h.
 
 struct AxAdv {
     char     name[40]; bool haveName;
@@ -159,7 +150,7 @@ bool axonClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
         any = true;
         bool hit = false;
         for (uint8_t i = 0; i < gSig.nameCount; i++)
-            if (gSig.namePatterns[i] && ciContains(f.name, gSig.namePatterns[i])) { hit = true; break; }
+            if (gSig.namePatterns[i] && acabAsciiCiContains(f.name, gSig.namePatterns[i])) { hit = true; break; }
         if (!hit) ok = false;
     }
     if (ok && gSig.usePayload && gSig.payload) {
@@ -178,7 +169,7 @@ bool axonClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
     // so it rides this same detector + toggle). The advertised name is the strong, MAC-
     // independent signal; the public OUI is the weaker fallback. Signatures (name + the
     // OUI table) live in axon_signatures.h next to their citations.
-    bool utilName = ciContains(f.name, UTIL_BWC_NAME);
+    bool utilName = acabAsciiCiContains(f.name, UTIL_BWC_NAME);
     bool utilOui  = false;
     if (!(mac[0] & 0x02)) {   // skip locally-administered / random MACs (no real OUI)
         for (size_t i = 0; i < UTIL_BWC_OUI_COUNT && !utilOui; i++)
