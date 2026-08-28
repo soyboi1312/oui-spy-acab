@@ -12,7 +12,10 @@ import SwiftUI
 //   w_connected  (Bool)   - whether a beacon board is currently linked
 //   w_c_<CAT>    (Int)    - today's count per category, one key per WidgetCategory case
 //                           (w_c_ALPR, w_c_DRONE, w_c_BODY, w_c_TRACKER, w_c_GLASSES, w_c_CAMERA).
-//                           Today-scoped like w_countToday and gated the same way, so they SUM to it.
+//                           Today-scoped and gated like w_countToday, so no key can exceed it;
+//                           rows with no strip glyph (nearby device, watched, unknown) count in
+//                           w_countToday but in no w_c_ key, so the cells may sum to LESS - see
+//                           the MediumView comment below and writeWidgetSummary in BLEManager.
 // The app calls WidgetCenter.shared.reloadAllTimelines() whenever it writes, so the
 // glance updates promptly on change; the 15-minute timeline policy below is only a
 // backstop so relative time and link state cannot drift too far while the app is idle.
@@ -271,7 +274,7 @@ private extension WidgetCategory {
 /// Today's breakdown as a single compact row: glyph + count per category, non-zero only.
 ///
 /// A ROW, not a list. Medium is short and already carries the header, the count, the link state and
-/// the last-hit line, so six stacked rows would not fit. Six four-character cells do. Empty
+/// the last-hit line, so six stacked rows would not fit. Six glyph-and-count cells do. Empty
 /// categories are dropped rather than shown as zeroes, so a quiet day just collapses the strip and
 /// the layout gives the space back to whatever is above it.
 private struct CategoryStrip: View {
@@ -313,8 +316,13 @@ private struct MediumView: View {
                 }
             }
             // Sits directly under the headline number because it is a breakdown OF that number:
-            // both are today-scoped and both skip rows whose time we cannot establish, so the
-            // categories always sum to the count above rather than disagreeing with it.
+            // both are today-scoped and both skip rows whose time we cannot establish, so no
+            // category cell can ever exceed the count above it. It is a breakdown of the PART of
+            // that total the widget has a glyph for, though, not a partition of it: rows with no
+            // strip cell (nearby device, watched, unknown) are counted in the headline and drawn
+            // nowhere here, so the cells can sum to LESS. That is the deliberate rule on both
+            // platforms - see writeWidgetSummary in BLEManager and its Android twin - and it reads
+            // as "412 today, 3 of them ALPR", never as a lost count.
             if entry.hasCategories { CategoryStrip(items: entry.categories) }
             Spacer(minLength: 0)
             LastHitLine(entry: entry, compact: false)

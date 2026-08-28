@@ -23,10 +23,6 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
 
     var id: Int { rawValue }
 
-    /// Key into the SHARED faq-content.json `relatedHelp` map. That file is byte-identical on both
-    /// platforms, so its keys are the Android enum's SCREAMING_CASE names and iOS maps onto them
-    /// here rather than the JSON carrying two spellings of every category. A type with no entry
-    /// simply has no RELATED HELP panel, which is the intended state for several of them.
     /// Key into `faq-content.json`'s `relatedHelp` map. Matches the Android enum's SCREAMING_CASE
     /// names, because the JSON is shared and Android keys off `name` directly.
     ///
@@ -113,16 +109,30 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
         }
     }
 
-    /// Whether the drive-mode surfaces speak this bucket: the six counters plus a starred
-    /// device (a star pinging the drive surface is the point of starring).
+    /// Whether the drive-mode surfaces speak this bucket: the six counters, and only those.
     ///
     /// .networkCamera joined 2026-07-31. It was excluded while the Live Activity had a fixed five
     /// columns, because letting it set the "last ..." line would have named a category with no
     /// tile. Now that the columns follow the board's toggles it gets a tile exactly when the
     /// opt-in is on, so the reason is gone. LEAVING IT OUT WAS AN ACTIVE BUG for one revision:
     /// the same change started folding cameras into DetectionState.total, and the widget gates
-    /// its footer on total > 0 while only onDriveSurface writes lastLiveKind, so a camera-only
-    /// drive rendered "last <blank> 2h ago" with an age measured from app launch.
+    /// its footer on total > 0 while (in that revision) ingestDetection wrote lastLiveKind gated
+    /// on onDriveSurface, so a camera-only drive rendered "last <blank> 2h ago" with an age
+    /// measured from app launch. Today recomputeLiveCounts writes lastLiveKind, gated on
+    /// widgetCategoryKey plus the board-enabled set; onDriveSurface only decides whether a
+    /// first sighting escalates an immediate Live Activity push.
+    ///
+    /// .watched LEFT on 2026-08-26. It used to be here on the reasoning that a star pinging the
+    /// drive surface is the point of starring, but nothing downstream ever honored that: a starred
+    /// row has no widgetCategoryKey, so recomputeLiveCounts skips it before any bucket or
+    /// lastLiveKind, and Android's DRIVE_CATS has no "WATCHED" either. Saying true here bought one
+    /// live cost and no benefit - a first-ever starred device forced an escalated push carrying a
+    /// ContentState that had not changed, spending the escalateMinGap budget a genuine ALPR or
+    /// body-cam hit arriving in the next 1.5 s then had to wait out. A star is not silent: the
+    /// firmware gives ACAB_WATCHED its own tone and DetectionNotifier lists it as a push category.
+    /// Giving it a real column instead would mean inventing a label for a user-defined bucket on a
+    /// surface whose columns are board toggles, which is the decision widgetCategoryKey already
+    /// took the other way.
     ///
     /// Desert-mode .nearbyDevice still fills no tile and would make "last ..." meaningless.
     /// Mirrors Android DeviceType.onDriveSurface. The home widget is separate state and keeps
@@ -130,9 +140,9 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
     var onDriveSurface: Bool {
         switch self {
         case .flockCamera, .flockRaven, .drone, .axonBodyCam, .tracker,
-             .recordingGlasses, .watched, .networkCamera:
+             .recordingGlasses, .networkCamera:
             return true
-        case .nearbyDevice, .unknown:
+        case .nearbyDevice, .watched, .unknown:
             return false
         }
     }
@@ -160,9 +170,6 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
         default:                        return nil
         }
     }
-
-    /// Drones move and broadcast their own position; everything else is a fixed install.
-    var isMobile: Bool { self == .drone }
 
     /// Not field-verified yet - the UI flags these specially. Glasses is the last one:
     /// body cam graduated on 2026-07-19 when the Axon "BWCDEVICE" service-data tag

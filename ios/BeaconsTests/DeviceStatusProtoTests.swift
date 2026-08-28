@@ -8,7 +8,7 @@ import XCTest
 /// every existing user on the day this ships. A fixture rather than a code read, because the
 /// failure is silent and lands on people who did nothing wrong.
 ///
-/// The three JSON strings are shared verbatim with the Android DeviceStatusProtoTest.
+/// The JSON fixture strings are shared verbatim with the Android DeviceStatusProtoTest.
 final class DeviceStatusProtoTests: XCTestCase {
 
     private func status(_ json: String) throws -> DeviceStatus {
@@ -49,9 +49,72 @@ final class DeviceStatusProtoTests: XCTestCase {
         XCTAssertEqual(s.firmware, "x")
     }
 
-    /// Both platforms must agree on the supported version, or one will warn where the other does not.
-    func testSupportedVersionMatchesTheAndroidConstant() {
+    func testBufferHealthFieldsDefaultOffOnEveryFreshStatus() throws {
+        let s = try status(#"{"fw":"x","buf":9,"bufon":true}"#)
+        XCTAssertFalse(s.bufferSaturated)
+        XCTAssertEqual(s.bufferFaults, 0)
+        XCTAssertFalse(s.bufferKeyMismatch)
+        XCTAssertEqual(s.bufferHealthNotices, [])
+    }
+
+    func testKeyMismatchPreservesHistoryAndBecomesAPersistentTransferWarning() throws {
+        let s = try status(#"{"fw":"x","buf":9,"keymis":true}"#)
+        XCTAssertTrue(s.bufferKeyMismatch)
+        XCTAssertEqual(s.bufferHealthNotices, [.keyNotAccepted])
+        XCTAssertEqual(
+            s.bufferHealthNotices[0].detail,
+            "This phone’s buffer key was not accepted. Existing history was preserved and was not replayed. Sync with the originating phone, or explicitly clear the board buffer to transfer."
+        )
+        XCTAssertTrue(s.bufferHealthNotices[0].critical)
+    }
+
+    func testBufferFaultsAndSaturationBecomeOrderedUserVisibleWarnings() throws {
+        // WRITE (0x04) and CRYPTO (0x40) make evidence incomplete; NVS (0x20) is historical.
+        let s = try status(#"{"fw":"x","bufsat":true,"buferr":100}"#)
+        XCTAssertTrue(s.bufferSaturated)
+        XCTAssertEqual(s.bufferFaults, 100)
+        XCTAssertEqual(s.bufferHealthNotices,
+                       [.storageFailed, .capacityReached, .persistenceErrorRecorded])
+        XCTAssertTrue(s.bufferHealthNotices[0].detail.contains("storage or encryption failure"))
+        XCTAssertTrue(s.bufferHealthNotices[0].detail.contains("may be missing or unavailable"))
+        XCTAssertTrue(s.bufferHealthNotices[1].detail.contains("may be missing"))
+        XCTAssertTrue(s.bufferHealthNotices[2].detail.contains("metadata save/load error"))
+        XCTAssertTrue(s.bufferHealthNotices[2].detail.contains("may already reflect a successful retry"))
+        XCTAssertTrue(s.bufferHealthNotices[2].detail.contains("replay timestamps"))
+        XCTAssertTrue(s.bufferHealthNotices[2].detail.contains("Clear the board buffer"))
+    }
+
+    func testNVSRetryAloneIsNotMislabeledAsRawStorageFailure() throws {
+        let s = try status(#"{"fw":"x","buferr":32}"#)
+        XCTAssertEqual(s.bufferHealthNotices, [.persistenceErrorRecorded])
+    }
+
+    func testFutureUInt32HighFaultBitRemainsFailClosed() throws {
+        let s = try status(#"{"fw":"x","buferr":2147483648}"#)
+        XCTAssertEqual(s.bufferFaults, 0x8000_0000)
+        XCTAssertEqual(s.bufferHealthNotices, [.storageFailed])
+    }
+
+    /// A ONE-SIDED pin, and the name now says so. It compares the iOS constant to a literal, so it
+    /// cannot see an Android or firmware bump. It was called
+    /// testSupportedVersionMatchesTheAndroidConstant, which promised a comparison nothing in the
+    /// body performs.
+    ///
+    /// It still earns its place in the direction it does cover. The contract version has three
+    /// copies - ACAB_BLE_PROTO_VERSION (firmware/lib/acab_core/acab_ble_service.h),
+    /// SUPPORTED_PROTO_VERSION (android .../model/Models.kt) and this one - and moving the iOS copy
+    /// alone fails right here, so nobody moves it without reading the other two off the message.
+    ///
+    /// The reverse direction is an admitted gap: bump the other two and nothing in the repo fails.
+    /// check-signature-drift.py does not look at `proto`, and Android's DeviceStatusProtoTest has
+    /// no equivalent pin. Left as a gap on purpose, because that direction is fail-SAFE -
+    /// needsNewerApp is `protoVersion > supported` on both platforms, so the app that lagged
+    /// over-warns instead of silently misparsing a newer board - and closing it from here would
+    /// mean reading Kotlin and C off the filesystem from a suite that is otherwise hermetic.
+    func testSupportedVersionIsPinnedSoABumpMustBeDeliberate() {
         XCTAssertEqual(DeviceStatus.supportedProtoVersion, 2,
-                       "must equal DeviceStatus.SUPPORTED_PROTO_VERSION in Android Models.kt")
+                       "bumping this means bumping ACAB_BLE_PROTO_VERSION in "
+                       + "firmware/lib/acab_core/acab_ble_service.h and SUPPORTED_PROTO_VERSION in "
+                       + "android/app/src/main/java/tech/acab/app/model/Models.kt in the same change")
     }
 }

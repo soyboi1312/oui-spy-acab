@@ -27,4 +27,9 @@ final class DriveModeStateTests: XCTestCase {
         DriveModeState.setWanted(false, in: defaults)
         XCTAssertFalse(DriveModeState.wanted(in: defaults))
     }
+
+    func testOnlySwipeDismissalInfersExplicitOff() {
+        XCTAssertTrue(shouldPreserveLiveModeIntent(after: .ended))
+        XCTAssertFalse(shouldPreserveLiveModeIntent(after: .dismissed))
+    }
 }

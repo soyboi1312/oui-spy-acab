@@ -196,9 +196,172 @@ internal fun configureOsmdroid(context: Context) {
  *  trackers, consumer glasses, network cams) collapse into grid bubbles so a dense area
  *  can't spray hundreds of individual pins; fixed surveillance infrastructure (Flock ALPR,
  *  Raven, body cam) and drones always pin individually. */
-private fun clusterable(d: Detection): Boolean =
-    d.type == DeviceType.NEARBY_DEVICE || d.type == DeviceType.TRACKER ||
-        d.type == DeviceType.GLASSES || d.type == DeviceType.NETWORK_CAMERA
+internal fun clusterable(type: DeviceType): Boolean =
+    type == DeviceType.NEARBY_DEVICE || type == DeviceType.TRACKER ||
+        type == DeviceType.GLASSES || type == DeviceType.NETWORK_CAMERA
+
+// ---------------------------------------------------------------------------------------------
+// SAME-COORDINATE PIN GROUPING
+//
+// Everything heard from one standing position is stamped with the same phone fix, so the
+// individually-pinned rows land on top of each other exactly. osmdroid draws overlays in list
+// order and hit-tests topmost-first, so the LAST marker added won every tap; the feed is
+// newest-first, so the last one added was the OLDEST sighting. One pin per spot settles the
+// draw order, the tap and the missing count cue at once.
+//
+// EVERY individually-pinned type takes part, drones included: the set is exactly the rows that
+// do not grid-cluster, so the filter is !clusterable(type) and there is no second list to keep in
+// step. A drone PIN anchors nothing. Its flight path, operator tether, launch glyph, no-GPS ring
+// and operator marker are each emitted by a pass over `droneRows` in the update block below, and
+// none of those passes asks whether that row's pin won its group, so an absorbed drone keeps
+// every piece of its artwork. What grouping buys the drone is reachability: at a shared spot only
+// one pin can be on top and the covered one takes no taps at all, whereas a grouped member is
+// reachable through the badged pin's member sheet. A drone alone at its coordinate is a group of
+// one and renders exactly as it did before. This rule is shared with iOS.
+// ---------------------------------------------------------------------------------------------
+
+/** How close two pins have to be before they are the same spot. 1e-5 degrees is about 1.1 m of
+ *  latitude, which is below any GPS fix's own error, so nothing this merges was ever separable.
+ *
+ *  THE SHARED NUMBER: iOS groups on the same tolerance and both suites assert it.
+ *
+ *  THE RULE, stated exactly so both platforms group identically: each coordinate is floored onto
+ *  a grid of this size and rows sharing a cell are one group. Rows carrying the IDENTICAL
+ *  coordinate, which is the case this exists for, always land in the same cell. Two rows a
+ *  fraction of a cell apart but straddling a cell edge do not group, and that is accepted: the
+ *  tolerance is slack for float drift, not a clustering radius. */
+internal const val PIN_GROUP_EPSILON_DEG = 1e-5
+
+/** Which member of a same-spot group draws its pin, lowest first. A body cam must never end up
+ *  hidden under an older, less important sighting, so the order is by what the user came here to
+ *  see: their own watchlist hit first, then the fixed surveillance kinds in the order the app
+ *  lists them everywhere else, then anything left over. Shared with iOS.
+ *
+ *  DRONE ranks here and reaches the grouper like every other individually-pinned type, so this
+ *  rank decides real leads: a body cam sharing a drone's spot draws the pin, and the drone is a
+ *  member of that pin's sheet. The table is also the cross-platform contract and both suites
+ *  assert it, so a type quietly dropping out of one copy is exactly the drift this pairing exists
+ *  to catch. */
+internal fun infraPinPriority(type: DeviceType): Int = when (type) {
+    DeviceType.WATCHED -> 0
+    DeviceType.FLOCK_CAMERA -> 1
+    DeviceType.FLOCK_RAVEN -> 2
+    DeviceType.BODY_CAM -> 3
+    DeviceType.DRONE -> 4
+    else -> 5
+}
+
+/** Detections sharing one spot, collapsed into the single pin that will be drawn for them. */
+internal data class PinGroup(
+    val lat: Double,
+    val lon: Double,
+    /** Highest priority first ([infraPinPriority]), ties broken most-recently-seen first. */
+    val members: List<Detection>,
+) {
+    /** The member whose pin actually draws, and whose detail opens for a group of one. */
+    val lead: Detection get() = members.first()
+}
+
+/**
+ * Group individually-pinned detections by spot (see [PIN_GROUP_EPSILON_DEG]).
+ *
+ * A group of ONE keeps its member's own coordinate untouched, so a lone pin renders exactly where
+ * it renders today. A group of several takes the lead's coordinate rather than an average of the
+ * members', for the same reason: the members are the same spot by construction, and averaging
+ * would move the pin off the position the lead was actually stamped with.
+ *
+ * [lastSeenOf] resolves the tie between two members of equal priority. Resolved ONCE per member
+ * before the sort, not from inside the comparator, because the caller reads those stamps behind
+ * the detection store's lock. A member with no usable stamp sorts last inside its priority band:
+ * an undated row never outranks one we can actually date. Ties all the way down keep the caller's
+ * order, which is the feed's newest-first.
+ */
+internal fun groupPinsBySpot(
+    items: List<Detection>,
+    coordOf: (Detection) -> Pair<Double, Double>?,
+    lastSeenOf: (Detection) -> Long?,
+): List<PinGroup> {
+    if (items.isEmpty()) return emptyList()
+    class Entry(val d: Detection, val lat: Double, val lon: Double, val seen: Long)
+    val buckets = LinkedHashMap<Long, MutableList<Entry>>()
+    for (d in items) {
+        val (lat, lon) = coordOf(d) ?: continue
+        val gx = Math.floor(lon / PIN_GROUP_EPSILON_DEG).toLong()
+        val gy = Math.floor(lat / PIN_GROUP_EPSILON_DEG).toLong()
+        val key = (gx shl 32) xor (gy and 0xFFFFFFFFL)
+        buckets.getOrPut(key) { mutableListOf() }
+            .add(Entry(d, lat, lon, lastSeenOf(d) ?: Long.MIN_VALUE))
+    }
+    return buckets.values.map { bucket ->
+        // A single-member bucket is the overwhelmingly common case; skip the sort for it entirely.
+        val ordered = if (bucket.size == 1) bucket else bucket.sortedWith(
+            compareBy<Entry> { infraPinPriority(it.d.type) }.thenByDescending { it.seen })
+        val lead = ordered.first()
+        PinGroup(lead.lat, lead.lon, ordered.map { it.d })
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// PIN RECENCY
+//
+// A persisted pin from yesterday used to look exactly like a live hit. Three tiers, shared with
+// iOS, decide how a pin presents. Presentation ONLY: the log's and Status's own recency rules,
+// and the freeze-at-Stop behaviour, are untouched by any of this.
+// ---------------------------------------------------------------------------------------------
+
+/** How recently a pin's row was heard, which is all the map uses it for.
+ *
+ *  FRESH  full colour, and the platform's ping may run if it has one.
+ *  RECENT full colour, no ping.
+ *  STALE  dimmed and desaturated, no ping. Still tappable, still full size, still its own
+ *         colour family. The tier dates a sighting; it never hides one.
+ *
+ *  Android draws the pin's pulse frozen into the bitmap rather than animating it, so there is no
+ *  ping here to gate and FRESH and RECENT reach identical artwork on this platform. The three
+ *  tiers are still the shared rule: the boundary that changes pixels on Android is the stale one. */
+internal enum class PinAge { FRESH, RECENT, STALE }
+
+/** Under this, a sighting is live enough to animate. THE SHARED NUMBER: iOS uses the same. */
+internal const val PIN_FRESH_MAX_MS = 5 * 60_000L
+
+/** Past this, a sighting is dimmed. THE SHARED NUMBER: iOS uses the same. */
+internal const val PIN_RECENT_MAX_MS = 60 * 60_000L
+
+/**
+ * The tier for a pin whose row was last heard at [lastSeenMs], against wall clock [now].
+ *
+ * No stamp, or a zero one, answers RECENT. Never FRESH: an unknown time is not evidence of
+ * liveness, and dressing one up as a live hit is the exact thing this whole signal exists to
+ * stop. Never STALE either, because we have not established that it is old.
+ *
+ * A stamp AHEAD of [now] answers FRESH, matching the one-sided rule the detection store already
+ * uses for staleness: a backward wall-clock step (an NTP correction) must not age live pins.
+ */
+internal fun pinAge(lastSeenMs: Long?, now: Long): PinAge = when {
+    lastSeenMs == null || lastSeenMs <= 0L -> PinAge.RECENT
+    now - lastSeenMs < PIN_FRESH_MAX_MS -> PinAge.FRESH
+    now - lastSeenMs <= PIN_RECENT_MAX_MS -> PinAge.RECENT
+    else -> PinAge.STALE
+}
+
+/**
+ * The text a detection marker carries: the category its artwork is drawing, and how many rows it
+ * stands for when it leads a same-spot group.
+ *
+ * NOT A USER-FACING CUE ON THIS PLATFORM, and nothing may be routed through it. osmdroid uses
+ * Marker.title for one thing, its default title InfoWindow, and every detection marker consumes
+ * its own tap (the click listener returns true), so that window never opens; osmdroid also draws
+ * markers as overlays on ONE opaque surface and publishes no per-marker accessibility node, so no
+ * screen reader reads this either. A previous round appended a "not heard in the last hour"
+ * sentence here for the STALE tier and it reached nobody.
+ *
+ * The cues that DO reach the user: the group count is the badge composited into the pin bitmap
+ * (PinBadgeFactory), the recency tier is the dimmed artwork, the screen-reader companion for the
+ * whole map is the LIST chip's sheet, and a pin's age IN WORDS is in the dossier the tap opens,
+ * whose "Last seen" row prints it via relativeAgo (DetailScreen.kt).
+ */
+internal fun pinTitle(category: String, groupSize: Int): String =
+    if (groupSize <= 1) category else "$groupSize detections here, showing $category"
 
 /** Rough RSSI -> distance (metres) for a no-GPS proximity ring. Uses a log-distance
  *  path-loss model, a ballpark, not a real measurement. */
@@ -224,6 +387,14 @@ private val MapCameraSaver = androidx.compose.runtime.saveable.listSaver<MapCame
             if (l.size == 4) { has = true; lat = l[0]; lon = l[1]; zoom = l[2]; follow = l[3] == 1.0 }
         }
     },
+)
+
+/** The rows the map can draw at all, plus the valid map coordinate each of them resolved to,
+ *  keyed by row id. Resolving one takes the detection store's lock, so the pass that already
+ *  pays for it hands the answer to every later pass in the same publish. */
+private class LocatedRows(
+    val rows: List<Detection>,
+    val coords: Map<String, Pair<Double, Double>>,
 )
 
 /** A group of nearby detections collapsed into one map bubble. */
@@ -336,7 +507,7 @@ fun MapScreen(
     // The LAYERS sheet (known-ALPR dataset toggle lives there; it is a layer, not a filter).
     var layersOpen by remember { mutableStateOf(false) }
     // Map settings "gear" menu. Two toggles persisted in SharedPreferences (same mechanism as
-    // the ALPR opt-in) so they survive relaunch: breadcrumb trails default ON, icon labels OFF.
+    // the ALPR layer toggle) so they survive relaunch: breadcrumb trails default ON, icon labels OFF.
     val mapPrefs = remember { context.getSharedPreferences("acab.map", Context.MODE_PRIVATE) }
     var showBreadcrumbs by remember { mutableStateOf(mapPrefs.getBoolean("show_breadcrumbs", true)) }
     var showLabels by remember { mutableStateOf(mapPrefs.getBoolean("show_labels", false)) }
@@ -358,12 +529,20 @@ fun MapScreen(
     val viewportRefresh = remember { arrayOfNulls<Runnable>(1) }
     val markers = rememberCategoryMarkers()   // category pins, built once
     val labeledMarkers = rememberLabeledCategoryMarkers(markers)   // + under-icon type tag, for showLabels
+    // STALE-tier twins of both sets. Built alongside the full-colour ones and remembered the same
+    // way, so switching a pin's tier is a map lookup on the rebuild path and never a redraw.
+    val dimMarkers = rememberDimCategoryMarkers()
+    val labeledDimMarkers = rememberLabeledCategoryMarkers(dimMarkers)
+    val pinArt = remember(markers, labeledMarkers, dimMarkers, labeledDimMarkers) {
+        MapPinArt(markers, dimMarkers, labeledMarkers, labeledDimMarkers)
+    }
+    val pinBadges = rememberPinBadgeFactory()
     val operatorMarker = rememberOperatorMarker()
     val launchMarker = rememberLaunchMarker()   // small distinct glyph for a drone track's start
 
     val clusterFactory = rememberClusterMarkerFactory()
 
-    // known-ALPR reference layer (opt-in, OSM/DeFlock), managed as its own overlay
+    // known-ALPR reference layer (ON by default, user-toggleable, OSM/DeFlock), managed as its own overlay
     val alpr = remember { AlprStore.getInstance(context) }
     val alprEnabled by alpr.enabled.collectAsState()
     val alprNodes by alpr.nodes.collectAsState()
@@ -373,17 +552,49 @@ fun MapScreen(
     val alprShowUnverified by alpr.showUnverified.collectAsState()
     val alprUnverifiedCount by alpr.unverifiedCount.collectAsState()
     // rawTier is published before alprNodes, so the nodes flow is the recomposition trigger and
-    // these counts always describe the same parsed dataset.
-    val alprTier0Count = alpr.rawTier.count { it == 0 }
-    val alprTier1Count = alpr.rawTier.count { it == 1 }
-    val alprTier2Count = alpr.rawTier.count { it == 2 }
-    val alprLegacyFormatCount = alpr.rawTier.count { it == ALPR_TIER_LEGACY_FORMAT }
-    val alprOtherTierCount = alpr.rawTier.count {
-        it != 0 && it != 1 && it != 2 && it != ALPR_TIER_LEGACY_FORMAT
+    // these counts always describe the same parsed dataset - which is why it is also the memo
+    // key. rawTier holds one entry per mapped node and is not Compose state, so unmemoised these
+    // scans re-ran on every recomposition of the whole screen, i.e. with the detection feed, for
+    // a legend that rests collapsed. The same hazard AlprDataset already solved for
+    // unverifiedCount by publishing it as a flow. One grouped pass here, rather than one scan
+    // per tier.
+    val alprTierCounts = remember(alprNodes) {
+        val tally = IntArray(5)
+        for (t in alpr.rawTier) {
+            when (t) {
+                0 -> tally[0]++
+                1 -> tally[1]++
+                2 -> tally[2]++
+                ALPR_TIER_LEGACY_FORMAT -> tally[3]++
+                else -> tally[4]++
+            }
+        }
+        tally
     }
+    val alprTier0Count = alprTierCounts[0]
+    val alprTier1Count = alprTierCounts[1]
+    val alprTier2Count = alprTierCounts[2]
+    val alprLegacyFormatCount = alprTierCounts[3]
+    val alprOtherTierCount = alprTierCounts[4]
     val alprMarker = rememberAlprMarker()
     val alprMarkerUnverified = rememberAlprMarker(confirmed = false)
+    // RING-PEEK: the wide variants, drawn for a mapped camera that a live detection pin is
+    // standing on. Each is remembered per density, so the bundle's identity is stable and the
+    // layer's update early-out still holds.
+    val alprMarkerPeek = rememberAlprMarker(peek = true)
+    val alprMarkerUnverifiedPeek = rememberAlprMarker(confirmed = false, peek = true)
+    val alprIcons = remember(alprMarker, alprMarkerUnverified, alprMarkerPeek,
+                            alprMarkerUnverifiedPeek) {
+        AlprRingIcons(alprMarker, alprMarkerUnverified, alprMarkerPeek, alprMarkerUnverifiedPeek)
+    }
     val alprHolder = remember { AlprOverlayHolder() }
+    // How many rings are drawing wide right now, so the legend explains that size only while one
+    // is on screen. Pushed from the layer's cull pass, and only when the number changes.
+    var alprPeekCount by remember { mutableIntStateOf(0) }
+    // Coordinates of the detection pins the last marker rebuild drew (interleaved lat/lon), handed
+    // to the ALPR layer for the peek test. Held in a plain array holder, not Compose state: this is
+    // an output of the update pass, and writing state from there would schedule another one.
+    val peekPins = remember { arrayOf(DoubleArray(0)) }
     // "Too far out for ALPR pins", hoisted so the hint can react to zoom (osmdroid won't
     // recompose). A Boolean written only when it flips, so a pan/zoom gesture's stream of
     // events can't recompose the screen (and re-run the marker rebuild) per event.
@@ -399,12 +610,33 @@ fun MapScreen(
     // One pass per publish, not per recomposition: mapCoord takes storeLock per row, so the
     // up-to-FEED_CAP filter must not re-run for every chip tap or legend toggle. Counts are a
     // single grouped pass instead of one O(n) scan per category chip.
-    val located = remember(detections) {
-        detections.filter { d ->
+    //
+    // The pass also KEEPS the coordinate it resolved, keyed by row id, so every later pass in the
+    // update lambda below reads it instead of asking mapCoord again per row: the viewport cull,
+    // the drone no-GPS RSSI ring, groupPinsBySpot's coordOf, and clusterDetections' bucketing.
+    // That matters because mapCoord falls through to the detection store's lock for every row
+    // without its own broadcast coordinates - nearly the whole log - and that is the same lock
+    // the BLE thread holds while filing a detection, so the redundant lookups contended with
+    // ingest during exactly the dense moments a drive test cares about. Freshness holds: this memo
+    // re-runs on every publish that moves the feed, and a row whose coordinate only just arrived
+    // does not pass the filter below until that same publish either. It also makes the four passes
+    // AGREE - a closest-approach coordinate migration used to land in the cull one publish before
+    // the pin that drew from it, which could briefly place a pin outside the box that let it in.
+    val locatedRows = remember(detections) {
+        // Sized for the pass up front: the feed is capped, and growing a map this pass fills
+        // once per publish would rehash it several times for nothing.
+        val coords = HashMap<String, Pair<Double, Double>>(detections.size)
+        val rows = detections.filter { d ->
             val c = ble.mapCoord(d)
+            // Only VALID pairs are kept, so a reader downstream can take a present entry at face
+            // value; an out-of-range one is exactly what mapRepresentationCoord already refuses.
+            if (c != null && validCoord(c.first, c.second)) coords[d.id] = c
             hasMapRepresentation(d.type, c, d.pilotLat, d.pilotLon)
         }
+        LocatedRows(rows, coords)
     }
+    val located = locatedRows.rows
+    val mapCoords = locatedRows.coords
     val shown = remember(located, filter) {
         filter?.let { f -> located.filter { it.type.category == f } } ?: located
     }
@@ -492,6 +724,10 @@ fun MapScreen(
                     overlays.add(self)
                     myLocation.value = self
                     alprHolder.attach(this)   // known-ALPR folder overlay + pan/zoom re-cull
+                    // Only fires when the count changes, so a pan that leaves the number alone
+                    // costs no recomposition; the pass it recomposes into early-outs of both the
+                    // marker rebuild and the ALPR update, so this cannot feed itself.
+                    alprHolder.onPeekCount = { alprPeekCount = it }
                     // mirror the zoom floor into Compose state so the ALPR hint stays live;
                     // write only on a flip so gestures don't recompose per event. The camera
                     // memory rides the same listener: plain field writes, zero recompositions.
@@ -519,29 +755,49 @@ fun MapScreen(
                 // AND-PERF-1: cull to the current viewport (mirrors MapAlpr.rebuild) and cap the
                 // count, so panning over a big log doesn't rebuild thousands of overlays each frame.
                 // A detection stays if its own pin OR its operator pin falls inside the box.
+                //
+                // The cap is on ROWS taken, and it is taken here, from the mixed newest-first set,
+                // BEFORE anything splits infrastructure from the clusterable mass. Same-spot pin
+                // grouping happens further down and only reduces how many MARKERS those surviving
+                // rows produce, so it does not widen this cap and does not change which rows an
+                // ambient-noise flood evicts. Cap policy is deliberately left exactly as it was.
                 val box = map.boundingBox
                 fun inBox(lat: Double, lon: Double) =
                     lat in box.latSouth..box.latNorth && lon in box.lonWest..box.lonEast
+                // One crumb read per tracker per PASS. crumbs() copies the whole trail under the
+                // detection store's lock, and the trail pass further down wants the same list, so
+                // the two share one read instead of copying it twice on a rebuild.
+                val trails = HashMap<String, List<Pair<Double, Double>>>()
+                fun trail(id: String): List<Pair<Double, Double>> =
+                    trails.getOrPut(id) { ble.crumbs(id) }
+                // Which of the scanned rows are actually INSIDE the box, collected as the cull
+                // walks them so the in-view set below reads the answer instead of re-deciding it.
+                val inBoxIds = HashSet<String>()
                 val visible = shown.asSequence().filter { d ->
+                    // The coordinate comes from `located`'s pass, so this is pure arithmetic and
+                    // takes no lock (see mapCoords above).
+                    val c = mapCoords[d.id]
+                    val pla = d.pilotLat; val plo = d.pilotLon
+                    val onScreen = (c != null && inBox(c.first, c.second)) ||
+                        (d.type == DeviceType.DRONE && pla != null && plo != null &&
+                            validCoord(pla, plo) && inBox(pla, plo))
+                    if (onScreen) {
+                        inBoxIds.add(d.id)
+                        return@filter true
+                    }
                     // Drones and trailed trackers are exempt from the box cull (mirrors iOS):
                     // a flight path or breadcrumb trail can cross the viewport while the pin
-                    // itself sits outside it, and both sets are tiny.
+                    // itself sits outside it, and both sets are tiny. Asked only AFTER the box
+                    // test now, so a tracker already on screen needs no trail read to survive.
                     if (d.type == DeviceType.DRONE) return@filter true
                     if (showBreadcrumbs && d.type == DeviceType.TRACKER &&
-                        ble.crumbs(d.id).size >= 2) return@filter true
-                    val c = ble.mapCoord(d)
-                    val pla = d.pilotLat; val plo = d.pilotLon
-                    (c != null && validCoord(c.first, c.second) && inBox(c.first, c.second)) ||
-                        (d.type == DeviceType.DRONE && pla != null && plo != null &&
-                            validCoord(pla, plo) && inBox(pla, plo))
+                        trail(d.id).size >= 2) return@filter true
+                    false
                 }.take(MAP_MARKER_CAP).toList()
-                val inViewport = visible.filter { d ->
-                    val c = ble.mapCoord(d)
-                    val pla = d.pilotLat; val plo = d.pilotLon
-                    (c != null && validCoord(c.first, c.second) && inBox(c.first, c.second)) ||
-                        (d.type == DeviceType.DRONE && pla != null && plo != null &&
-                            validCoord(pla, plo) && inBox(pla, plo))
-                }.map { it.id }
+                // The two exemptions above are deliberately stripped back out here: the in-view
+                // chip and its sheet speak for what is in the box, not for the off-screen rows
+                // kept only so their path or trail can cross it.
+                val inViewport = visible.mapNotNull { d -> d.id.takeIf { it in inBoxIds } }
                 if (inViewport != visibleDetectionIds) visibleDetectionIds = inViewport
                 // AND-PERF-3: skip the teardown/realloc when visible membership and the zoom
                 // bucket are unchanged since the last pass. Membership alone is NOT enough
@@ -563,8 +819,42 @@ fun MapScreen(
                     // in ONE addAll instead of copying the backing array per marker.
                     map.overlays.removeAll { it is Marker || it is Polyline || it is Polygon }
                     val fresh = ArrayList<Overlay>()
+                    // RING-PEEK: every PIN this pass draws, interleaved lat/lon. Count bubbles are
+                    // deliberately absent - a bubble already says "several things here", and
+                    // widening a ring under one would claim the mapped camera for whichever member
+                    // happened to land in the cell. Sized for the worst case (every visible row a
+                    // pin) so the collect never reallocates; same-spot grouping only ever draws
+                    // fewer pins than rows, and its members shared a coordinate anyway, so the set
+                    // of PLACES a ring can be asked about is exactly what it was before grouping.
+                    val pinPts = DoubleArray(visible.size * 2)
+                    var pinN = 0
+                    // One last-seen read per visible row, taken once for the whole pass. Both new
+                    // pin rules want it (a same-spot group breaks its priority ties on it, and
+                    // every pin takes its recency tier from it) and lastSeen() takes the detection
+                    // store's lock on each call, so reading it per use would take that lock
+                    // several times for the same row. Inside the rebuild gate deliberately: it is
+                    // part of building markers, not something the ~3 Hz feed pays for.
+                    //
+                    // A pseudo-stamp from the board's buffered replay is an ordering key, not a
+                    // clock reading, so it is dropped here and the row is left undated. pinAge
+                    // answers RECENT for that, which is the honest tier for a time we do not know.
+                    val seenAt = HashMap<String, Long>(visible.size)
+                    for (d in visible) {
+                        val ls = ble.lastSeen(d.id)
+                        if (ls != null && !ble.isApproxTime(ls)) seenAt[d.id] = ls
+                    }
+                    val nowMs = System.currentTimeMillis()
+                    fun ageOf(d: Detection): PinAge = pinAge(seenAt[d.id], nowMs)
+                    // The drone rows, split out ONCE and read by the two DRONE OVERLAY passes:
+                    // the flight-path / tether / launch-glyph / no-GPS-ring pass immediately
+                    // below, and the operator-marker pass further down. THE INVARIANT: both walk
+                    // EVERY drone row, whatever same-spot grouping did with that row's pin, so an
+                    // absorbed drone never loses its path, its tether, its launch glyph or its
+                    // operator. Drone PINS come from the grouped pass with everyone else's.
+                    // One filter serves both passes; each used to re-filter `visible` for itself.
+                    val droneRows = visible.filter { it.type == DeviceType.DRONE }
                     // drone overlays, under the markers: flight path, tether, launch, no-GPS ring
-                    visible.filter { it.type == DeviceType.DRONE }.forEach { d ->
+                    droneRows.forEach { d ->
                         val path = ble.track(d.id)
                         if (path.size >= 2) {
                             fresh.add(Polyline(map).apply {
@@ -600,8 +890,9 @@ fun MapScreen(
                             })
                         }
                         if (d.lat == null) {   // no broadcast GPS: draw an RSSI ring around us
-                            ble.mapCoord(d)?.let { (lat, lon) ->
-                                if (!validCoord(lat, lon)) return@let
+                            // From the publish pass, like the cull: no storeLock, and no second
+                            // validCoord test because only valid pairs were ever stored.
+                            mapCoords[d.id]?.let { (lat, lon) ->
                                 fresh.add(Polygon(map).apply {
                                     points = Polygon.pointsAsCircle(GeoPoint(lat, lon), rssiRadiusMeters(d.rssi))
                                     fillPaint.color = Acab.droneTone.copy(alpha = 0.08f).toArgb()
@@ -617,7 +908,9 @@ fun MapScreen(
                     // Gated by the "breadcrumb trail" map setting.
                     if (showBreadcrumbs) {
                         visible.filter { it.type == DeviceType.TRACKER }.forEach { d ->
-                            val crumbs = ble.crumbs(d.id)
+                            // Whatever the cull above already read for this tracker, not a
+                            // second copy of the same trail.
+                            val crumbs = trail(d.id)
                             if (crumbs.size >= 2) {
                                 fresh.add(Polyline(map).apply {
                                     setPoints(crumbs.map { GeoPoint(it.first, it.second) })
@@ -628,34 +921,81 @@ fun MapScreen(
                             }
                         }
                     }
-                    // Fixed surveillance infrastructure (Flock ALPR, Raven, drone, body cam)
-                    // always pins individually, so a camera is never lost inside a clump. The
-                    // noisy mass (nearby devices, trackers, glasses, network cams) grid-clusters,
-                    // below, mirroring iOS. (A tracker later flagged as "following" will promote
-                    // back to an individual marker.)
-                    visible.filter { !clusterable(it) }.forEach { d ->
-                        val (lat, lon) = ble.mapCoord(d) ?: return@forEach
-                        if (!validCoord(lat, lon)) return@forEach
+                    // Fixed surveillance infrastructure (Flock ALPR, Raven, body cam), drones and
+                    // anything unclassified always pin individually, so a camera is never lost
+                    // inside a clump. The noisy mass (nearby devices, trackers, glasses, network
+                    // cams) grid-clusters, below, mirroring iOS. (A tracker later flagged as
+                    // "following" will promote back to an individual marker.)
+                    //
+                    // Individually does not mean one pin per row when several rows share a spot:
+                    // groupPinsBySpot collapses those onto the highest-priority member with a
+                    // count badge, so the stack stops swallowing taps and every member stays
+                    // reachable through the badged pin's sheet. Drones are in here with everyone
+                    // else; their overlays come from droneRows above and below and do not care
+                    // which row won. Runs inside the rebuild gate with everything else on this
+                    // path, never per arrival.
+                    val pinGroups = groupPinsBySpot(
+                        visible.filterNot { clusterable(it.type) },
+                        // Publish-pass coordinate, same as the cull: mapCoords already holds the
+                        // validCoord-filtered answer for every row that got this far.
+                        coordOf = { d -> mapCoords[d.id] },
+                        lastSeenOf = { d -> seenAt[d.id] },
+                    )
+                    for (g in pinGroups) {
+                        val d = g.lead
+                        val n = g.members.size
+                        pinPts[pinN++] = g.lat; pinPts[pinN++] = g.lon
                         fresh.add(Marker(map).apply {
-                            position = GeoPoint(lat, lon)
-                            labelMarker(d.type, showLabels, markers, labeledMarkers)
-                            title = d.type.category
-                            setOnMarkerClickListener { _, _ -> selectFresh(d); true }
+                            position = GeoPoint(g.lat, g.lon)
+                            val age = ageOf(d)
+                            pinIcon(d.type, age, showLabels, pinArt, pinBadges, n)
+                            // osmdroid's InfoWindow text, and nothing more: this marker consumes
+                            // its own tap so that window never opens, and osmdroid publishes the
+                            // map as ONE opaque surface with no per-marker accessibility node, so
+                            // the title is not a cue on Android (see pinTitle). What the user
+                            // gets instead: the badge in the pin bitmap for the count, the dimmed
+                            // artwork for the STALE tier, the LIST chip's sheet as the
+                            // screen-reader companion (every member of every group is its own
+                            // focusable row there), and, for the age in words, the dossier - which
+                            // this tap opens directly for a lone pin, and which a grouped pin
+                            // reaches one row further on, through the member sheet below.
+                            title = pinTitle(d.type.category, n)
+                            setOnMarkerClickListener { _, _ ->
+                                // One member keeps today's behaviour exactly: straight to the
+                                // dossier. Several open the member sheet, which is the only way
+                                // the ones under the lead are reachable at all.
+                                if (n == 1) {
+                                    selectFresh(d)
+                                } else {
+                                    memberSheetIsViewport = false
+                                    clusterMembers = g.members
+                                }
+                                true
+                            }
                         })
                     }
                     val clusters = clusterDetections(
-                        visible.filter { clusterable(it) },
+                        visible.filter { clusterable(it.type) },
                         map.zoomLevelDouble,
                     ) {
-                        ble.mapCoord(it)?.takeIf { (lat, lon) -> validCoord(lat, lon) }
+                        // Publish-pass coordinate again, for the same reason as the two passes
+                        // above: bucketing up to MAP_MARKER_CAP rows must not take storeLock once
+                        // per row while the BLE thread is filing detections into it.
+                        mapCoords[it.id]
                     }
                     for (c in clusters) {
                         if (c.members.size == 1) {
                             val d = c.members.first()
+                            pinPts[pinN++] = c.lat; pinPts[pinN++] = c.lon
                             fresh.add(Marker(map).apply {
                                 position = GeoPoint(c.lat, c.lon)
-                                labelMarker(d.type, showLabels, markers, labeledMarkers)
-                                title = d.type.category
+                                // A lone clusterable row draws a real pin, so it carries the
+                                // recency tier like every other pin. The BUBBLE below never
+                                // does: one tier cannot describe a whole cell's worth of rows,
+                                // and dimming a bubble would date members it does not speak for.
+                                val age = ageOf(d)
+                                pinIcon(d.type, age, showLabels, pinArt, pinBadges, 1)
+                                title = pinTitle(d.type.category, 1)
                                 setOnMarkerClickListener { _, _ -> selectFresh(d); true }
                             })
                         } else {
@@ -680,7 +1020,7 @@ fun MapScreen(
                         }
                     }
                     // drone operator pins: the muted person marker, distinct from the dots
-                    visible.filter { it.type == DeviceType.DRONE }.forEach { d ->
+                    droneRows.forEach { d ->
                         val plat = d.pilotLat; val plon = d.pilotLon
                         if (plat != null && plon != null && validCoord(plat, plon)) {
                             fresh.add(Marker(map).apply {
@@ -696,6 +1036,12 @@ fun MapScreen(
                     }
                     map.overlays.addAll(fresh)
                     map.invalidate()
+                    // Keep the PREVIOUS array whenever the pins landed in the same places. The
+                    // ALPR layer early-outs on identity, and this pass re-runs once a second even
+                    // when nothing moved (the staleness backstop), so swapping in an equal-but-new
+                    // instance would re-scan the whole node set every second for nothing.
+                    val nextPins = pinPts.copyOf(pinN)
+                    if (!nextPins.contentEquals(peekPins[0])) peekPins[0] = nextPins
                 }
                 // "open in map" jump from a dossier thumbnail: one close-in hop to the sighting,
                 // consumed exactly once so recompositions and tab revisits never re-center.
@@ -757,14 +1103,22 @@ fun MapScreen(
                         }
                     }
                 }
-                // refresh the known-ALPR layer with the latest opt-in state + dataset (the
+                // refresh the known-ALPR layer with the latest enabled state + dataset (the
                 // holder early-outs when none of those inputs changed, so this is free on the
                 // ~3 Hz path; its own debounced listener re-culls on pan/zoom)
                 // makerIdx/makerTable are read here (not collected) - they are set in the same
                 // parse as alprNodes, so an alprNodes change recomposes this and passes the match.
                 alprHolder.update(map, alprNodes, alpr.makerIdx, alpr.makerTable,
-                                  alpr.confirmed, alpr.rawTier, alprMarkerUnverified, alprEnabled,
-                                  alprShowUnverified, alprMarker)
+                                  alpr.confirmed, alpr.rawTier, alprIcons, alprEnabled,
+                                  alprShowUnverified)
+                // RING-PEEK, as its OWN call rather than an input to the cull above. The pin set
+                // changes every time a new device is heard; the RINGS only change with the
+                // viewport or the dataset. Handing the pins to update() defeated its identity
+                // early-out, so every arrival re-scanned all 119k nodes and re-alloc'd up to 500
+                // markers on the main thread. This path only re-stamps icons on the rings the cull
+                // already drew. Last in the pass on purpose: peekPins[0] has to describe the
+                // markers this pass just drew, or a ring would widen for a pin that is gone.
+                alprHolder.setPeekPins(map, peekPins[0])
             },
             onRelease = { map ->
                 viewportRefresh[0]?.let { map.removeCallbacks(it) }
@@ -1015,7 +1369,7 @@ fun MapScreen(
                         showLabels = it
                         mapPrefs.edit().putBoolean("show_labels", it).apply()
                     }
-                    // known-ALPR layer: the same opt-in the chip row toggles (one store, always
+                    // known-ALPR layer: the same toggle the chip row flips (one store, always
                     // in sync), repeated here so the layer controls live with the map settings.
                     MapSettingRow("known ALPR", alprEnabled) { alpr.setEnabled(it) }
                     if (alprEnabled) {
@@ -1059,6 +1413,13 @@ fun MapScreen(
                     LegendRow(Acab.trackerTone, "Tracker")
                     LegendRow(Acab.glassesTone, "Glasses")
                     LegendRow(Acab.netcamTone, "Network camera")
+                    // PIN RECENCY: the only pin state on this map that is not a category, so the
+                    // legend has to name it or a dimmed pin just looks like a rendering fault.
+                    // Always listed, unlike the conditional rows below: a relaunch redraws the
+                    // whole persisted log, and every one of those pins is past the stale mark.
+                    // The swatch is a neutral tone dimmed by the same rule the pins use, so it
+                    // demonstrates the state without claiming a category.
+                    LegendRow(dimTone(Acab.text), "dimmed: last heard over an hour ago")
                     if (alprEnabled) {
                         if (alprTier1Count > 0) LegendRow(
                             Acab.flockTone.copy(alpha = 0.95f),
@@ -1092,6 +1453,15 @@ fun MapScreen(
                                 hollow = true,
                             )
                         }
+                        // RING-PEEK: named only while a wide ring is actually drawn, same rule as
+                        // the tier rows above. The wide rim is the map's only cue that a live hit
+                        // landed on a camera the dataset already knows about.
+                        if (alprPeekCount > 0) LegendRow(
+                            Acab.flockTone.copy(alpha = 0.95f),
+                            "wide ring: live hit at a mapped camera",
+                            hollow = true,
+                            wide = true,
+                        )
                         Text("cameras: OpenStreetMap ODbL · DeFlock", color = Acab.faint,
                             fontSize = 8.5.sp, fontFamily = Acab.mono)
                     }
@@ -1115,7 +1485,7 @@ fun MapScreen(
     }
 
     // LAYERS sheet: the known-ALPR reference layer's toggle, out of the filter row so a layer
-    // that triggers a dataset download can explain itself before it is flipped on.
+    // that carries a dataset download (now on by default) can explain itself.
     if (layersOpen) {
         ModalBottomSheet(
             onDismissRequest = { layersOpen = false },
@@ -1141,7 +1511,7 @@ fun MapScreen(
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         Text("known ALPR cameras", color = Acab.text, fontSize = 14.sp,
                             fontWeight = FontWeight.Medium)
-                        Text("draws a fixed dataset of reported camera locations (OpenStreetMap · DeFlock). turning it on downloads the dataset once for offline use.",
+                        Text("draws a fixed dataset of reported camera locations (OpenStreetMap · DeFlock). on by default. the dataset downloads once and works offline; turn it off to hide the pins.",
                             color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
                     }
                     Spacer(Modifier.size(12.dp))
@@ -1216,21 +1586,49 @@ fun MapScreen(
     }
 }
 
-/** Point a detection marker at either the plain category pin or its labeled variant (icon +
- *  under-icon type tag). Both keep the icon centered on the geo point (the labeled bitmap is
- *  taller, so it uses a raised anchor). */
-private fun Marker.labelMarker(
+/** The four pin sets the update pass chooses between: full colour or the STALE tier's dimmed
+ *  twin, each with and without the "icon labels" under-icon type tag. Bundled so the pass picks
+ *  artwork with one call instead of threading four maps through every marker it builds. */
+private class MapPinArt(
+    val plain: Map<DeviceType, BitmapDrawable>,
+    val plainDim: Map<DeviceType, BitmapDrawable>,
+    val labeled: LabeledMarkers,
+    val labeledDim: LabeledMarkers,
+)
+
+/** Point a detection marker at its pin artwork: the category, the recency tier, the "icon labels"
+ *  setting, and, when this pin stands for a same-spot group, the count badge. Every variant keeps
+ *  the ICON centered on the geo point, so none of these choices moves the pin (the labeled bitmap
+ *  is taller and the badged one is padded, so each carries its own raised anchor).
+ *
+ *  [groupSize] of 1 is the ungrouped pin and takes no badge, which is what keeps a lone pin
+ *  pixel-identical to the way it drew before grouping existed. */
+private fun Marker.pinIcon(
     type: DeviceType,
+    age: PinAge,
     showLabels: Boolean,
-    plain: Map<DeviceType, BitmapDrawable>,
-    labeled: LabeledMarkers,
+    art: MapPinArt,
+    badges: PinBadgeFactory,
+    groupSize: Int,
 ) {
+    val dim = age == PinAge.STALE
+    val base: BitmapDrawable
+    val baseAnchorV: Float
     if (showLabels) {
-        icon = labeled.icons.getValue(type)
-        setAnchor(Marker.ANCHOR_CENTER, labeled.anchorV)
+        val set = if (dim) art.labeledDim else art.labeled
+        base = set.icons.getValue(type)
+        baseAnchorV = set.anchorV
     } else {
-        icon = plain.getValue(type)
-        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+        base = (if (dim) art.plainDim else art.plain).getValue(type)
+        baseAnchorV = Marker.ANCHOR_CENTER
+    }
+    if (groupSize > 1) {
+        val badged = badges.badged(base, baseAnchorV, groupSize)
+        icon = badged.icon
+        setAnchor(Marker.ANCHOR_CENTER, badged.anchorV)
+    } else {
+        icon = base
+        setAnchor(Marker.ANCHOR_CENTER, baseAnchorV)
     }
 }
 
@@ -1410,13 +1808,16 @@ private fun AlprDatasetRows(alpr: AlprStore, nodes: IntArray, loading: Boolean,
     }
 }
 
-/** One legend row: colored dot (filled, or a hollow ring for reference layers) + label. */
+/** One legend row: colored dot (filled, or a hollow ring for reference layers) + label. [wide]
+ *  draws the ring-peek swatch, the one that is bigger on the map. The swatch sits in a fixed slot
+ *  so that extra width cannot push its label out of line with every other row. */
 @Composable
-private fun LegendRow(color: Color, label: String, hollow: Boolean = false) {
+private fun LegendRow(color: Color, label: String, hollow: Boolean = false, wide: Boolean = false) {
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-        val dot = if (hollow) Modifier.size(8.dp).border(1.5.dp, color, RoundedCornerShape(50))
-                  else Modifier.size(8.dp).background(color, RoundedCornerShape(50))
-        Box(dot)
+        val dotSize = if (wide) 12.dp else 8.dp
+        val dot = if (hollow) Modifier.size(dotSize).border(1.5.dp, color, RoundedCornerShape(50))
+                  else Modifier.size(dotSize).background(color, RoundedCornerShape(50))
+        Box(Modifier.size(12.dp), contentAlignment = Alignment.Center) { Box(dot) }
         Text(label, color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
     }
 }

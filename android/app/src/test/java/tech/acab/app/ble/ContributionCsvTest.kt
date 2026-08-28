@@ -36,14 +36,20 @@ class ContributionCsvTest {
         assertEquals(DetectionCsvExternalText("", ""), detectionCsvExternalText(null, null))
     }
 
-    // The real column order (AcabBleManager.detectionsCsv header). approx_* at 10/11 are the phone;
-    // drone_* at 14/15 and operator_* at 20/21 are the Remote ID broadcast.
-    private val header =
-        "detected_at,time_basis,time_precision_s,type,mac,rssi,source,matched_on,confidence,sightings," +
-        "approx_lat,approx_lon,company_id,uas_id,drone_lat,drone_lon,altitude_m,speed_ms,heading_deg," +
-        "height_agl_m,operator_lat,operator_lon,operator_alt_m,rid_status,maker"
+    // The EMITTED header, not a copy of it. AcabBleManager.detectionsCsv opens the file with
+    // detectionCsvRow(DETECTION_CSV_COLUMNS, ::csvSafe), and csvSafe delegates to csvField, which
+    // is detectionCsvRow's own default encoder, so this expression is that exact string.
+    //
+    // Derived on purpose. With a hand-copied header, col() kept indexing by the OLD layout: swap
+    // two columns in the emitter and every case below stayed green while the real export moved a
+    // coordinate under a different name, which is the one outcome ContributionCsv.kt exists to
+    // prevent. Now the sample rows mis-align and the redaction cases fail. A column that appears
+    // or disappears fails too, on record width. The literal is written out by hand exactly once,
+    // in productionHeader_isTheFixture_andCarriesAllSevenPolicyColumns, so a rename still has to
+    // be re-stated deliberately instead of the whole suite quietly following the emitter.
+    private val header = detectionCsvRow(DETECTION_CSV_COLUMNS)
 
-    private val cols = header.split(",")
+    private val cols = DETECTION_CSV_COLUMNS
     private fun col(csv: String, row: Int, name: String): String {
         val records = requireNotNull(parseCsvDocument(csv))
         return records.records[row][cols.indexOf(name)]
@@ -208,12 +214,46 @@ class ContributionCsvTest {
         }
     }
 
-    @Test fun productionHeaderFixture_containsAllSevenPolicyColumns() {
-        // Android's manager header is embedded in its instance export method, so this exact mirror
-        // is the test boundary here. iOS additionally compares the fixture to its pure builder.
+    @Test fun productionHeader_isTheFixture_andCarriesAllSevenPolicyColumns() {
+        // The ONLY hand-written copy of the export layout in this file, and the reason deriving
+        // `header` from the emitter is safe: everything else follows DETECTION_CSV_COLUMNS, so
+        // without this literal a rename in the exporter would propagate into every fixture and no
+        // case would notice. A column that appears, disappears or moves has to be re-stated here.
+        assertEquals(
+            "detected_at,time_basis,time_precision_s,type,mac,rssi,source,matched_on,confidence," +
+            "sightings,approx_lat,approx_lon,company_id,uas_id,drone_lat,drone_lon,altitude_m," +
+            "speed_ms,heading_deg,height_agl_m,operator_lat,operator_lon,operator_alt_m,rid_status," +
+            "maker",
+            header,
+        )
+        // Position, spelled out, because the redactor blanks by header-derived INDEX: a policy
+        // column that moves is a coordinate blanked at the wrong offset. approx_* is the phone,
+        // drone_* and operator_* are the Remote ID broadcast.
+        assertEquals(10, cols.indexOf("approx_lat"))
+        assertEquals(11, cols.indexOf("approx_lon"))
+        assertEquals(14, cols.indexOf("drone_lat"))
+        assertEquals(15, cols.indexOf("drone_lon"))
+        assertEquals(20, cols.indexOf("operator_lat"))
+        assertEquals(21, cols.indexOf("operator_lon"))
+        assertEquals(22, cols.indexOf("operator_alt_m"))
+        // The policy sets are matched by NAME, so a rename is precisely the change that would leak
+        // a coordinate the redactor no longer recognises.
         val policyColumns = OBSERVER_LOCATION_COLS + DRONE_LOCATION_COLS + OPERATOR_LOCATION_COLS
         assertEquals(7, policyColumns.size)
-        assertTrue(cols.containsAll(policyColumns))
+        assertTrue(DETECTION_CSV_COLUMNS.containsAll(policyColumns))
+    }
+
+    @Test fun renamedPolicyColumn_failsClosed_ratherThanSharingTheOriginal() {
+        // Belt to the braces above: if the emitter and the policy sets ever do drift, a requested
+        // column the header does not carry must fall back to the header, exactly like malformed
+        // input. Returning the ORIGINAL csv there shipped approx_lat under its new name.
+        val renamed = header.replace("approx_lat", "observer_lat")
+        val csv = renamed + "\n" + sample().split("\n")[1]
+        val redacted = redactCsvColumns(csv, contributionBlankColumns(
+            includeObserverLocation = false, includeDroneLocation = true, includeOperatorLocation = true))
+        assertEquals(renamed, redacted)
+        // A partly-matching policy fails closed too: half a policy applied is not the policy.
+        assertEquals(renamed, redactCsvColumns(csv, setOf("approx_lat", "approx_lon")))
     }
 
     // A capture window [1000, 2000]. Overlap membership, not containment.

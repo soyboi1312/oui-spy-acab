@@ -5,8 +5,9 @@ import CoreLocation
 /// Export-format tests: the CSV drone-column gate and the GPX writer.
 ///
 /// WHY THESE EXIST. On 2026-08-05 a real 2747-row export was found to carry a bogus drone position
-/// on 2746 of 2746 NON-drone rows: `lat`/`lon` on the wire is overloaded ("drones: broadcast
-/// position; others: detector GPS", ble-protocol.md line 88) and the CSV writer copied it into
+/// on 2746 of 2746 NON-drone rows: `lat`/`lon` on the wire is overloaded ("drones = the aircraft's
+/// own broadcast position; everything else = the DETECTOR's GPS", the `lat`,`lon` row of
+/// ble-protocol.md's detection-frame table) and the CSV writer copied it into
 /// drone_lat/drone_lon unconditionally. 555 of those rows were byte-identical to the row's own
 /// approx_lat/lon, i.e. the phone's position exported as an aircraft's. Both writers already
 /// carried a comment claiming "blank for a non-drone row"; nothing enforced it. These tests are
@@ -40,7 +41,7 @@ final class ExportTests: XCTestCase {
     """
 
     private func decode(_ json: String) throws -> Detection {
-        try JSONDecoder().decode(Detection.self, from: Data(json.utf8))
+        try Detection.decodeWireJSON(Data(json.utf8))
     }
 
     private func row(_ json: String,
@@ -326,12 +327,23 @@ final class ExportTests: XCTestCase {
     func testRepeatedStandardExportsKeepReadableNameButUseUniqueParents() throws {
         // Two share sheets can overlap in time. The second export must not mutate the URL already
         // handed to the first, while the leaf filename should remain useful to the recipient.
+        //
+        // The snapshot is handed in EXPLICITLY rather than letting the convenience overload build
+        // one from the manager's store. That store is whatever the simulator container already
+        // holds, so the old form's output rode a race: loadPersistedDetections() hands off to
+        // persistQueue and landed AFTER both snapshots, which is the only reason the two files
+        // were header-only and the byte-equality assertion below passed by construction. Win that
+        // race on a developer machine and the same test writes real captured MACs and GPS out to
+        // temporaryDirectory. A fixture row removes both halves: no real user state is read, and
+        // there is real content on both sides of the comparison.
         let manager = BLEManager()
+        let snapshot = BLEManager.DetectionExportSnapshot(rows: [try row(Self.nearbyJSON)],
+                                                          unseenIDs: [])
         let done = expectation(description: "two exports finish")
         done.expectedFulfillmentCount = 2
         var urls: [URL] = []
         for _ in 0..<2 {
-            manager.writeDetections(.csv) { result in
+            manager.writeDetections(.csv, snapshot: snapshot) { result in
                 if case let .success(url) = result { urls.append(url) }
                 done.fulfill()
             }
@@ -445,7 +457,7 @@ final class ExportTests: XCTestCase {
 final class ElidedRecordTests: XCTestCase {
 
     private func decode(_ json: String) throws -> Detection {
-        try JSONDecoder().decode(Detection.self, from: Data(json.utf8))
+        try Detection.decodeWireJSON(Data(json.utf8))
     }
 
     /// Fully populated drone record, then each elision level applied in the documented order.
@@ -505,5 +517,194 @@ final class ElidedRecordTests: XCTestCase {
         XCTAssertEqual(d.mac, "c2:40:d8:1c:2b:96")
         XCTAssertNil(d.pilotCoordinate)
         XCTAssertNil(d.speedH)
+    }
+
+    // MARK: - wire clamps (parity table, shared with AcabBleManagerExportTest.kt)
+
+    /// One legal history row with the field under test appended. The TAILS are the shared half:
+    /// AcabBleManagerExportTest.kt builds the same bytes from the same tails and asserts the same
+    /// decoded OUTCOME, because a fixture the two platforms pass for different reasons proves
+    /// nothing. The two spellings of "no value" differ, and writing both sides is what pins that:
+    /// iOS says nil, Android says 0, each its platform's existing absent value.
+    ///
+    /// None of these values can come off a genuine board - the firmware's slotValid() rejects
+    /// seq 0 and 0xFFFFFFFF, and at/ms/boot are uint32 on the wire - so what this table pins is
+    /// the behaviour when the peer is NOT a genuine board. That is the case that matters: a
+    /// poisoned seq or timestamp is checkpointed to disk and survives relaunch.
+    private func clamped(_ tail: String) throws -> Detection {
+        try decode(#"{"t":7,"s":0,"meth":0,"c":0,"mac":"c2:40:d8:1c:2b:96","n":1,"hist":true,"#
+                   + tail + "}")
+    }
+
+    /// The empty-slot sentinels, the sharpest case in the table: one of these riding into the
+    /// replay cursor is checkpointed, and the board then never replays another buffered record.
+    func testSeqEmptySlotSentinelsNeverBecomeACursor() throws {
+        for tail in [#""seq":0"#, #""seq":4294967295"#] {
+            let d = try clamped(tail)
+            XCTAssertNil(d.seq, "\(tail) must move no cursor")
+            XCTAssertTrue(d.isHistory,
+                          "\(tail): the record is still received and counted, it just moves no cursor")
+        }
+    }
+
+    func testSeqOutsideTheUint32WireTypeIsRejectedButALegalSeqSurvives() throws {
+        XCTAssertNil(try clamped(#""seq":-1"#).seq)
+        XCTAssertNil(try clamped(#""seq":4294967296"#).seq)
+        // The guard has to reject the sentinels without swallowing the ordinary case, or the
+        // offline buffer stops draining for the opposite reason.
+        XCTAssertEqual(try clamped(#""seq":1"#).seq, 1)
+        XCTAssertEqual(try clamped(#""seq":4294967294"#).seq, 4_294_967_294)
+    }
+
+    /// Out of range is NO TIMESTAMP, never the nearest legal value: pinned to the ceiling it
+    /// would present 2106 as a real capture time and widen that boot's anchor bounds to match.
+    func testCapturedAtOutsideTheUint32WireTypeIsDroppedNotPinned() throws {
+        XCTAssertNil(try clamped(#""at":4294967296"#).capturedAt)
+        XCTAssertNil(try clamped(#""at":-1"#).capturedAt)
+        XCTAssertNil(try clamped(#""at":1e30"#).capturedAt)
+        // Both ends of the legal range still decode.
+        XCTAssertEqual(try clamped(#""at":4294967295"#).capturedAt,
+                       Date(timeIntervalSince1970: 4_294_967_295))
+        XCTAssertEqual(try clamped(#""at":1780000000"#).capturedAt,
+                       Date(timeIntervalSince1970: 1_780_000_000))
+    }
+
+    /// Uptime and boot session are uint32 too, and they feed the reconstruction that dates every
+    /// unanchored record, so they read as absent by the same rule.
+    func testUptimeAndBootSessionOutsideTheWireTypeReadAsAbsent() throws {
+        let poisoned = try clamped(#""ms":4294967296,"boot":4294967296"#)
+        XCTAssertNil(poisoned.whenMs)
+        XCTAssertNil(poisoned.bootCount)
+        let legal = try clamped(#""ms":1234,"boot":7"#)
+        XCTAssertEqual(legal.whenMs, 1234)
+        XCTAssertEqual(legal.bootCount, 7)
+    }
+
+    /// A fractional JSON number can be numerically inside the uint32 bounds without being a
+    /// uint32. Keep this vector beside the other shared wire fixtures. The verdict comes from the
+    /// exact raw numeric token for all four fields; JSONDecoder is not an exact boundary because it
+    /// can round a precision-hidden fractional tail away. A `.0` spelling is still the same integer.
+    func testFractionalUint32WireFieldsReadAsAbsent() throws {
+        let fractional = try clamped(#""seq":1.9,"at":1780000000.9,"ms":1234.9,"boot":7.9"#)
+        XCTAssertNil(fractional.seq)
+        XCTAssertNil(fractional.capturedAt)
+        XCTAssertNil(fractional.whenMs)
+        XCTAssertNil(fractional.bootCount)
+
+        let integral = try clamped(#""seq":1.0,"at":1780000000.0,"ms":1234.0,"boot":7.0"#)
+        XCTAssertEqual(integral.seq, 1)
+        XCTAssertEqual(integral.capturedAt, Date(timeIntervalSince1970: 1_780_000_000))
+        XCTAssertEqual(integral.whenMs, 1234)
+        XCTAssertEqual(integral.bootCount, 7)
+    }
+
+    /// These are the runtime-representative holes in a decoded-number guard. Current Foundation
+    /// rounds the first tail into its binary UInt32/Double value, and Decimal-based preflights lose
+    /// the second tail beyond their precision. The raw BLE boundary must retain neither value.
+    func testPrecisionHiddenFractionalUint32WireFieldsReadAsAbsent() throws {
+        let binaryRounded = try clamped(
+            #""seq":1.0000000000000000001,"at":1780000000.0000000000000000001,"ms":1234.0000000000000000001,"boot":7.0000000000000000001"#)
+        XCTAssertNil(binaryRounded.seq)
+        XCTAssertNil(binaryRounded.capturedAt)
+        XCTAssertNil(binaryRounded.whenMs)
+        XCTAssertNil(binaryRounded.bootCount)
+
+        let beyondDecimal = try clamped(
+            #""seq":1.0000000000000000000000000000000000000001,"at":1780000000.0000000000000000000000000000000000000001,"ms":1234.0000000000000000000000000000000000000001,"boot":7.0000000000000000000000000000000000000001"#)
+        XCTAssertNil(beyondDecimal.seq)
+        XCTAssertNil(beyondDecimal.capturedAt)
+        XCTAssertNil(beyondDecimal.whenMs)
+        XCTAssertNil(beyondDecimal.bootCount)
+    }
+
+    func testMathematicallyIntegralDecimalAndExponentWireSpellingsSurvive() throws {
+        let d = try clamped(
+            #""seq":10e-1,"at":178000000000e-2,"ms":123400e-2,"boot":7000e-3"#)
+        XCTAssertEqual(d.seq, 1)
+        XCTAssertEqual(d.capturedAt, Date(timeIntervalSince1970: 1_780_000_000))
+        XCTAssertEqual(d.whenMs, 1_234)
+        XCTAssertEqual(d.bootCount, 7)
+
+        XCTAssertEqual(try clamped(#""at":4.294967295e9"#).capturedAt,
+                       Date(timeIntervalSince1970: 4_294_967_295))
+    }
+
+    func testFractionHiddenBehindAnExponentIsRejected() throws {
+        let d = try clamped(
+            #""seq":100000000000000000001e-20,"at":178000000000000000001e-11,"ms":123400000000000000001e-17,"boot":70000000000000000001e-19"#)
+        XCTAssertNil(d.seq)
+        XCTAssertNil(d.capturedAt)
+        XCTAssertNil(d.whenMs)
+        XCTAssertNil(d.bootCount)
+    }
+
+    func testHistoryBeginFromUsesTheSameExactTopLevelUint32Boundary() {
+        func value(_ token: String) -> UInt32? {
+            let json = #"{"hist":"begin","n":1,"from":"# + token + "}"
+            return Detection.exactWireUInt32(forKey: "from", in: Data(json.utf8))
+        }
+
+        XCTAssertNil(value("1.0000000000000000001"))
+        XCTAssertNil(value("1.0000000000000000000000000000000000000001"))
+        XCTAssertNil(value("100000000000000000001e-20"))
+        XCTAssertEqual(value("15040e-1"), 1_504)
+        XCTAssertEqual(value("1504.000"), 1_504)
+        XCTAssertNil(value("4294967296"))
+
+        // Only the decoded top-level member counts: keys in strings/nested objects cannot spoof
+        // it, an escaped spelling is the same key, and ambiguous duplicates fail closed.
+        let escaped = #"{"hist":"begin","fr\u006fm":15040e-1}"#
+        XCTAssertEqual(Detection.exactWireUInt32(forKey: "from", in: Data(escaped.utf8)), 1_504)
+        let nested = #"{"hist":"begin","note":"\"from\":1504","x":{"from":1504}}"#
+        XCTAssertNil(Detection.exactWireUInt32(forKey: "from", in: Data(nested.utf8)))
+        let duplicate = #"{"hist":"begin","from":1504,"from":1505}"#
+        XCTAssertNil(Detection.exactWireUInt32(forKey: "from", in: Data(duplicate.utf8)))
+    }
+
+    func testRssiIsClampedToTheInt16WireType() throws {
+        XCTAssertEqual(try clamped(#""rssi":32767"#).rssi, 32_767)
+        XCTAssertEqual(try clamped(#""rssi":-32768"#).rssi, -32_768)
+        XCTAssertEqual(try clamped(#""rssi":32768"#).rssi, 32_767)
+        XCTAssertEqual(try clamped(#""rssi":-32769"#).rssi, -32_768)
+        XCTAssertEqual(try clamped(#""rssi":2147483647"#).rssi, 32_767)
+        XCTAssertEqual(try clamped(#""rssi":-2147483648"#).rssi, -32_768)
+        // Wider than Int32: the value Android's optInt used to NARROW into a negative dBm, i.e.
+        // an impossibly close device reported as impossibly far away.
+        XCTAssertEqual(try clamped(#""rssi":2147483648"#).rssi, 32_767)
+        XCTAssertEqual(try clamped(#""rssi":-87"#).rssi, -87)
+    }
+
+    /// Keep RSSI on the same raw-token boundary as Android. Foundation accepts the precision-hidden
+    /// fraction below as Int(-87), which would otherwise make the two apps assign different signal
+    /// strength and proximity behavior to the same hostile/malformed frame.
+    func testRssiRequiresAnExactIntegralNumericWireTokenBeforeClamping() throws {
+        for tail in [
+            #""rssi":"-87""#,
+            #""rssi":-87.5"#,
+            #""rssi":-87.0000000000000000001"#,
+            #""rssi":null"#,
+            #""rssi":true"#,
+            #""rssi":9223372036854775808"#,
+            #""rssi":1e30"#,
+        ] {
+            XCTAssertEqual(try clamped(tail).rssi, 0, tail)
+        }
+
+        // Decimal/exponent spellings are valid when their mathematical value is exactly integral.
+        XCTAssertEqual(try clamped(#""rssi":-87.0"#).rssi, -87)
+        XCTAssertEqual(try clamped(#""rssi":-870e-1"#).rssi, -87)
+        XCTAssertEqual(try clamped(#""rssi":9223372036854775807"#).rssi, 32_767)
+        XCTAssertEqual(try clamped(#""rssi":-9223372036854775808"#).rssi, -32_768)
+    }
+
+    /// JSON leaves duplicate-member semantics undefined: Foundation keeps the first RSSI while
+    /// Android's general parser keeps the last. The exact scanners therefore make either spelling
+    /// absent/0, including an escaped spelling of the same top-level key.
+    func testDuplicateRssiFailsClosedIncludingEscapedKeySpellings() throws {
+        XCTAssertEqual(try clamped(#""rssi":-87,"rssi":-40"#).rssi, 0)
+        XCTAssertEqual(try clamped(#""rssi":-87,"r\u0073si":-40"#).rssi, 0)
+
+        let nested = try clamped(#""rssi":-87,"extra":{"rssi":-40}"#)
+        XCTAssertEqual(nested.rssi, -87, "a nested member is not a duplicate top-level RSSI")
     }
 }

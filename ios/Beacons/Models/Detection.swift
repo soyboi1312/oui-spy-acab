@@ -1,6 +1,307 @@
 import Foundation
 import CoreLocation
 
+/// Exact numeric values read from the top-level BLE JSON object before Foundation turns JSON
+/// numbers into binary/decimal values. JSONDecoder is deliberately not the authority here:
+/// on current iOS it rounds precision-hidden fractional tails for both UInt32 and Int. The replay
+/// fields become cursors/dates and RSSI feeds proximity policy, so the original numeric lexeme is
+/// the only lossless boundary.
+private struct DetectionWireNumericFields {
+    let uint32Values: [String: UInt32]
+    let rssi: Int?
+    subscript(_ key: String) -> UInt32? { uint32Values[key] }
+}
+
+private let detectionWireNumericFieldsKey = CodingUserInfoKey(
+    rawValue: "tech.acab.detection.raw-wire-numeric-fields")!
+private let detectionWireNumericFieldNames: Set<String> = ["seq", "at", "ms", "boot", "rssi"]
+
+private enum ExactWireJSONError: Error { case malformedTopLevelObject }
+
+/// A small structural scanner for the compact, top-level JSON objects carried by the BLE
+/// characteristic. It does not interpret arbitrary values; it only preserves the byte range of
+/// requested top-level members while correctly stepping over strings and nested containers.
+/// JSONDecoder still validates and decodes the complete Detection afterwards.
+private struct ExactWireJSONObject {
+    private let bytes: [UInt8]
+    private var index = 0
+
+    init(_ data: Data) { bytes = Array(data) }
+
+    mutating func numericValues(for wanted: Set<String>) throws -> DetectionWireNumericFields {
+        var uint32Values: [String: UInt32] = [:]
+        var rssi: Int?
+        var seen = Set<String>()
+        var duplicates = Set<String>()
+
+        skipWhitespace()
+        guard consume(0x7B) else { throw ExactWireJSONError.malformedTopLevelObject } // {
+        skipWhitespace()
+        if consume(0x7D) { // }
+            skipWhitespace()
+            guard index == bytes.count else { throw ExactWireJSONError.malformedTopLevelObject }
+            return DetectionWireNumericFields(uint32Values: uint32Values, rssi: rssi)
+        }
+
+        while true {
+            skipWhitespace()
+            guard peek == 0x22 else { throw ExactWireJSONError.malformedTopLevelObject } // "
+            let keyStart = index
+            try skipString()
+            let keyEnd = index
+            let key = requestedKey(in: keyStart..<keyEnd, wanted: wanted)
+
+            skipWhitespace()
+            guard consume(0x3A) else { throw ExactWireJSONError.malformedTopLevelObject } // :
+            skipWhitespace()
+            let valueStart = index
+            try skipValue()
+            let valueEnd = index
+
+            if let key {
+                if seen.insert(key).inserted {
+                    if key == "rssi" {
+                        if let value = Self.exactInt64(in: bytes, range: valueStart..<valueEnd) {
+                            rssi = Int(min(Int64(Int16.max), max(Int64(Int16.min), value)))
+                        }
+                    } else if let value = Self.exactUInt32(in: bytes,
+                                                          range: valueStart..<valueEnd) {
+                        uint32Values[key] = value
+                    }
+                } else {
+                    // Duplicate member semantics are not defined by JSON, and Foundation's choice
+                    // must never disagree with the raw security verdict. Fail this field closed.
+                    duplicates.insert(key)
+                    if key == "rssi" { rssi = nil }
+                    else { uint32Values.removeValue(forKey: key) }
+                }
+            }
+
+            skipWhitespace()
+            if consume(0x2C) { continue } // ,
+            guard consume(0x7D) else { throw ExactWireJSONError.malformedTopLevelObject } // }
+            break
+        }
+
+        skipWhitespace()
+        guard index == bytes.count else { throw ExactWireJSONError.malformedTopLevelObject }
+        for key in duplicates {
+            if key == "rssi" { rssi = nil }
+            else { uint32Values.removeValue(forKey: key) }
+        }
+        return DetectionWireNumericFields(uint32Values: uint32Values, rssi: rssi)
+    }
+
+    /// Firmware keys are short unescaped ASCII. Compare those bytes in place so the detection hot
+    /// path does not construct a JSONDecoder (or even a String) for every one of ~20 members. An
+    /// escaped key is rare/adversarial and takes the slower decoder path so `"s\u0065q"` cannot
+    /// evade the same raw-token verdict as `"seq"`.
+    private func requestedKey(in quotedRange: Range<Int>, wanted: Set<String>) -> String? {
+        let content = bytes[(quotedRange.lowerBound + 1)..<(quotedRange.upperBound - 1)]
+        if !content.contains(0x5C) { // backslash
+            for key in wanted where content.elementsEqual(key.utf8) { return key }
+            return nil
+        }
+        guard let decoded = try? JSONDecoder().decode(
+            String.self, from: Data(bytes[quotedRange])), wanted.contains(decoded) else { return nil }
+        return decoded
+    }
+
+    private var peek: UInt8? { index < bytes.count ? bytes[index] : nil }
+
+    private mutating func consume(_ byte: UInt8) -> Bool {
+        guard peek == byte else { return false }
+        index += 1
+        return true
+    }
+
+    private mutating func skipWhitespace() {
+        while let b = peek, b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D { index += 1 }
+    }
+
+    private mutating func skipString() throws {
+        guard consume(0x22) else { throw ExactWireJSONError.malformedTopLevelObject }
+        while let b = peek {
+            index += 1
+            if b == 0x22 { return }
+            guard b >= 0x20 else { throw ExactWireJSONError.malformedTopLevelObject }
+            if b == 0x5C { // backslash
+                guard let escaped = peek else { throw ExactWireJSONError.malformedTopLevelObject }
+                index += 1
+                if escaped == 0x75 { // u, followed by exactly four ASCII hex digits
+                    guard index + 4 <= bytes.count,
+                          bytes[index..<(index + 4)].allSatisfy(Self.isHex) else {
+                        throw ExactWireJSONError.malformedTopLevelObject
+                    }
+                    index += 4
+                } else if ![0x22, 0x5C, 0x2F, 0x62, 0x66, 0x6E, 0x72, 0x74].contains(escaped) {
+                    throw ExactWireJSONError.malformedTopLevelObject
+                }
+            }
+        }
+        throw ExactWireJSONError.malformedTopLevelObject
+    }
+
+    private mutating func skipValue() throws {
+        guard let first = peek else { throw ExactWireJSONError.malformedTopLevelObject }
+        if first == 0x22 { try skipString(); return }
+
+        if first == 0x7B || first == 0x5B { // { or [
+            var closers: [UInt8] = [first == 0x7B ? 0x7D : 0x5D]
+            index += 1
+            while !closers.isEmpty {
+                guard let b = peek else { throw ExactWireJSONError.malformedTopLevelObject }
+                if b == 0x22 { try skipString(); continue }
+                if b == 0x7B { closers.append(0x7D); index += 1; continue }
+                if b == 0x5B { closers.append(0x5D); index += 1; continue }
+                if b == 0x7D || b == 0x5D {
+                    guard closers.last == b else { throw ExactWireJSONError.malformedTopLevelObject }
+                    closers.removeLast()
+                }
+                index += 1
+            }
+            return
+        }
+
+        let start = index
+        while let b = peek,
+              b != 0x20 && b != 0x09 && b != 0x0A && b != 0x0D
+                && b != 0x2C && b != 0x7D && b != 0x5D {
+            index += 1
+        }
+        guard index > start else { throw ExactWireJSONError.malformedTopLevelObject }
+    }
+
+    private static func isHex(_ b: UInt8) -> Bool {
+        (0x30...0x39).contains(b) || (0x41...0x46).contains(b) || (0x61...0x66).contains(b)
+    }
+
+    private static func isDigit(_ b: UInt8) -> Bool { (0x30...0x39).contains(b) }
+
+    /// Parse one JSON numeric token as a mathematical uint32 without ever converting through
+    /// Double or Decimal. Decimal points and exponents are accepted when the represented value is
+    /// integral (`1.0`, `1000e-3`); any non-zero discarded digit makes the field invalid.
+    private static func exactUInt32(in bytes: [UInt8], range: Range<Int>) -> UInt32? {
+        guard let value = exactIntegerMagnitude(in: bytes, range: range,
+                                                maximum: UInt64(UInt32.max)),
+              !value.negative else { return nil }
+        return UInt32(value.magnitude)
+    }
+
+    /// RSSI is signed on the wire. Match JSONDecoder's useful domain by accepting an exact Int64,
+    /// then let the caller clamp it to the firmware's int16 storage type. This intentionally rejects
+    /// a precision-hidden fractional token that Foundation rounds to an apparently integral Int.
+    private static func exactInt64(in bytes: [UInt8], range: Range<Int>) -> Int64? {
+        let negativeLimit = UInt64(Int64.max) + 1
+        guard let value = exactIntegerMagnitude(in: bytes, range: range,
+                                                maximum: negativeLimit) else { return nil }
+        if value.magnitude == 0 { return 0 }
+        if value.negative {
+            if value.magnitude == negativeLimit { return Int64.min }
+            return -Int64(value.magnitude)
+        }
+        guard value.magnitude <= UInt64(Int64.max) else { return nil }
+        return Int64(value.magnitude)
+    }
+
+    /// Exact shared parser for signed/unsigned integral JSON numbers. [maximum] bounds the decimal
+    /// accumulator before conversion, so hostile exponents and long mantissas cannot overflow or
+    /// turn into work proportional to their claimed scale.
+    private static func exactIntegerMagnitude(in bytes: [UInt8], range: Range<Int>,
+                                              maximum: UInt64) ->
+        (negative: Bool, magnitude: UInt64)? {
+        var i = range.lowerBound
+        let end = range.upperBound
+        guard i < end else { return nil }
+
+        var negative = false
+        if bytes[i] == 0x2D { negative = true; i += 1 } // -
+        guard i < end else { return nil }
+
+        var digits: [UInt8] = []
+        if bytes[i] == 0x30 {
+            digits.append(bytes[i]); i += 1
+            // JSON numbers may not carry an integer-part leading zero.
+            if i < end, isDigit(bytes[i]) { return nil }
+        } else {
+            guard (0x31...0x39).contains(bytes[i]) else { return nil }
+            while i < end, isDigit(bytes[i]) { digits.append(bytes[i]); i += 1 }
+        }
+
+        var fractionalDigits = 0
+        if i < end, bytes[i] == 0x2E { // .
+            i += 1
+            let fractionStart = i
+            while i < end, isDigit(bytes[i]) {
+                digits.append(bytes[i]); fractionalDigits += 1; i += 1
+            }
+            guard i > fractionStart else { return nil }
+        }
+
+        var exponent = 0
+        if i < end, bytes[i] == 0x65 || bytes[i] == 0x45 { // e/E
+            i += 1
+            var exponentNegative = false
+            if i < end, bytes[i] == 0x2B || bytes[i] == 0x2D { // +/-
+                exponentNegative = bytes[i] == 0x2D
+                i += 1
+            }
+            let exponentStart = i
+            // Saturating is enough: anything beyond this bound is either zero (handled below) or
+            // far outside uint32. It also keeps a hostile exponent from overflowing Int.
+            let limit = 1_000_000
+            var magnitude = 0
+            while i < end, isDigit(bytes[i]) {
+                if magnitude < limit {
+                    magnitude = min(limit, magnitude * 10 + Int(bytes[i] - 0x30))
+                }
+                i += 1
+            }
+            guard i > exponentStart else { return nil }
+            exponent = exponentNegative ? -magnitude : magnitude
+        }
+        guard i == end else { return nil }
+
+        guard let firstNonZero = digits.firstIndex(where: { $0 != 0x30 }) else {
+            // JSON -0 and zero with any decimal/exponent spelling are still integer zero.
+            return (false, 0)
+        }
+
+        let scale = exponent - fractionalDigits
+        var significantEnd = digits.count
+        var appendedZeros = 0
+        if scale < 0 {
+            let dropped = -scale
+            guard dropped < significantEnd - firstNonZero else { return nil }
+            guard digits[(significantEnd - dropped)..<significantEnd].allSatisfy({ $0 == 0x30 }) else {
+                return nil
+            }
+            significantEnd -= dropped
+        } else {
+            appendedZeros = scale
+        }
+
+        var maximumDigits = 1
+        var maximumProbe = maximum
+        while maximumProbe >= 10 { maximumDigits += 1; maximumProbe /= 10 }
+        // Check length first so a huge positive exponent never becomes a huge loop; the accumulator
+        // below enforces the exact caller-supplied ceiling.
+        guard appendedZeros <= maximumDigits,
+              significantEnd - firstNonZero + appendedZeros <= maximumDigits else { return nil }
+        var result: UInt64 = 0
+        for digitByte in digits[firstNonZero..<significantEnd] {
+            let digit = UInt64(digitByte - 0x30)
+            guard result <= (maximum - digit) / 10 else { return nil }
+            result = result * 10 + digit
+        }
+        for _ in 0..<appendedZeros {
+            guard result <= maximum / 10 else { return nil }
+            result *= 10
+        }
+        return (negative, result)
+    }
+}
+
 /// One detection event, decoded from a Detections-characteristic notify.
 /// JSON shape and keys live in docs/ble-protocol.md.
 struct Detection: Identifiable, Equatable {
@@ -21,7 +322,10 @@ struct Detection: Identifiable, Equatable {
     let pilotLat: Double?        // json "plat"
     let pilotLon: Double?        // json "plon"
     let altitude: Int?           // metres MSL (drones)
-    let gpsAgeSec: Int?          // age (s) of the phone fix used for lat/lon (json "gage"; offline/Desert)
+    let gpsAgeSec: Int?          // age (s) of the fix behind lat/lon (json "gage"). Present on any
+                                 // non-drone row whose stamping fix was >= 1s old, LIVE rows included;
+                                 // nil = fresh sub-second fix, no coordinate, the board's own onboard
+                                 // fix, a drone's broadcast position, or a trimmed hist row
 
     // Drone Remote ID flight telemetry (drones only; nil when not broadcast).
     let speedH: Int?             // horizontal speed m/s   (json "spd")
@@ -40,10 +344,12 @@ struct Detection: Identifiable, Equatable {
     let seq: UInt32?             // the board's buffer sequence number (json "seq")
     let capturedAt: Date?        // when the board actually saw it, unix secs (json "at")
     let approx: Bool             // timestamp unknown; only ordering is meaningful (json "approx")
-    // The raw inputs behind capturedAt, sent on EVERY history record including the approx ones.
-    // whenMs is millis() uptime at capture and bootCount says which boot session that uptime
-    // belongs to, so a record survives reboots. Together they let the app bound a record the
-    // board itself could not date: see BLEManager's bracketing.
+    // The raw inputs behind capturedAt. Guaranteed on approx records, where they are the only
+    // dating information; on an at-bearing record a small-MTU link may shed both via the replay
+    // trim ladder (HIST_TRIM_ANCHOR, see docs/ble-protocol.md), so decode and treat both as
+    // optional. whenMs is millis() uptime at capture and bootCount says which boot session that
+    // uptime belongs to, so a record survives reboots. Together they let the app bound a record
+    // the board itself could not date: see BLEManager's bracketing.
     let whenMs: UInt32?          // json "ms"
     let bootCount: UInt32?       // json "boot"
 
@@ -58,6 +364,14 @@ struct Detection: Identifiable, Equatable {
     /// String-interpolating computed version burned ~110k allocations per publish and saturated the main
     /// thread. Computed once in init(from:); identity semantics are unchanged.
     let id: String
+
+    /// `mac` lowercased, STORED for the same reason as `id`. The watchlist and mute sets are keyed
+    /// on lowercased MACs, so every projection test needs this form: publishDetections and
+    /// recomputeLiveCounts both walk up to the 5,000-row cap at the ~3 Hz publish cadence (and the
+    /// widget summary walks today's rows on its own sample), and each was allocating its own
+    /// throwaway String per row per pass. Computed once in init(from:); derived from `mac`, so it
+    /// is not a wire key and not encoded.
+    let loweredMac: String
 
     var coordinate: CLLocationCoordinate2D? {
         guard let lat, let lon, !(lat == 0 && lon == 0) else { return nil }
@@ -165,7 +479,13 @@ struct Detection: Identifiable, Equatable {
     }
 
     /// Rough signal bucket for the bars indicator (0...4).
-    var signalBars: Int {
+    var signalBars: Int { Detection.signalBars(rssi: rssi) }
+
+    /// Single owner of the RSSI band thresholds. The static form exists for callers that
+    /// hold a bare RSSI and no Detection (the connect screen's scan rows); every bars
+    /// indicator and its spoken strong/good/fair/weak label must band through here so
+    /// tuning a boundary can never split the visual from the accessibility copy.
+    static func signalBars(rssi: Int) -> Int {
         switch rssi {
         case ..<(-90): return 1
         case ..<(-80): return 2
@@ -179,6 +499,27 @@ struct Detection: Identifiable, Equatable {
 // navigationDestination) instead of building a detail-view destination for every row.
 extension Detection: Hashable {
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+extension Detection {
+    /// Decode one raw Detections-characteristic frame. All callers at the BLE boundary must use
+    /// this entry point instead of feeding the bytes straight to JSONDecoder, because Foundation
+    /// can round a fractional numeric lexeme to an apparently valid integer before Codable sees it.
+    static func decodeWireJSON(_ data: Data) throws -> Detection {
+        var object = ExactWireJSONObject(data)
+        let values = try object.numericValues(for: detectionWireNumericFieldNames)
+        let decoder = JSONDecoder()
+        decoder.userInfo[detectionWireNumericFieldsKey] = values
+        return try decoder.decode(Detection.self, from: data)
+    }
+
+    /// Exact raw-token helper for the two BLE paths that do not decode a Detection: the history
+    /// begin sentinel's `from`, and seq-only bookkeeping for an otherwise undecodable history row.
+    /// Missing, duplicated, non-numeric, fractional and out-of-range members all return nil.
+    static func exactWireUInt32(forKey key: String, in data: Data) -> UInt32? {
+        var object = ExactWireJSONObject(data)
+        return (try? object.numericValues(for: [key]))?[key]
+    }
 }
 
 extension Detection: Codable {
@@ -205,10 +546,18 @@ extension Detection: Codable {
         method     = DetectionMethod(rawValue: (try? k.decode(Int.self, forKey: .meth)) ?? 0) ?? .none
         confidence = (try? k.decode(Int.self, forKey: .c)) ?? 0
         mac        = (try? k.decode(String.self, forKey: .mac)) ?? "??:??:??:??:??:??"
-        // Clamped to the int16 wire type (firmware sends an int16 dBm). Unclamped, a hostile
-        // rssi = Int.max reaches smoothedRssi's average (Double(2^63) -> Int traps), overflows
-        // the window sum, and arms the best + 4 comparison in the closest-approach update.
-        rssi       = min(32_767, max(-32_768, (try? k.decode(Int.self, forKey: .rssi)) ?? 0))
+        loweredMac = mac.lowercased()   // once per row, not once per projection test (see `loweredMac`)
+        // Clamped to the int16 wire type (firmware sends an int16 dBm). At the BLE boundary the
+        // value comes from the exact raw numeric lexeme: Foundation rounds a precision-hidden
+        // fraction such as -87.0000000000000000001 to Int(-87), and its duplicate-member choice
+        // differs from Android's. Both are ambiguous wire data and therefore read as absent/0.
+        // Locally JSONEncoder-authored checkpoint/demo data retains the ordinary Int fallback.
+        if let wire = decoder.userInfo[detectionWireNumericFieldsKey]
+            as? DetectionWireNumericFields {
+            rssi = wire.rssi ?? 0
+        } else {
+            rssi = min(32_767, max(-32_768, (try? k.decode(Int.self, forKey: .rssi)) ?? 0))
+        }
         name       = try? k.decodeIfPresent(String.self, forKey: .name)
         uasID      = try? k.decodeIfPresent(String.self, forKey: .id)
         // Stored identity, computed exactly once (see `id`). Same rule as the old computed property:
@@ -233,18 +582,36 @@ extension Detection: Codable {
         isNew      = (try? k.decode(Bool.self, forKey: .new)) ?? false
         randomAddr = (try? k.decode(Bool.self, forKey: .rnd)) ?? false
         isHistory  = (try? k.decode(Bool.self, forKey: .hist)) ?? false
-        seq        = try? k.decodeIfPresent(UInt32.self, forKey: .seq)
-        // Clamp at the decode boundary. The wire type is a uint32 (firmware det_log.h atUnix), so
-        // a legitimate board can only send 0...4294967295; anything else (NaN, infinities, huge or
-        // negative doubles from an impostor peripheral) is dropped rather than converted, because
-        // a poisoned Date reaches trapping Int conversions downstream AND gets checkpointed, which
-        // made the crash persistent across relaunch.
-        capturedAt = (try? k.decodeIfPresent(TimeInterval.self, forKey: .at) ?? nil)
-            .flatMap { $0.isFinite && (0...4_294_967_295).contains($0)
-                       ? Date(timeIntervalSince1970: $0) : nil }
+        // Clamped at the decode boundary, same rule as `rssi` above and `capturedAt` below. 0 and
+        // 0xFFFFFFFF are the firmware's own empty-slot sentinels - det_log.cpp's slotValid()
+        // rejects both - so a genuine board can never send either. An impostor peripheral that
+        // sends 0xFFFFFFFF would ride histHighestSeq into lastGoodSeq, get checkpointed into
+        // `acab.lastSeq`, and then trap the next record on lastGoodSeq + 1: a crash that survives
+        // relaunch because the poison is on disk. A record with no usable seq is still received
+        // and still counted toward the drain tally; it just moves no cursor.
+        // THE RULE, and both apps hold it at EVERY boundary that reads these uint32 fields off the
+        // wire, because a rule enforced at only one of them is the softest one an impostor can aim
+        // at. `decodeWireJSON` supplies values parsed from the exact raw numeric lexemes: asking
+        // JSONDecoder for UInt32/Double is not exact because it rounds precision-hidden fractions.
+        // The fallback branch is only for our own JSONEncoder-written checkpoint and demo data;
+        // those trusted local encoders emit an exact integer or `.0` Double spelling.
+        if let wire = decoder.userInfo[detectionWireNumericFieldsKey]
+            as? DetectionWireNumericFields {
+            seq = wire["seq"].flatMap { $0 == 0 || $0 == UInt32.max ? nil : $0 }
+            capturedAt = wire["at"].map { Date(timeIntervalSince1970: TimeInterval($0)) }
+            whenMs = wire["ms"]
+            bootCount = wire["boot"]
+        } else {
+            seq = (try? k.decodeIfPresent(UInt32.self, forKey: .seq) ?? nil)
+                .flatMap { $0 == 0 || $0 == UInt32.max ? nil : $0 }
+            capturedAt = (try? k.decodeIfPresent(TimeInterval.self, forKey: .at) ?? nil)
+                .flatMap { $0.isFinite && $0.rounded(.towardZero) == $0
+                           && (0...4_294_967_295).contains($0)
+                           ? Date(timeIntervalSince1970: $0) : nil }
+            whenMs = try? k.decodeIfPresent(UInt32.self, forKey: .ms)
+            bootCount = try? k.decodeIfPresent(UInt32.self, forKey: .boot)
+        }
         approx     = (try? k.decode(Bool.self, forKey: .approx)) ?? false
-        whenMs     = try? k.decodeIfPresent(UInt32.self, forKey: .ms)
-        bootCount  = try? k.decodeIfPresent(UInt32.self, forKey: .boot)
         // Live wire records carry neither key -> false. Replayed records carry hist=true.
         // Our on-disk checkpoint writes "off" explicitly so a reloaded row keeps the chip.
         offline    = (try? k.decode(Bool.self, forKey: .off)) ?? isHistory

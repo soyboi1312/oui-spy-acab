@@ -18,6 +18,25 @@ import Foundation
 /// Columns are named EXPLICITLY, never matched on the text "lat"/"lon": a rule that blanked every
 /// "lat" column would wrongly strip drone_lat. The pure functions are unit-tested (ContributionCsvTests).
 enum ContributionCsv {
+    /// The detection CSV's columns, in order. Byte-identical to Android's DETECTION_CSV_COLUMNS
+    /// (AcabBleManager.kt), which is why it moves in the same commit or not at all.
+    ///
+    /// It lives HERE rather than as a literal inside BLEManager.buildCSV because the redaction
+    /// policy below names these columns as STRINGS: observer/drone/operatorLocationCols have to
+    /// match the emitter exactly or a coordinate the disclosure says was removed ships under its
+    /// new name. With one shared list, ContributionCsvTests pins the two against each other
+    /// instead of against a hand-copied fixture that a rename would leave green.
+    ///
+    /// `maker` is appended LAST so an existing parser keyed on column order still reads every
+    /// field it knew about.
+    static let detectionColumns: [String] = [
+        "detected_at", "time_basis", "time_precision_s", "type", "mac", "rssi",
+        "source", "matched_on", "confidence", "sightings", "approx_lat", "approx_lon",
+        "company_id", "uas_id", "drone_lat", "drone_lon", "altitude_m", "speed_ms",
+        "heading_deg", "height_agl_m", "operator_lat", "operator_lon", "operator_alt_m",
+        "rid_status", "maker",
+    ]
+
     /// The contributor's own phone position. Removed by default in a shared contribution.
     static let observerLocationCols: Set<String> = ["approx_lat", "approx_lon"]
     /// The aircraft's Remote ID broadcast position. A separate opt-in, on by default. Deliberately
@@ -63,13 +82,21 @@ enum ContributionCsv {
     /// columns (type label, maker, rid) can be quoted and hold commas or record separators, so
     /// splitting on commas or newlines would misalign and blank the wrong field. Malformed quoted
     /// input fails closed to a header-only CSV rather than returning possibly sensitive row bytes.
+    /// A requested column the header does not carry fails closed the same way, for the same reason.
     static func redact(_ csv: String, blankColumns: Set<String>) -> String {
         if csv.isEmpty { return csv }
         guard let document = parseDocument(csv) else { return safeHeader(csv) }
         if blankColumns.isEmpty { return csv }
         guard let header = document.records.first else { return "" }
+        // Every policy column must be present. The emitter's header is `detectionColumns` and every
+        // set above is a subset of it, so a missing name means the two drifted - a renamed column -
+        // and blanking only the names that still match would ship the renamed coordinate under its
+        // new name in a file whose disclosure says it was removed. This used to return the ORIGINAL
+        // csv in that case, which is the one outcome the whole file exists to prevent. Partial
+        // matches fail closed too: half a policy applied is not the policy. Android twin: the
+        // `blankColumnNames.all { it in header }` guard in redactCsvColumns.
+        guard blankColumns.allSatisfy({ header.contains($0) }) else { return safeHeader(csv) }
         let blankIdx = Set(header.enumerated().filter { blankColumns.contains($0.element) }.map { $0.offset })
-        if blankIdx.isEmpty { return csv }   // none of the requested columns exist here
 
         var records = [header]
         for record in document.records.dropFirst() {
@@ -224,13 +251,6 @@ enum ContributionCsv {
 
         return ParsedDocument(records: records, recordSeparator: firstRecordSeparator ?? "\n",
                               endsWithRecordSeparator: endsWithRecordSeparator)
-    }
-
-    /// Compatibility helper for callers parsing exactly one record. Malformed input yields no
-    /// partially parsed fields.
-    static func parseLine(_ line: String) -> [String] {
-        guard let records = parseDocument(line)?.records, records.count == 1 else { return [] }
-        return records[0]
     }
 
     private static func serialize(_ records: [[String]], separator: String,

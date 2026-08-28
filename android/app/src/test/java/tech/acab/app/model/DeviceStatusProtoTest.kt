@@ -14,7 +14,8 @@ import org.junit.Test
  * every existing user on the day this ships. Kept as a fixture rather than a code read, because the
  * failure is silent and lands on people who did nothing wrong.
  *
- * Mirrors the iOS DeviceStatusProtoTests fixtures; both sides parse the same three JSON strings.
+ * Mirrors the iOS DeviceStatusProtoTests fixtures; both sides parse the same JSON fixture
+ * strings, verbatim.
  */
 class DeviceStatusProtoTest {
 
@@ -57,5 +58,62 @@ class DeviceStatusProtoTest {
         assertEquals(1, s.protoVersion)
         assertFalse(s.needsNewerApp)
         assertEquals("x", s.firmware)
+    }
+
+    @Test
+    fun `buffer health fields default off on every fresh status`() {
+        val s = status("""{"fw":"x","buf":9,"bufon":true}""")
+        assertFalse(s.bufferSaturated)
+        assertEquals(0L, s.bufferFaults)
+        assertFalse(s.bufferKeyMismatch)
+        assertEquals(emptyList<BufferHealthNotice>(), s.bufferHealthNotices)
+    }
+
+    @Test
+    fun `key mismatch preserves history and becomes a persistent transfer warning`() {
+        val s = status("""{"fw":"x","buf":9,"keymis":true}""")
+        assertTrue(s.bufferKeyMismatch)
+        assertEquals(listOf(BufferHealthNotice.KEY_NOT_ACCEPTED), s.bufferHealthNotices)
+        assertEquals(
+            "This phone’s buffer key was not accepted. Existing history was preserved and was not replayed. Sync with the originating phone, or explicitly clear the board buffer to transfer.",
+            s.bufferHealthNotices.single().detail,
+        )
+        assertTrue(s.bufferHealthNotices.single().critical)
+    }
+
+    @Test
+    fun `buffer faults and saturation become ordered user-visible warnings`() {
+        // WRITE (0x04) and CRYPTO (0x40) make evidence incomplete; NVS (0x20) is historical.
+        val s = status("""{"fw":"x","bufsat":true,"buferr":100}""")
+        assertTrue(s.bufferSaturated)
+        assertEquals(100L, s.bufferFaults)
+        assertEquals(
+            listOf(
+                BufferHealthNotice.STORAGE_FAILED,
+                BufferHealthNotice.CAPACITY_REACHED,
+                BufferHealthNotice.PERSISTENCE_ERROR_RECORDED,
+            ),
+            s.bufferHealthNotices,
+        )
+        assertTrue(s.bufferHealthNotices[0].detail.contains("storage or encryption failure"))
+        assertTrue(s.bufferHealthNotices[0].detail.contains("may be missing or unavailable"))
+        assertTrue(s.bufferHealthNotices[1].detail.contains("may be missing"))
+        assertTrue(s.bufferHealthNotices[2].detail.contains("metadata save/load error"))
+        assertTrue(s.bufferHealthNotices[2].detail.contains("may already reflect a successful retry"))
+        assertTrue(s.bufferHealthNotices[2].detail.contains("replay timestamps"))
+        assertTrue(s.bufferHealthNotices[2].detail.contains("Clear the board buffer"))
+    }
+
+    @Test
+    fun `future uint32 high fault bit remains fail closed`() {
+        val s = status("""{"fw":"x","buferr":2147483648}""")
+        assertEquals(0x8000_0000L, s.bufferFaults)
+        assertEquals(listOf(BufferHealthNotice.STORAGE_FAILED), s.bufferHealthNotices)
+    }
+
+    @Test
+    fun `nvs retry alone is not mislabeled as raw storage failure`() {
+        val s = status("""{"fw":"x","buferr":32}""")
+        assertEquals(listOf(BufferHealthNotice.PERSISTENCE_ERROR_RECORDED), s.bufferHealthNotices)
     }
 }

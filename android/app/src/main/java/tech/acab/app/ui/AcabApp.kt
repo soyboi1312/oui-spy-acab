@@ -1,7 +1,5 @@
 package tech.acab.app.ui
 
-import android.Manifest
-import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -25,11 +23,13 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.filled.BluetoothDisabled
@@ -49,6 +49,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -64,8 +65,14 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -75,6 +82,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import tech.acab.app.ble.AcabBleManager
 import tech.acab.app.ble.ConnState
+import tech.acab.app.ble.DetectionNotifier
 import tech.acab.app.ble.FoundBoard
 import tech.acab.app.ble.OtaPhase
 import tech.acab.app.ble.OtaProgress
@@ -89,6 +97,46 @@ internal fun shouldUseReconnectShell(
     otaActive: Boolean,
 ): Boolean = shellEstablished && hadLink && state == ConnState.CONNECTING && !otaActive
 
+internal fun shouldPresentFirstRunTour(seen: Boolean, deferred: Boolean): Boolean =
+    !seen && !deferred
+
+/** READY must open the real orientation before any effect can start Live Mode. */
+internal fun shouldOpenRealFirstRunTour(
+    state: ConnState,
+    demoMode: Boolean,
+    seen: Boolean,
+    deferred: Boolean,
+): Boolean = state == ConnState.READY && !demoMode &&
+    shouldPresentFirstRunTour(seen = seen, deferred = deferred)
+
+/** Automatic Live startup is earned only by explicitly finishing or skipping the real tour. */
+internal fun shouldAttemptDefaultLive(
+    state: ConnState,
+    demoMode: Boolean,
+    tourSeen: Boolean,
+    promptDeferred: Boolean,
+    wanted: Boolean,
+    active: Boolean,
+    attempted: Boolean,
+): Boolean = state == ConnState.READY && !demoMode && tourSeen && !promptDeferred && wanted &&
+    !active && !attempted
+
+enum class NearbyPermissionDenial { NONE, RETRYABLE, SETTINGS }
+
+/** Turn the platform permission result into a stable, directly renderable recovery state. */
+internal fun resolveNearbyPermissionDenial(
+    granted: Boolean,
+    requestedBefore: Boolean,
+    canAskAgain: Boolean,
+): NearbyPermissionDenial = when {
+    granted || !requestedBefore -> NearbyPermissionDenial.NONE
+    canAskAgain -> NearbyPermissionDenial.RETRYABLE
+    else -> NearbyPermissionDenial.SETTINGS
+}
+
+internal fun canRetryAllMissingPermissions(missingPermissionCanAskAgain: List<Boolean>): Boolean =
+    missingPermissionCanAskAgain.isNotEmpty() && missingPermissionCanAskAgain.all { it }
+
 /**
  * The pre-connection / first-run screen: says what the beacon hears, explains the permissions
  * before the OS asks, scans for a board, and offers a first-class "tour on sample data" path.
@@ -98,16 +146,26 @@ internal fun shouldUseReconnectShell(
 fun AcabApp(
     ble: AcabBleManager,
     permissionsGranted: Boolean,
+    locationGranted: Boolean,
+    notificationsAvailable: Boolean,
+    nearbyPermissionDenial: NearbyPermissionDenial,
+    liveNotificationDenied: Boolean,
     onRequestPermissions: () -> Unit,
+    onRequestLocation: () -> Unit,
+    onStartDefaultLiveMode: (requestNotification: Boolean) -> Unit,
+    onLiveNotificationDenialHandled: () -> Unit,
 ) {
     val state by ble.state.collectAsState()
     val found by ble.found.collectAsState()
+    val connectHint by ble.connectHint.collectAsState()
+    val scanHint by ble.scanHint.collectAsState()
     val ota by ble.otaProgress.collectAsState()
-    val detections by ble.detections.collectAsState()
+    val logDetections by ble.logDetections.collectAsState()
     val demoMode by ble.demoMode.collectAsState()
+    val liveMode by ble.driveMode.collectAsState()
+    val liveModeWanted by ble.driveModeWanted.collectAsState()
     val uriHandler = LocalUriHandler.current
     val context = LocalContext.current
-    val activity = context as? Activity
 
     // Once the app shell has existed, keep that single composition alive for the rest of this
     // activity. A transient reconnect must not destroy an in-progress contribution capture,
@@ -142,35 +200,84 @@ fun AcabApp(
     var userStoppedScan by remember { mutableStateOf(false) }
     var scanEndedEmpty by remember { mutableStateOf(false) }
     var prevConnState by remember { mutableStateOf(state) }
-    LaunchedEffect(state) {
-        if (state == ConnState.SCANNING) scanEndedEmpty = false
+    LaunchedEffect(state, scanHint) {
+        if (state == ConnState.SCANNING || scanHint != null) scanEndedEmpty = false
         if (prevConnState == ConnState.SCANNING && state == ConnState.DISCONNECTED &&
-            found.isEmpty() && !userStoppedScan) {
+            found.isEmpty() && !userStoppedScan && scanHint == null) {
             scanEndedEmpty = true
         }
         if (state != ConnState.SCANNING) userStoppedScan = false
         prevConnState = state
     }
 
-    // "Don't allow" twice (or the OS auto-deny) makes the permission prompt return immediately
-    // with no dialog, which left the CTA a silent no-op forever. rationale == false only means
-    // "permanently denied" once we know we HAVE asked, so remember that across launches (the
-    // denial itself persists across launches too). Checked at composition for the relaunch case
-    // and re-checked on each CTA tap for the denied-twice-this-session case.
-    val prefs = remember { context.getSharedPreferences("acab_ui", Context.MODE_PRIVATE) }
-    var askedBefore by remember { mutableStateOf(prefs.getBoolean(KEY_PERMS_REQUESTED, false)) }
-    fun permanentlyDenied() = !permissionsGranted && askedBefore && activity != null &&
-        scanPermissions().none { activity.shouldShowRequestPermissionRationale(it) }
-    var showDeniedPanel by remember { mutableStateOf(permanentlyDenied()) }
-
     val otaActive = ota.phase != OtaPhase.IDLE && ota.phase != OtaPhase.DONE && ota.phase != OtaPhase.FAILED
     val reconnectUsable = shouldUseReconnectShell(shellEstablished, hadLink, state, otaActive)
-    // Hoisted so the shell can be removed from the semantics tree while the opaque first-run
-    // overlay is visible. Demo must not spend the one-time tour on sample data.
+    // Hoisted so the shell can be removed from the semantics tree while an orientation overlay is
+    // visible. Sample data gets its own non-persisting orientation and never spends the real tour.
     var tourDone by rememberSaveable { mutableStateOf(FirstRunTour.hasSeen(context)) }
-    val firstRunTourOpen = shellEstablished && state == ConnState.READY && !demoMode && !tourDone
+    // Android Back temporarily dismisses the tour without writing its one-time seen flag. The
+    // explicit skip and final buttons are the only actions that spend it.
+    var tourDeferred by rememberSaveable { mutableStateOf(false) }
+    // Derive directly from the authoritative link state. shellEstablished flips in a
+    // LaunchedEffect, which is one frame too late to prevent the Live-start effect from winning.
+    val firstRunTourOpen = shouldOpenRealFirstRunTour(
+        state = state,
+        demoMode = demoMode,
+        seen = tourDone,
+        deferred = tourDeferred,
+    )
+    var sampleTourHandled by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(demoMode) {
+        if (!demoMode) sampleTourHandled = false
+    }
+    val sampleTourOpen = state == ConnState.READY && demoMode && !sampleTourHandled
+
+    // Help must remain reachable before a beacon connects, which is when setup questions happen.
+    var preConnectHelpOpen by rememberSaveable { mutableStateOf(false) }
+
+    // Live Mode defaults on, but Android 13+ needs a notification permission before its glanceable
+    // surface can appear. Explain that request only after the real-board orientation has closed.
+    // The explanation is persisted independently from the one-time product tour: denying the OS
+    // prompt must not cause a nag on every reconnect; Beacon readiness shows the recovery instead.
+    val livePromptPrefs = remember { context.getSharedPreferences("acab_ui", Context.MODE_PRIVATE) }
+    var livePermissionExplained by remember {
+        mutableStateOf(livePromptPrefs.getBoolean(KEY_LIVE_PERMISSION_EXPLAINED, false))
+    }
+    var showLivePermissionPrompt by rememberSaveable { mutableStateOf(false) }
+    // Scrim, Back, and Not now defer both the rationale and automatic start for this Activity
+    // session. Saveable keeps that promise across rotation and reconnects without persisting Off.
+    var livePromptDeferred by rememberSaveable { mutableStateOf(false) }
+    // Session-only: activity recreation while Android owns the permission dialog must retry the
+    // start after the result is delivered, rather than restoring a stale "attempted" latch.
+    var liveStartAttempted by remember { mutableStateOf(false) }
+    val notificationRuntimeGranted = DetectionNotifier.hasPostPermission(context)
+    LaunchedEffect(state, demoMode, tourDone, livePromptDeferred, liveModeWanted, liveMode,
+        notificationsAvailable, livePermissionExplained) {
+        if (state != ConnState.READY || demoMode) {
+            liveStartAttempted = false
+            showLivePermissionPrompt = false
+            return@LaunchedEffect
+        }
+        if (shouldAttemptDefaultLive(
+                state = state,
+                demoMode = demoMode,
+                tourSeen = tourDone,
+                promptDeferred = livePromptDeferred,
+                wanted = liveModeWanted,
+                active = liveMode,
+                attempted = liveStartAttempted,
+            )) {
+            liveStartAttempted = true
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                !notificationRuntimeGranted && !livePermissionExplained) {
+                showLivePermissionPrompt = true
+            } else {
+                onStartDefaultLiveMode(false)
+            }
+        }
+    }
     val shellCovered = shellEstablished &&
-        ((state != ConnState.READY && !reconnectUsable) || firstRunTourOpen)
+        ((state != ConnState.READY && !reconnectUsable) || firstRunTourOpen || sampleTourOpen)
 
     Box(Modifier.fillMaxSize()) {
     if (shellEstablished) {
@@ -185,7 +292,14 @@ fun AcabApp(
                     }
                 }
         } else Modifier
-        MainScreen(ble, reconnecting = reconnectUsable, modifier = shellModifier)
+        MainScreen(
+            ble = ble,
+            reconnecting = reconnectUsable,
+            locationGranted = locationGranted,
+            notificationsAvailable = notificationsAvailable,
+            onRequestLocation = onRequestLocation,
+            modifier = shellModifier,
+        )
     }
 
     // Once linked, hand off to the four-tab shell, but the FIRST time a real board connects,
@@ -194,7 +308,68 @@ fun AcabApp(
     // one-time moment on a fake board (mirrors iOS RootView).
     if (state == ConnState.READY) {
         if (firstRunTourOpen) {
-            FirstRunTourOverlay(onFinish = { FirstRunTour.markSeen(context); tourDone = true })
+            FirstRunTourOverlay(
+                onBack = { tourDeferred = true },
+                onFinish = { FirstRunTour.markSeen(context); tourDone = true },
+            )
+        } else if (sampleTourOpen) {
+            FirstRunTourOverlay(
+                sampleMode = true,
+                onBack = { sampleTourHandled = true },
+                onFinish = { sampleTourHandled = true },
+            )
+        }
+        if (showLivePermissionPrompt) {
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = {
+                    showLivePermissionPrompt = false
+                    livePromptDeferred = true
+                    // Back/scrim is a defer, not an explicit settings change. Persisting Off here
+                    // made an accidental outside tap defeat the fresh-install default forever.
+                },
+                containerColor = Acab.bg2,
+                titleContentColor = Acab.text,
+                title = { Text("Keep Live Mode at a glance?", fontWeight = FontWeight.SemiBold) },
+                text = {
+                    Text(
+                        "Live Mode keeps a private counter in the status bar and on the lock " +
+                            "screen while your beacon is connected. Android may ask to allow notifications next.",
+                        color = Acab.dim,
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            livePromptPrefs.edit().putBoolean(KEY_LIVE_PERMISSION_EXPLAINED, true).apply()
+                            livePermissionExplained = true
+                            showLivePermissionPrompt = false
+                            onStartDefaultLiveMode(true)
+                        },
+                    ) {
+                        Text("CONTINUE", color = Acab.accent, fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = {
+                            showLivePermissionPrompt = false
+                            livePromptDeferred = true
+                            // "Not now" defers the one-time prompt for this session; the dedicated
+                            // Live Mode toggle remains the only control that persists Off.
+                        },
+                    ) {
+                        Text("NOT NOW", color = Acab.dim, fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+                    }
+                },
+            )
+        }
+        if (liveNotificationDenied && !firstRunTourOpen && !showLivePermissionPrompt) {
+            LiveNotificationBlockedBanner(
+                onDismiss = onLiveNotificationDenialHandled,
+                modifier = Modifier.align(Alignment.TopCenter),
+            )
         }
         return@Box
     }
@@ -214,7 +389,17 @@ fun AcabApp(
     }
 
     if (showSavedLog) {
-        SavedLogScreen(ble, onClose = { showSavedLog = false })
+        SavedLogScreen(
+            ble = ble,
+            locationGranted = locationGranted,
+            onRequestLocation = onRequestLocation,
+            onClose = { showSavedLog = false },
+        )
+        return@Box
+    }
+
+    if (preConnectHelpOpen) {
+        PreConnectHelpScreen(onClose = { preConnectHelpOpen = false })
         return@Box
     }
 
@@ -231,19 +416,35 @@ fun AcabApp(
                 Modifier.weight(1f).fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                item { BeaconHearsPanel() }
-
                 when (state) {
                     ConnState.CONNECTING ->
-                        if (hadLink) item { ReconnectingPanel(onStop = { ble.disconnect() }) }
-                        else item { ConnectingRow("Connecting…", onCancel = { ble.disconnect() }) }
-                    ConnState.BONDING -> item { ConnectingRow("Pairing…", onCancel = { ble.disconnect() }) }
-                    ConnState.POWERED_OFF -> item { RadioOffPanel() }
+                        if (hadLink) item { ReconnectingPanel(onStop = { ble.stopConnectionAndScan() }) }
+                        else item {
+                            ConnectingRow(
+                                text = "Connecting…",
+                                guidance = "Keep the beacon powered and nearby.",
+                                onCancel = { ble.stopConnectionAndScan() },
+                            )
+                        }
+                    ConnState.BONDING -> item {
+                        ConnectingRow(
+                            text = "Pairing…",
+                            guidance = "Keep the beacon powered and nearby. Approve Android's pairing request if it appears.",
+                            onCancel = { ble.stopConnectionAndScan() },
+                        )
+                    }
+                    ConnState.POWERED_OFF -> item {
+                        RadioOffPanel(onOpenBluetoothSettings = {
+                            runCatching {
+                                context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                            }.onFailure {
+                                context.startActivity(Intent(Settings.ACTION_SETTINGS))
+                            }
+                        })
+                    }
                     else -> {
-                        if (showDeniedPanel && !permissionsGranted) {
-                            // The OS will never show the prompt again; the app's Settings page
-                            // is the only way back in, so send the user straight there.
-                            item {
+                        when {
+                            !permissionsGranted && nearbyPermissionDenial == NearbyPermissionDenial.SETTINGS -> item {
                                 PermissionDeniedPanel(onOpenSettings = {
                                     context.startActivity(
                                         Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
@@ -251,22 +452,20 @@ fun AcabApp(
                                     )
                                 })
                             }
-                        } else {
+                            !permissionsGranted && nearbyPermissionDenial == NearbyPermissionDenial.RETRYABLE -> item {
+                                PermissionRetryPanel(onTryAgain = onRequestPermissions)
+                            }
+                            else -> {
                             item {
                                 ScanCtaPanel(
                                     permissionsGranted = permissionsGranted,
                                     scanning = state == ConnState.SCANNING,
                                     onAllowScan = {
                                         when {
-                                            !permissionsGranted && permanentlyDenied() -> showDeniedPanel = true
-                                            !permissionsGranted -> {
-                                                prefs.edit().putBoolean(KEY_PERMS_REQUESTED, true).apply()
-                                                askedBefore = true
-                                                onRequestPermissions()
-                                            }
-                                            // The CTA is a stop/start toggle while a scan runs (iOS parity).
+                                            !permissionsGranted -> onRequestPermissions()
+                                            // The CTA is an explicit stop/start toggle while a scan runs.
                                             // userStoppedScan: a deliberate stop must not raise
-                                            // the "No boards found" timeout message.
+                                            // the "No beacons found" timeout message.
                                             state == ConnState.SCANNING -> {
                                                 userStoppedScan = true; ble.stopScan()
                                             }
@@ -277,19 +476,43 @@ fun AcabApp(
                             }
                             if (found.isEmpty() && state == ConnState.SCANNING) {
                                 item {
-                                    Text("Looking for your board…", color = Acab.dim,
-                                        fontSize = 12.sp, fontFamily = Acab.mono)
+                                    Text(
+                                        "Looking for your beacon…",
+                                        color = Acab.dim,
+                                        fontSize = 12.sp,
+                                        fontFamily = Acab.mono,
+                                        modifier = Modifier.semantics {
+                                            liveRegion = LiveRegionMode.Polite
+                                        },
+                                    )
+                                }
+                            }
+                            if (state != ConnState.SCANNING) {
+                                scanHint?.let { hint ->
+                                    item { ScanFailurePanel(hint = hint, onRetry = { ble.startScan() }) }
                                 }
                             }
                             // The scan window closed with nothing heard: say so and offer the
                             // retry, instead of the spinner silently becoming a resting button.
-                            if (scanEndedEmpty && state != ConnState.SCANNING && found.isEmpty()) {
+                            if (scanHint == null && scanEndedEmpty && state != ConnState.SCANNING && found.isEmpty()) {
                                 item { NoBoardsFoundPanel(onScanAgain = { ble.startScan() }) }
                             }
+                            if (state != ConnState.SCANNING) {
+                                connectHint?.let { hint ->
+                                    item {
+                                        ConnectionHintPanel(hint = hint, onRetry = { ble.startScan() })
+                                    }
+                                }
+                            }
                             items(found) { board -> BoardRow(board, onConnect = { ble.connect(board) }) }
+                            }
                         }
                     }
                 }
+
+                // The first action stays above the catalog, especially at large text sizes.
+                item { BeaconHearsPanel() }
+                item { SetupHelpCard(onClick = { preConnectHelpOpen = true }) }
 
                 // Demo is a first-class path: explore the full app on sample data, no board needed.
                 if (state != ConnState.CONNECTING && state != ConnState.BONDING) {
@@ -302,12 +525,11 @@ fun AcabApp(
                     // even do" because it IS the app on sample data. It leads now, and it is the only
                     // filled card so it reads as the primary action for anyone stuck.
                     item { DemoCard(onClick = { ble.seedDemoData() }) }
-                    if (!demoMode && detections.isNotEmpty()) {
-                        item { SavedLogCard(count = detections.size, onClick = { showSavedLog = true }) }
+                    if (!demoMode && logDetections.isNotEmpty()) {
+                        item { SavedLogCard(count = logDetections.size, onClick = { showSavedLog = true }) }
                     }
-                    // No board yet? Point straight at the shop.
+                    // No beacon yet? Point straight at the shop.
                     item { GetBeaconCard(onClick = { uriHandler.openUri("https://soyboi.tech") }) }
-                    item { SoyboiLink(onClick = { uriHandler.openUri("https://soyboi.tech") }) }
                 }
             }
 
@@ -331,12 +553,8 @@ private fun WordmarkHero() {
     }
 }
 
-/** The six signatures the beacon listens for, as a SINGLE row of glyph tiles on every font size,
- *  matching iOS. Each tile is an equal-weight column so all six always share one row; when a label
- *  is too wide for its column it wraps to two lines rather than the tiles wrapping to a second row,
- *  which is what used to happen at large font sizes (columns dropped to 3, so a 5-item strip became
- *  two rows). Network cameras belong here beside trackers: both are opt-in, and the copy below
- *  names them, so leaving the glyph out read as a gap. */
+/** The six signatures the beacon listens for. Normal text keeps a compact six-up strip; large text
+ *  reflows to two three-up rows so labels and TalkBack targets stay usable. */
 @Composable
 private fun BeaconHearsPanel() {
     val hears = listOf(
@@ -349,18 +567,28 @@ private fun BeaconHearsPanel() {
     )
     Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Kicker("WHAT YOUR BEACON CAN HEAR")
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            hears.forEach { (type, label) ->
-                Column(
-                    Modifier.weight(1f),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(7.dp),
-                ) {
-                    CatGlyph(type, size = 30, filled = true)
-                    Text(label, color = Acab.dim, fontSize = 8.5.sp,
-                        fontFamily = Acab.mono, maxLines = 2,
-                        textAlign = TextAlign.Center)
+        val groups = if (LocalDensity.current.fontScale >= 1.35f) hears.chunked(3) else listOf(hears)
+        groups.forEach { group ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                group.forEach { (type, label) ->
+                    Column(
+                        Modifier.weight(1f).minimumInteractiveComponentSize().clearAndSetSemantics {
+                            contentDescription = when (type) {
+                                DeviceType.TRACKER -> "Bluetooth tracker detector, optional"
+                                DeviceType.NETWORK_CAMERA -> "Network camera detector, optional"
+                                else -> "${type.label} detector"
+                            }
+                        },
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(7.dp),
+                    ) {
+                        CatGlyph(type, size = 30, filled = true)
+                        Text(label, color = Acab.dim, fontSize = 8.5.sp,
+                            fontFamily = Acab.mono, maxLines = 2,
+                            textAlign = TextAlign.Center)
+                    }
                 }
+                repeat((3 - group.size).coerceAtLeast(0)) { Spacer(Modifier.weight(1f)) }
             }
         }
         Text(
@@ -378,19 +606,29 @@ private fun BeaconHearsPanel() {
 @Composable
 private fun ScanCtaPanel(permissionsGranted: Boolean, scanning: Boolean, onAllowScan: () -> Unit) {
     Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(13.dp)) {
+        Text(
+            "Power on your beacon and keep it nearby.",
+            color = Acab.text,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
         if (!permissionsGranted) {
             Kicker("BEFORE THE SYSTEM ASKS")
-            RationaleRow(Icons.Filled.Bluetooth, "Bluetooth",
-                "pairs you to the beacon. The board does the listening, not your phone.")
-            // The claim is scoped honestly: explicit export and the contribution composer
-            // exist, so "nothing leaves this phone" would be a lie. Uploads: never automatic.
-            RationaleRow(Icons.Filled.LocationOn, "Location",
-                "pins observer-based hits to the map and sends your current coordinates over encrypted local Bluetooth to your own beacon for geotagging. Drones can still provide their own Remote ID position if you decline. The app does not automatically upload detections or location to us. Beyond your own beacon, they reach another recipient only when you explicitly export or send them. Map tiles and optional datasets are requested from their providers. No account is required.")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                RationaleRow(
+                    Icons.Filled.Bluetooth,
+                    "Nearby devices",
+                    "finds and connects to your beacon. The beacon does the listening, not your phone.",
+                )
+            } else {
+                RationaleRow(Icons.Filled.LocationOn, "Location",
+                    "is required by this Android version to scan for Bluetooth devices. it also records where your phone heard a detection. detections and location are never uploaded automatically.")
+            }
         }
         val label = when {
-            !permissionsGranted -> "Allow & scan for boards"
-            scanning -> "Scanning…"
-            else -> "Scan for boards"
+            !permissionsGranted -> "Allow & scan for beacons"
+            scanning -> "Stop scanning"
+            else -> "Scan for beacons"
         }
         PrimaryButton(label, onAllowScan)
         PairWindowNote()
@@ -442,8 +680,26 @@ private fun RationaleRow(icon: ImageVector, lead: String, rest: String) {
 /** One discovered board: cpu glyph, name, firmware pill, short id, signal bars, RSSI (iOS anatomy). */
 @Composable
 private fun BoardRow(board: FoundBoard, onConnect: () -> Unit) {
+    val bars = rssiBars(board.rssi)
+    val signal = when {
+        bars >= 4 -> "strong"
+        bars == 3 -> "good"
+        bars == 2 -> "fair"
+        else -> "weak"
+    }
+    val addrHi = board.device.address.substringBefore(':').toIntOrNull(16) ?: 0
+    val stableAddress = board.device.address.takeIf { (addrHi shr 6) != 0b01 }
+    val spoken = buildString {
+        append(board.name)
+        board.firmware?.let { append(", firmware ").append(it) }
+        append(", ").append(signal).append(" signal")
+        stableAddress?.let { append(", hardware address ").append(it) }
+    }
     Row(
-        Modifier.fillMaxWidth().clickable { onConnect() }.panel(),
+        Modifier.fillMaxWidth()
+            .clickable(onClickLabel = "connect to ${board.name}", role = Role.Button) { onConnect() }
+            .semantics(mergeDescendants = true) { contentDescription = spoken }
+            .panel(),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(Icons.Filled.Memory, contentDescription = null, tint = Acab.accent,
@@ -477,20 +733,25 @@ private fun BoardRow(board: FoundBoard, onConnect: () -> Unit) {
             // iOS deliberately differs and needs no equivalent: CoreBluetooth never exposes a peer
             // MAC at all, it substitutes a per-host UUID that stays stable for that phone, which is
             // why ConnectView keeps showing its 8-character handle.
-            val addrHi = board.device.address.substringBefore(':').toIntOrNull(16) ?: 0
-            if ((addrHi shr 6) != 0b01) {
-                Text(board.device.address, color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono)
+            if (stableAddress != null) {
+                Text(stableAddress, color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono)
             }
         }
-        SignalBars(rssiBars(board.rssi), tint = Acab.accent)
+        SignalBars(bars, tint = Acab.accent)
         Spacer(Modifier.width(8.dp))
-        Text("${board.rssi}", color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
+        Text("$signal · ${board.rssi} dBm", color = Acab.dim, fontSize = 11.sp,
+            fontFamily = Acab.mono)
     }
 }
 
 @Composable
-private fun ConnectingRow(text: String, onCancel: () -> Unit) {
-    Box(Modifier.fillMaxWidth().padding(vertical = 44.dp), contentAlignment = Alignment.Center) {
+private fun ConnectingRow(text: String, guidance: String, onCancel: () -> Unit) {
+    Box(
+        Modifier.fillMaxWidth().padding(vertical = 44.dp).semantics {
+            liveRegion = LiveRegionMode.Polite
+        },
+        contentAlignment = Alignment.Center,
+    ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -498,6 +759,15 @@ private fun ConnectingRow(text: String, onCancel: () -> Unit) {
             CircularProgressIndicator(color = Acab.accent, strokeWidth = 3.dp,
                 modifier = Modifier.size(28.dp))
             Text(text, color = Acab.dim, fontSize = 13.sp, fontFamily = Acab.mono)
+            Text(
+                guidance,
+                color = Acab.faint,
+                fontSize = 11.sp,
+                fontFamily = Acab.mono,
+                lineHeight = 16.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 24.dp),
+            )
             // A stuck bond/connect (a powered-off board still in the scan list, an OS pairing
             // prompt dismissed) otherwise leaves this spinner with no way out but a cold launch.
             // disconnect() tears down the pending client, including the never-linked case.
@@ -532,16 +802,17 @@ private fun CancelConnectButton(onClick: () -> Unit) {
 @Composable
 private fun ReconnectingPanel(onStop: () -> Unit) {
     Column(
-        Modifier.fillMaxWidth().panel().padding(horizontal = 4.dp, vertical = 26.dp),
+        Modifier.fillMaxWidth().panel().padding(horizontal = 4.dp, vertical = 26.dp)
+            .semantics { liveRegion = LiveRegionMode.Polite },
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         CircularProgressIndicator(color = Acab.accent, strokeWidth = 3.dp,
             modifier = Modifier.size(28.dp))
-        Text("Reconnecting to your board…", color = Acab.text, fontSize = 15.sp,
+        Text("Reconnecting to your beacon…", color = Acab.text, fontSize = 15.sp,
             fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
         Text(
-            "It reconnects on its own the moment the board is back in range, even in the background. Keep waiting, or stop to scan for a different board.",
+            "It reconnects on its own the moment the beacon is back in range, even in the background. Keep waiting, or stop to scan for a different beacon.",
             color = Acab.dim, fontSize = 11.5.sp, fontFamily = Acab.mono, lineHeight = 16.sp,
             textAlign = TextAlign.Center,
         )
@@ -555,18 +826,48 @@ private fun ReconnectingPanel(onStop: () -> Unit) {
 @Composable
 private fun PermissionDeniedPanel(onOpenSettings: () -> Unit) {
     Column(
-        Modifier.fillMaxWidth().padding(vertical = 36.dp),
+        Modifier.fillMaxWidth().padding(vertical = 36.dp)
+            .semantics { liveRegion = LiveRegionMode.Polite },
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Icon(Icons.Filled.Lock, contentDescription = null, tint = Acab.dim,
             modifier = Modifier.size(34.dp))
-        Text("Bluetooth not allowed", color = Acab.text, fontSize = 16.sp,
+        Text(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) "Nearby devices not allowed"
+            else "Location not allowed",
+            color = Acab.text, fontSize = 16.sp,
             fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
-        Text("Enable Bluetooth for beacons in Settings.", color = Acab.dim, fontSize = 12.sp,
+        Text(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+                "Allow Nearby devices for beacons in Settings. It is used only to find and connect to your beacon."
+            else
+                "Allow Location for beacons in Settings. This Android version requires it to find Bluetooth beacons.",
+            color = Acab.dim, fontSize = 12.sp,
             fontFamily = Acab.mono, textAlign = TextAlign.Center)
         Spacer(Modifier.height(2.dp))
         PrimaryButton("Open Settings", onOpenSettings)
+    }
+}
+
+/** A retryable first denial. This appears as soon as Android returns the result. */
+@Composable
+private fun PermissionRetryPanel(onTryAgain: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().panel().semantics { liveRegion = LiveRegionMode.Polite },
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+                "Nearby devices permission was not allowed. It is used only to find and connect to your beacon. The beacon does the listening."
+            else
+                "Location was not allowed. This Android version requires it to find Bluetooth beacons. Nothing is uploaded automatically.",
+            color = Acab.dim,
+            fontSize = 12.sp,
+            fontFamily = Acab.mono,
+            lineHeight = 17.sp,
+        )
+        PrimaryButton("TRY AGAIN", onTryAgain)
     }
 }
 
@@ -576,19 +877,49 @@ private fun PermissionDeniedPanel(onOpenSettings: () -> Unit) {
 @Composable
 private fun NoBoardsFoundPanel(onScanAgain: () -> Unit) {
     Column(
-        Modifier.fillMaxWidth().panel(),
+        Modifier.fillMaxWidth().panel().semantics { liveRegion = LiveRegionMode.Polite },
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("No boards found. Make sure your beacon is powered on and nearby, then scan again.",
+        Text("No beacons found. Make sure your beacon is powered on and nearby, then scan again.",
             color = Acab.dim, fontSize = 12.sp, fontFamily = Acab.mono, lineHeight = 17.sp)
         PrimaryButton("SCAN AGAIN", onScanAgain)
+    }
+}
+
+/** A platform scanner failure is not the same thing as an empty scan. */
+@Composable
+private fun ScanFailurePanel(hint: String, onRetry: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().panel().semantics { liveRegion = LiveRegionMode.Assertive },
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("Bluetooth scan did not start", color = Acab.text, fontSize = 14.sp,
+            fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+        Text(hint, color = Acab.warn, fontSize = 12.sp, fontFamily = Acab.mono,
+            lineHeight = 17.sp)
+        PrimaryButton("TRY AGAIN", onRetry)
+    }
+}
+
+/** Actionable recovery after a connection attempt ended before the link became usable. */
+@Composable
+private fun ConnectionHintPanel(hint: String, onRetry: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().panel().semantics { liveRegion = LiveRegionMode.Assertive },
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("Connection didn't finish", color = Acab.text, fontSize = 14.sp,
+            fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+        Text(hint, color = Acab.warn, fontSize = 12.sp, fontFamily = Acab.mono,
+            lineHeight = 17.sp)
+        PrimaryButton("SCAN AGAIN", onRetry)
     }
 }
 
 /** Radio-off screen, shown when the phone's Bluetooth is turned off (mirrors iOS). Recovers on
  *  its own when the radio comes back, via the adapter receiver in AcabBleManager. */
 @Composable
-private fun RadioOffPanel() {
+private fun RadioOffPanel(onOpenBluetoothSettings: () -> Unit) {
     Box(Modifier.fillMaxWidth().padding(vertical = 40.dp), contentAlignment = Alignment.Center) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -598,8 +929,9 @@ private fun RadioOffPanel() {
                 modifier = Modifier.size(34.dp))
             Text("Bluetooth is off", color = Acab.text, fontSize = 16.sp,
                 fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
-            Text("Turn on Bluetooth to find your board.", color = Acab.dim, fontSize = 12.sp,
+            Text("Turn on Bluetooth to find your beacon.", color = Acab.dim, fontSize = 12.sp,
                 fontFamily = Acab.mono, textAlign = TextAlign.Center)
+            PrimaryButton("OPEN BLUETOOTH SETTINGS", onOpenBluetoothSettings)
         }
     }
 }
@@ -631,7 +963,7 @@ private fun SavedLogCard(count: Int, onClick: () -> Unit) {
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text("View saved log ($count)", color = Acab.text, fontSize = 13.sp,
                 fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
-            Text("history on this phone · browse and export, no board needed", color = Acab.dim,
+            Text("history on this phone · browse and export, no beacon needed", color = Acab.dim,
                 fontSize = 10.sp, fontFamily = Acab.mono)
         }
         Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = Acab.faint,
@@ -665,6 +997,30 @@ private fun DemoCard(onClick: () -> Unit) {
     }
 }
 
+/** Offline setup and pairing help, available before a successful connection. */
+@Composable
+private fun SetupHelpCard(onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth()
+            .border(1.dp, Acab.lineStrong, RoundedCornerShape(Acab.radiusSm))
+            .clickable(onClickLabel = "open setup and pairing help", role = Role.Button, onClick = onClick)
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Outlined.Info, contentDescription = null, tint = Acab.accent,
+            modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("Setup + pairing help", color = Acab.text, fontSize = 13.sp,
+                fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+            Text("offline help for power, permissions, pairing, and connection recovery",
+                color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono)
+        }
+        Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = Acab.faint,
+            modifier = Modifier.size(20.dp))
+    }
+}
+
 /** Outlined buy CTA: no board yet, get one. Opens the shop (soyboi.tech) in the browser. */
 @Composable
 private fun GetBeaconCard(onClick: () -> Unit) {
@@ -682,7 +1038,7 @@ private fun GetBeaconCard(onClick: () -> Unit) {
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text("Get a beacon", color = Acab.text, fontSize = 13.sp,
                 fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
-            Text("the board that does the listening · soyboi.tech", color = Acab.dim,
+            Text("the beacon that does the listening · soyboi.tech", color = Acab.dim,
                 fontSize = 10.sp, fontFamily = Acab.mono)
         }
         Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, tint = Acab.faint,
@@ -690,24 +1046,10 @@ private fun GetBeaconCard(onClick: () -> Unit) {
     }
 }
 
-/** Secondary text link to the same shop, for people who just want the plain URL. */
-@Composable
-private fun SoyboiLink(onClick: () -> Unit) {
-    Text(
-        "soyboi.tech",
-        color = Acab.accent,
-        fontSize = 10.5.sp,
-        fontFamily = Acab.mono,
-        textAlign = TextAlign.Center,
-        modifier = Modifier.fillMaxWidth().minimumInteractiveComponentSize()
-            .clickable { onClick() }.padding(top = 2.dp),
-    )
-}
-
 @Composable
 private fun ScopeFootnote() {
     Text(
-        "Passive detection only. beacons never jams, spoofs, or interferes.",
+        "Passive detection only. beacons never jam, spoof, or interfere.",
         color = Acab.dim,
         fontSize = 9.sp,
         fontFamily = Acab.mono,
@@ -716,11 +1058,79 @@ private fun ScopeFootnote() {
     )
 }
 
+/** Full-screen offline Help for a user who has not connected a beacon yet. */
+@Composable
+private fun PreConnectHelpScreen(onClose: () -> Unit) {
+    BackHandler(onBack = onClose)
+    Surface(Modifier.fillMaxSize(), color = Acab.bg) {
+        Column(
+            Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing),
+        ) {
+            Row(
+                Modifier.fillMaxWidth().minimumInteractiveComponentSize()
+                    .clickable(onClickLabel = "back to beacon setup", role = Role.Button, onClick = onClose)
+                    .padding(horizontal = Acab.pad, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null,
+                    tint = Acab.accent, modifier = Modifier.size(22.dp))
+                Spacer(Modifier.width(10.dp))
+                Text("Setup + pairing help", color = Acab.text, fontSize = 22.sp,
+                    fontWeight = FontWeight.SemiBold)
+            }
+            HelpScreen(
+                scrollToId = "q-setup",
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+            )
+        }
+    }
+}
+
+/** Immediate, dismissible recovery after Android declines the Live Mode notification request. */
+@Composable
+private fun LiveNotificationBlockedBanner(onDismiss: () -> Unit, modifier: Modifier = Modifier) {
+    Box(
+        modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.safeDrawing).padding(Acab.pad),
+        contentAlignment = Alignment.TopCenter,
+    ) {
+        Row(
+            Modifier.widthIn(max = 640.dp).fillMaxWidth().panel()
+                .semantics { liveRegion = LiveRegionMode.Assertive },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "Android blocked the Live Mode lock-screen and status-bar counter. You can allow notifications later under Beacon, System readiness.",
+                color = Acab.warn,
+                fontSize = 11.sp,
+                fontFamily = Acab.mono,
+                lineHeight = 16.sp,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "GOT IT",
+                color = Acab.accent,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = Acab.mono,
+                modifier = Modifier.minimumInteractiveComponentSize()
+                    .clickable(onClickLabel = "dismiss notification help", role = Role.Button, onClick = onDismiss)
+                    .padding(8.dp),
+            )
+        }
+    }
+}
+
 /** Full-screen, board-less view of the persisted log (the Log tab is normally gated behind a
  *  READY link). Everything inside is phone-local: view, mark seen, export CSV, clear; the
  *  board-config writes no-op while disconnected. Mirrors the iOS savedLogCard sheet. */
 @Composable
-private fun SavedLogScreen(ble: AcabBleManager, onClose: () -> Unit) {
+private fun SavedLogScreen(
+    ble: AcabBleManager,
+    locationGranted: Boolean,
+    onRequestLocation: () -> Unit,
+    onClose: () -> Unit,
+) {
     var selected by remember { mutableStateOf<Detection?>(null) }
     val uriHandler = LocalUriHandler.current
     // System back peels the dossier first, then closes the saved log (not the app).
@@ -752,23 +1162,20 @@ private fun SavedLogScreen(ble: AcabBleManager, onClose: () -> Unit) {
     // Dossier over the log, like MainScreen's compact overlay. "Open in map" has no Map tab to
     // land on with no board linked, so hand the coordinate to the system maps app instead.
     selected?.let { d ->
-        DetailScreen(d, ble, onBack = { selected = null }, onOpenInMap = { lat, lon ->
-            runCatching { uriHandler.openUri("geo:$lat,$lon?q=$lat,$lon") }
-        })
+        DetailScreen(
+            detection = d,
+            ble = ble,
+            onBack = { selected = null },
+            onOpenInMap = { lat, lon ->
+                runCatching { uriHandler.openUri("geo:$lat,$lon?q=$lat,$lon") }
+            },
+            locationGranted = locationGranted,
+            onRequestLocation = onRequestLocation,
+        )
     }
 }
 
-/** Prefs key: the permission prompt has been fired at least once (see the denied-for-good
- *  detection in AcabApp; rationale == false is only meaningful after a real ask). */
-private const val KEY_PERMS_REQUESTED = "perms_requested"
-
-/** What MainActivity.requiredPermissions gates scanning on, duplicated here (it's private to
- *  the activity) to ask "would the OS ever show the prompt again?". */
-private fun scanPermissions(): Array<String> =
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-        arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
-    else
-        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+private const val KEY_LIVE_PERMISSION_EXPLAINED = "live_permission_explained"
 
 /** Locked screen shown while an OTA is in flight but the link is down (the reboot/reconnect
  *  window). No scan/connect controls, so the reconnect loop can finish uninterrupted. */
@@ -788,12 +1195,12 @@ private fun OtaWaitScreen(ota: OtaProgress) {
                 fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
             Spacer(Modifier.height(8.dp))
             Text(
-                ota.message.ifBlank { "The board is rebooting into the new firmware. Keep the app open, it reconnects on its own." },
+                ota.message.ifBlank { "The beacon is rebooting into the new firmware. Keep the app open, it reconnects on its own." },
                 color = Acab.dim, fontSize = 12.sp, fontFamily = Acab.mono,
                 textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 24.dp),
             )
             Spacer(Modifier.height(6.dp))
-            Text("this can take up to a minute. don't unplug the board.",
+            Text("this can take up to a minute. don't unplug the beacon.",
                 color = Acab.faint, fontSize = 10.sp, fontFamily = Acab.mono, textAlign = TextAlign.Center)
         }
     }

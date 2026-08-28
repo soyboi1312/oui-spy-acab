@@ -80,15 +80,25 @@ fun contributionBlankColumns(
  * commas or record separators, so splitting on ',' or '\n' would misalign and blank the wrong
  * field. It parses the complete RFC 4180 document, blanks target columns by their HEADER-derived
  * index, and re-serialises. Malformed quoted input fails closed to a header-only CSV: sharing no
- * observations is safer than returning a row whose location fields could not be identified.
+ * observations is safer than returning a row whose location fields could not be identified. A
+ * requested column the header does not carry fails closed the same way, for the same reason.
  */
 fun redactCsvColumns(csv: String, blankColumnNames: Set<String>): String {
     if (csv.isEmpty()) return csv
     val document = parseCsvDocument(csv) ?: return safeCsvHeader(csv)
     if (blankColumnNames.isEmpty()) return csv
     val header = document.records.firstOrNull() ?: return ""
+    // Every policy column must be present. The emitter's header is DETECTION_CSV_COLUMNS and every
+    // set here is a subset of it, so a missing name means the two drifted - a renamed column - and
+    // blanking only the names that still match would ship the renamed coordinate under its new name
+    // in a file whose disclosure says it was removed. This used to return the ORIGINAL csv in that
+    // case, which is the one outcome the whole file exists to prevent. Partial matches fail closed
+    // too: half a policy applied is not the policy.
+    // iOS twin: the `blankColumns.allSatisfy` guard in ContributionCsv.redact, backed the same way
+    // by ContributionCsv.detectionColumns. A redaction policy that cannot be applied must never
+    // emit the unredacted column, on either platform.
+    if (!blankColumnNames.all { it in header }) return safeCsvHeader(csv)
     val blankIdx = header.withIndex().filter { it.value in blankColumnNames }.map { it.index }.toSet()
-    if (blankIdx.isEmpty()) return csv   // none of the requested columns exist in this CSV
 
     val redacted = ArrayList<List<String>>(document.records.size)
     redacted.add(header)

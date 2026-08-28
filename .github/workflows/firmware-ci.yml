@@ -6,18 +6,77 @@ name: Firmware CI
 # both least visible and least recoverable.
 #
 # iOS has its own macOS test and unsigned Release-build gate in ios-ci.yml.
-
+#
+# THE PATH LIST REACHES OUTSIDE firmware/ ON PURPOSE. check-signature-drift.py below is the only
+# automated runner of the cross-platform guards, and the files those guards read live in the two
+# APP trees: faq-content.json is duplicated verbatim into both, the relatedHelp key list is derived
+# from the two DeviceType enums, SHARED_CONSTANTS pins the CSV column list and pairing hint, and
+# the privacy guard reads each app's link plus the canonical web policy. With a firmware-only
+# filter, the one commit shape those guards
+# exist to catch - an app-tree-only edit that changes one copy - never triggered them, and neither
+# ios-ci.yml nor android-release.yml runs the script. Both DeviceType files tell maintainers this
+# script "FAILS the build"; the app-tree paths in both lists are what makes that sentence true.
+#
+# THE COST, STATED: an edit to any of them spends a cached PlatformIO build. AcabBleManager.kt is
+# the highest-churn file in that list, so this is not free. A guard that does not run on the commit
+# it exists to catch is worth less than the runner minutes, and cancel-in-progress below stops a
+# superseded push from spending them twice.
 on:
   push:
     branches: [main]
-    paths: ['firmware/**', 'docs/**', 'README.md', '.github/workflows/firmware-ci.yml']
+    paths:
+      - 'firmware/**'
+      - 'docs/**'
+      - 'README.md'
+      - '.github/workflows/firmware-ci.yml'
+      - 'ios/Beacons/Resources/faq-content.json'
+      - 'android/app/src/main/assets/faq-content.json'
+      - 'ios/Beacons/Models/DeviceType.swift'
+      - 'android/app/src/main/java/tech/acab/app/model/Models.kt'
+      - 'ios/Beacons/BLE/ContributionCsv.swift'
+      - 'ios/Beacons/BLE/BLEManager.swift'
+      - 'android/app/src/main/java/tech/acab/app/ble/AcabBleManager.kt'
+      - 'ios/Beacons/Views/SettingsView.swift'
+      - 'android/app/src/main/java/tech/acab/app/ui/DeviceScreen.kt'
+      - 'web/privacy.html'
   pull_request:
-    paths: ['firmware/**', 'docs/**', 'README.md', '.github/workflows/firmware-ci.yml']
+    paths:
+      - 'firmware/**'
+      - 'docs/**'
+      - 'README.md'
+      - '.github/workflows/firmware-ci.yml'
+      - 'ios/Beacons/Resources/faq-content.json'
+      - 'android/app/src/main/assets/faq-content.json'
+      - 'ios/Beacons/Models/DeviceType.swift'
+      - 'android/app/src/main/java/tech/acab/app/model/Models.kt'
+      - 'ios/Beacons/BLE/ContributionCsv.swift'
+      - 'ios/Beacons/BLE/BLEManager.swift'
+      - 'android/app/src/main/java/tech/acab/app/ble/AcabBleManager.kt'
+      - 'ios/Beacons/Views/SettingsView.swift'
+      - 'android/app/src/main/java/tech/acab/app/ui/DeviceScreen.kt'
+      - 'web/privacy.html'
   workflow_dispatch:
+
+# LEAST PRIVILEGE. This was the only workflow in the repo declaring no permissions at all, so it
+# ran with the repo default - which is `write` on a repo that publishes signed firmware. Every job
+# here opens with a checkout, and checkout persists that token into .git/config for the whole job,
+# next to `pip install --upgrade platformio` and a full `pio run`. Nothing here writes:
+# check-signature-drift.py reads one PUBLIC releases endpoint, and the token it is handed only
+# raises the api.github.com rate limit.
+permissions:
+  contents: read
+
+# The heaviest job in the repo (every firmware env). Without this a superseded push builds to
+# completion for a commit nobody is waiting for; without timeout-minutes below, a hung PlatformIO
+# fetch runs to the 6-hour default. android-ci.yml and ios-ci.yml already carry both.
+concurrency:
+  group: firmware-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
 
@@ -51,7 +110,13 @@ jobs:
         run: firmware/tools/host-tests/run.sh
 
       # A drift watcher that only runs when someone remembers to run it is not a watcher.
+      # The job's own token goes in because the opendroneid release watch now FAILS on an
+      # unreachable api.github.com instead of warning and reporting no drift, and unauthenticated
+      # calls share the runner's egress IP against a 60/hour limit. No --offline here: in CI, a
+      # watcher that skipped itself has watched nothing.
       - name: Signature + vendored-copy drift
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 firmware/tools/check-signature-drift.py
 
       # The release-tooling suite (descriptor parsing, rev-B staging, signature-over-staged-bytes,
@@ -67,6 +132,7 @@ jobs:
   # at files no public reader can see. Two had already shipped that way.
   links:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - name: Check relative links in tracked markdown resolve

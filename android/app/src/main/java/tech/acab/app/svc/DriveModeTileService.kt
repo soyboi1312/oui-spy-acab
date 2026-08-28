@@ -33,9 +33,9 @@ class DriveModeTileService : TileService() {
     override fun onStartListening() {
         super.onStartListening()
         val ble = AcabBleManager.getInstance(applicationContext)
-        // Key off the manager's driveMode flag, not AcabLinkService.isRunning: the link service
-        // can be held up for a background OTA reconnect with Drive mode never turned on, and
-        // reading isRunning would then paint the tile ACTIVE for that OTA-only hold. driveModeOn
+        // Key off the manager's driveMode flag, not whether AcabLinkService is alive: the link
+        // service can be held up for a background OTA reconnect with Drive mode never turned on,
+        // and a liveness signal would then paint the tile ACTIVE for that OTA-only hold. driveModeOn
         // is the user-intent flag and flips synchronously with the in-app switch.
         //
         // Track the flows for as long as the shade is open, not a one-shot snapshot: drive mode
@@ -45,13 +45,20 @@ class DriveModeTileService : TileService() {
         // covers the initial render.
         listenJob?.cancel()
         listenJob = scope.launch {
-            combine(ble.driveMode, ble.state) { running, state ->
-                running to (state == ConnState.READY)
-            }.collect { (running, linked) ->
+            combine(ble.driveMode, ble.state, ble.demoMode) { running, state, demo ->
+                Triple(running, state == ConnState.READY, demo)
+            }.collect { (running, linked, demo) ->
                 // R7: with no board linked the tile is UNAVAILABLE (greyed), not a tappable
                 // control that snaps back. A running session stays togglable so you can always
                 // turn it off.
-                render(active = running, available = linked || running)
+                //
+                // demoMode is part of the LINKED test, not a separate one: sample data seeds
+                // ConnState.READY, so the link check alone would paint this tappable while
+                // MainActivity.maybeStartRequestedDrive refuses the request it sends. That made
+                // the tile a dead control - shade collapses, app comes forward, nothing happens,
+                // no explanation. Greyed is the honest state. A genuinely running session is still
+                // exempt, so nothing can strand a live drive as un-turn-off-able.
+                render(active = running, available = running || (linked && !demo))
             }
         }
     }
@@ -74,14 +81,19 @@ class DriveModeTileService : TileService() {
         if (turnOn) {
             // No board linked: starting drive mode would just pin a permanent
             // "Reconnecting…" foreground notification. Show it as unavailable.
-            if (ble.state.value != ConnState.READY) {
+            //
+            // Sample data is refused for the same reason MainActivity.maybeStartRequestedDrive
+            // refuses it: a demo Live Mode would pin a real ongoing notification over canned rows
+            // and persist the preference from a preview. Checked here as well as in the collector
+            // because a tap can land on a render that is one emission stale.
+            if (ble.state.value != ConnState.READY || ble.demoMode.value) {
                 render(active = false, available = false)
                 return
             }
             // The service dies NOT_STICKY under memory pressure without resetting the
             // manager's driveMode flag; clear it first so startDriveMode can't early-return
             // on a stale true.
-            ble.endDriveMode()
+            ble.suspendDriveMode()
             requestDriveStartInForeground()
             // Android 14 does not allow a background tile service to create a location foreground
             // service with only while-in-use location permission. Keep the tile inactive until
@@ -128,10 +140,9 @@ class DriveModeTileService : TileService() {
             active -> Tile.STATE_ACTIVE
             else -> Tile.STATE_INACTIVE
         }
-        // Sentence case, matching the notification channel ("Drive mode") and the in-app
-        // switch row; the deliberate all-caps "DRIVE MODE" notification title stays as-is.
-        tile.label = "Drive mode"
-        tile.icon = Icon.createWithResource(this, R.drawable.ic_qs_drive)
+        // Sentence case, matching the notification channel and the in-app Live Mode switch.
+        tile.label = "Live Mode"
+        tile.icon = Icon.createWithResource(this, R.drawable.ic_stat_beacons)
         tile.updateTile()
     }
 

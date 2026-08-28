@@ -5,8 +5,12 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.*
@@ -39,14 +43,16 @@ import tech.acab.app.ui.theme.Acab
  * and it is why the "FAQ online" support row is the only thing here that reaches the network , and
  * only when the user taps it.
  *
- * [scrollToId] is the deep link from a dossier's RELATED HELP row: that question opens expanded.
- * Android has no ScrollViewReader equivalent in a plain scrolling Column, so rather than fake one
- * we open the answer and let the user land on a screen where the thing they tapped is already
- * showing its content. iOS additionally scrolls to it; the outcome the user cares about (the answer
- * is open) is identical.
+ * [scrollToId] is the deep link from a dossier's RELATED HELP row: that question opens expanded
+ * and its bring-into-view requester scrolls it into view after the first layout pass.
  */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-fun HelpScreen(scrollToId: String? = null, onImproveDetection: (() -> Unit)? = null) {
+fun HelpScreen(
+    scrollToId: String? = null,
+    onImproveDetection: (() -> Unit)? = null,
+    modifier: Modifier = Modifier,
+) {
     val context = LocalContext.current
     val faq = remember { FaqContent.get(context) }
     var query by remember { mutableStateOf("") }
@@ -56,13 +62,24 @@ fun HelpScreen(scrollToId: String? = null, onImproveDetection: (() -> Unit)? = n
 
     val searching = query.trim().isNotEmpty()
     val results = remember(query) { faq.search(query) }
+    val relatedHelpRequester = remember { BringIntoViewRequester() }
+    LaunchedEffect(scrollToId) {
+        if (scrollToId != null && faq.question(scrollToId) != null) {
+            withFrameNanos { }
+            relatedHelpRequester.bringIntoView()
+        }
+    }
 
-    Column(
-        Modifier.fillMaxWidth()
-            .then(if (tourOpen) Modifier.clearAndSetSemantics { } else Modifier)
-            .padding(horizontal = 14.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
+    // Own a bounded viewport and scroll the FAQ inside it. The tour is a sibling in this root Box,
+    // so fillMaxSize means the visible Help route, not an unbounded parent scrolling Column.
+    Box(modifier.fillMaxSize()) {
+        Column(
+            Modifier.fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .then(if (tourOpen) Modifier.clearAndSetSemantics { } else Modifier)
+                .padding(horizontal = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
         // ---- search ----------------------------------------------------------------------
         Row(
             Modifier
@@ -132,7 +149,12 @@ fun HelpScreen(scrollToId: String? = null, onImproveDetection: (() -> Unit)? = n
                 ) {
                     Kicker(section.kicker)
                     section.questions.forEachIndexed { i, q ->
-                        QuestionRow(q, null, openId == q.id) { openId = if (openId == q.id) null else q.id }
+                        QuestionRow(
+                            q, null, openId == q.id,
+                            modifier = if (q.id == scrollToId) {
+                                Modifier.bringIntoViewRequester(relatedHelpRequester)
+                            } else Modifier,
+                        ) { openId = if (openId == q.id) null else q.id }
                         if (i < section.questions.size - 1) Hairline()
                     }
                 }
@@ -164,15 +186,22 @@ fun HelpScreen(scrollToId: String? = null, onImproveDetection: (() -> Unit)? = n
             }
         }
 
-        Spacer(Modifier.height(6.dp))
-    }
+            Spacer(Modifier.height(6.dp))
+        }
 
-    if (tourOpen) FirstRunTourOverlay(onFinish = { tourOpen = false })
+        if (tourOpen) FirstRunTourOverlay(onFinish = { tourOpen = false })
+    }
 }
 
 @Composable
-private fun QuestionRow(q: FaqQuestion, sectionKicker: String?, open: Boolean, onToggle: () -> Unit) {
-    Column(Modifier.fillMaxWidth().minimumInteractiveComponentSize()
+private fun QuestionRow(
+    q: FaqQuestion,
+    sectionKicker: String?,
+    open: Boolean,
+    modifier: Modifier = Modifier,
+    onToggle: () -> Unit,
+) {
+    Column(modifier.fillMaxWidth().minimumInteractiveComponentSize()
         .clickable(role = Role.Button) { onToggle() }
         .semantics(mergeDescendants = true) {
             stateDescription = if (open) "expanded" else "collapsed"
@@ -202,7 +231,14 @@ private fun QuestionRow(q: FaqQuestion, sectionKicker: String?, open: Boolean, o
 @Composable
 private fun SupportRow(row: FaqSupportRow, onClick: () -> Unit) {
     Row(
-        Modifier.fillMaxWidth().clickable { onClick() }.padding(vertical = 11.dp),
+        Modifier.fillMaxWidth().minimumInteractiveComponentSize()
+            .clickable(
+                onClickLabel = if (row.external) {
+                    "open ${row.title} in browser"
+                } else "open ${row.title}",
+                role = Role.Button,
+                onClick = onClick,
+            ).padding(vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {

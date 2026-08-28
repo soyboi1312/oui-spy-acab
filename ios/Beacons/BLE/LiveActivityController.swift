@@ -1,6 +1,16 @@
 import Foundation
 import ActivityKit
 
+enum LiveActivityInactiveReason: Equatable { case ended, dismissed }
+enum LiveActivityAdoptionResult: Equatable { case none, adopted, dismissed }
+
+/// A swipe dismissal is a direct surface-level Off. An ended activity may be lifecycle/budget
+/// retirement or an explicit intent that already persisted its own choice, so it must not erase a
+/// still-wanted preference by inference.
+func shouldPreserveLiveModeIntent(after reason: LiveActivityInactiveReason) -> Bool {
+    reason == .ended
+}
+
 /// Owns the Drive-mode Live Activity: started in the foreground, fed throttled count
 /// updates as detections arrive over BLE, and ended on demand. Kept off BLEManager so
 /// the manager stays focused on the link. Call on the main thread (BLEManager's
@@ -20,7 +30,7 @@ final class LiveActivityController {
 
     /// Fired when the system ends or dismisses the activity out from under us (e.g. the
     /// user swiped it away), so the owner can sync its Drive-mode toggle back to off.
-    var onInactive: (() -> Void)?
+    var onInactive: ((LiveActivityInactiveReason) -> Void)?
 
     /// Live Activities can be disabled per-app in Settings.
     var isAvailable: Bool { ActivityAuthorizationInfo().areActivitiesEnabled }
@@ -40,7 +50,12 @@ final class LiveActivityController {
     func dropIfInactive() {
         guard let a = activity else { return }
         switch a.activityState {
-        case .ended, .dismissed: pending?.cancel(); pending = nil; activity = nil
+        case .ended:
+            pending?.cancel(); pending = nil; activity = nil
+            onInactive?(.ended)
+        case .dismissed:
+            pending?.cancel(); pending = nil; activity = nil
+            onInactive?(.dismissed)
         default: break
         }
     }
@@ -71,24 +86,27 @@ final class LiveActivityController {
     /// activity == nil guard then reported "already running", leaving Drive mode on with no
     /// visible surface. The corpses get ended here so they can't be re-adopted on every call
     /// (or shadow a live second entry).
-    @discardableResult
-    func adoptExisting() -> Bool {
-        guard activity == nil else { return isActive }
+    func adoptExisting() -> LiveActivityAdoptionResult {
+        guard activity == nil else { return isActive ? .adopted : .none }
         var adopted: Activity<DetectionActivityAttributes>?
+        var sawDismissed = false
         for a in Activity<DetectionActivityAttributes>.activities {
             if retiringIDs.contains(a.id) { continue }
             switch a.activityState {
             case .active, .stale:
                 if adopted == nil { adopted = a }
+            case .dismissed:
+                sawDismissed = true
+                Task { await a.end(nil, dismissalPolicy: .immediate) }
             default:
                 Task { await a.end(nil, dismissalPolicy: .immediate) }   // dead orphan: finish it off
             }
         }
-        guard let a = adopted else { return false }
+        guard let a = adopted else { return sawDismissed ? .dismissed : .none }
         activity = a
         latest = a.content.state
         observe(a)
-        return isActive
+        return isActive ? .adopted : .none
     }
 
     /// Watch for the system ending/dismissing this activity and notify the owner once.
@@ -96,7 +114,7 @@ final class LiveActivityController {
         let id = a.id
         Task { @MainActor [weak self] in
             for await s in a.activityStateUpdates where s == .ended || s == .dismissed {
-                self?.handleInactive(id: id)
+                self?.handleInactive(id: id, reason: s == .dismissed ? .dismissed : .ended)
                 // A dismissed activity stays in Activity.activities until the app ends it, and
                 // a lingering corpse is what adoptExisting used to re-adopt. Finish it here.
                 if s == .dismissed { await a.end(nil, dismissalPolicy: .immediate) }
@@ -107,7 +125,7 @@ final class LiveActivityController {
 
     /// The system ended/dismissed the activity: drop our handle and tell the owner so it
     /// can sync its Drive-mode toggle off. Runs on the main thread.
-    private func handleInactive(id: String) {
+    private func handleInactive(id: String, reason: LiveActivityInactiveReason) {
         // Only the CURRENT activity's terminal event may clear state and fire the callback.
         // end() never cancels the observe Task, so after a quick Drive off -> on the OLD
         // activity's .ended still arrives here; an unconditional onInactive then flipped the
@@ -115,7 +133,7 @@ final class LiveActivityController {
         // driveModeOn = false and stops location, unconditionally). A stale id is a no-op.
         guard activity?.id == id else { return }
         pending?.cancel(); pending = nil; activity = nil
-        onInactive?()
+        onInactive?(reason)
     }
 
     /// Push new counts. Coalesced to ~1 update / `minGap`, EXCEPT `escalate` (a brand-new
@@ -141,15 +159,27 @@ final class LiveActivityController {
         push()
     }
 
-    func end() {
+    /// Shared gather step for both enders: cancel any pending push, collect every activity of
+    /// our type (plus the owned handle, in case it has already fallen out of
+    /// Activity.activities), and drop the handle. Returns the set to end - possibly empty.
+    /// retiringIDs bookkeeping deliberately stays at the end() call site: the willTerminate
+    /// path (endBlocking) dies with the process, so it has no adoption window to guard.
+    private func takeActivitiesToEnd() -> [Activity<DetectionActivityAttributes>] {
         pending?.cancel(); pending = nil
-        guard let a = activity else { return }
-        let id = a.id
-        retiringIDs.insert(id)
+        var all = Activity<DetectionActivityAttributes>.activities
+        if let owned = activity, !all.contains(where: { $0.id == owned.id }) { all.append(owned) }
         activity = nil
+        return all
+    }
+
+    func end() {
+        let all = takeActivitiesToEnd()
+        guard !all.isEmpty else { return }
+        let ids = Set(all.map(\.id))
+        retiringIDs.formUnion(ids)
         Task { @MainActor [weak self] in
-            await a.end(nil, dismissalPolicy: .immediate)
-            self?.retiringIDs.remove(id)
+            for a in all { await a.end(nil, dismissalPolicy: .immediate) }
+            self?.retiringIDs.subtract(ids)
         }
     }
 
@@ -159,11 +189,13 @@ final class LiveActivityController {
     /// semaphore wait can't deadlock; the timeout is a safety cap inside willTerminate's
     /// budget. Best-effort: a suspended (e.g. location-denied) app may never reach here.
     func endBlocking(timeout: TimeInterval = 2) {
-        pending?.cancel(); pending = nil
-        guard let a = activity else { return }
-        activity = nil
+        let all = takeActivitiesToEnd()
+        guard !all.isEmpty else { return }
         let sem = DispatchSemaphore(value: 0)
-        Task.detached { await a.end(nil, dismissalPolicy: .immediate); sem.signal() }
+        Task.detached {
+            for a in all { await a.end(nil, dismissalPolicy: .immediate) }
+            sem.signal()
+        }
         _ = sem.wait(timeout: .now() + timeout)
     }
 

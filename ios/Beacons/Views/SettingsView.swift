@@ -1,9 +1,34 @@
 import SwiftUI
+import UIKit
+
+/// A retained/key-mismatched log must remain erasable even when offline capture is switched off.
+func shouldOfferBufferClear(isDemoMode: Bool, bufferOn: Bool, bufferedCount: Int,
+                            keyMismatch: Bool, wiping: Bool) -> Bool {
+    !isDemoMode && (bufferOn || bufferedCount > 0 || keyMismatch || wiping)
+}
+
+struct BufferClearConfirmationCopy: Equatable {
+    let title: String
+    let message: String
+}
+
+func bufferClearConfirmationCopy(bufferedCount: Int,
+                                 keyMismatch: Bool) -> BufferClearConfirmationCopy {
+    if keyMismatch {
+        return BufferClearConfirmationCopy(
+            title: "Erase the board’s retained offline history and transfer future buffering to this phone?",
+            message: "This permanently erases the board’s preserved offline history. Any history only readable by the originating phone will be permanently lost. The app will then install this phone’s buffer key for future offline transfers.")
+    }
+    return BufferClearConfirmationCopy(
+        title: "Erase \(bufferedCount) buffered detection\(bufferedCount == 1 ? "" : "s") on the board?",
+        message: "This permanently wipes the board's offline log and can't be undone. Detections already synced to this phone stay in your log; anything not yet synced is lost.")
+}
 
 /// Device tab: OUI-Spy hardware status, scan radios, and alert controls.
 struct DeviceView: View {
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var manifest: FirmwareManifestStore
+    var openDetectorsToken: Int = 0
 
     @State private var master: Double = 72
     @State private var pendingVolume = false   // hold the slider at the user's value while dragging + until the board confirms
@@ -14,9 +39,6 @@ struct DeviceView: View {
     @State private var glassesOn = true
     @State private var droneOuiOn = false        // drone vendor-OUI fallback; sub-option of droneOn, off by default
     @State private var netcamOn = false          // network-camera detector; opt-in, off by default (like droneOui)
-    /// Phone-notification toggles, mirrored into @State so the switches animate; the source of
-    /// truth is DetectionNotifier's UserDefaults keys. Keyed by DeviceType.rawValue.
-    @State private var notifyOn: [Int: Bool] = [:]
     @State private var motorolaOn = true         // broad Motorola-OUI match; sub-option of bodyCamOn, on by default
     @State private var pendingFlock = false     // just flipped; hold the value until the board confirms
     @State private var pendingDrone = false
@@ -48,21 +70,61 @@ struct DeviceView: View {
     /// Which list the pencil was tapped in. One alert serves both cards; without this the Save
     /// button would always call renameWatched and silently no-op on an ignored device.
     @State private var renameIsIgnored = false
+    // A board write is optimistic, but never indefinite: each toggle gets ten seconds for the
+    // status stream to echo the requested value. If that never happens, put the control back on
+    // the latest board value and explain the failure instead of leaving a convincing green lie.
+    @State private var pendingWriteTokens: [PendingControl: UUID] = [:]
+    @State private var configError: String?
+    @State private var systemPermissionRevision = 0
     // T5: regular width lays the cards out two-up; compact stays a single column.
     @Environment(\.horizontalSizeClass) private var hSize
     // Accessibility text sizes stack the hero and stat rows vertically and pad the scroll
     // bottom; the default layout is untouched.
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
-    // Any mode but the buzzer dims the volume sliders.
-    private var muted: Bool { ble.alertMode != .buzzer }
+    private enum PendingControl: Hashable {
+        case volume, flock, drone, droneOui, bodyCam, motorola, tracker, glasses, netcam
+        case ble, wifi, wifiEco, buffer, led, desert
+
+        var label: String {
+            switch self {
+            case .volume: return "volume"
+            case .flock: return "ALPR detector"
+            case .drone: return "drone detector"
+            case .droneOui: return "non-broadcasting drone detector"
+            case .bodyCam: return "body-camera detector"
+            case .motorola: return "Motorola radio detector"
+            case .tracker: return "tracker detector"
+            case .glasses: return "recording-glasses detector"
+            case .netcam: return "network-camera detector"
+            case .ble: return "Bluetooth scanning"
+            case .wifi: return "Wi-Fi scanning"
+            case .wifiEco: return "Wi-Fi eco mode"
+            case .buffer: return "offline buffer"
+            case .led: return "board LED"
+            case .desert: return "Desert mode"
+            }
+        }
+    }
+
+    private var clearBufferConfirmationCopy: BufferClearConfirmationCopy {
+        bufferClearConfirmationCopy(
+            bufferedCount: ble.status?.bufCount ?? 0,
+            keyMismatch: ble.status?.bufferKeyMismatch == true)
+    }
 
     var body: some View {
         NavigationStack {
             ZStack {
+                // This read is what makes the foreground permission bump repaint the view: SwiftUI
+                // never invalidates for a @State the body does not read, and the blocked warnings
+                // render off notifier.mutedBySystem / liveActivitiesEnabled, plain cached vars
+                // with no publisher of their own.
+                let _ = systemPermissionRevision
                 ACABTheme.bg.ignoresSafeArea()
-                ScrollView {
-                    Group {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        Group {
                         if hSize == .regular {
                             // R13: mirror the Android tablet split (>=840dp). The page header, the
                             // hero, and the fault/firmware banners span the FULL content width; the
@@ -82,7 +144,10 @@ struct DeviceView: View {
                                         // Present on iPad the same as compact: this row was
                                         // simply missing from the regular-width split, so the
                                         // whole contribute feature did not exist on iPad.
-                                        helpImproveRow
+                                        if improveDetectionAvailable(isSessionReady: ble.sessionReady,
+                                                                     isDemoMode: ble.demoMode) {
+                                            helpImproveRow
+                                        }
                                         helpSupportRow
                                     }
                                     .frame(maxWidth: .infinity, alignment: .top)
@@ -106,22 +171,34 @@ struct DeviceView: View {
                             .frame(maxWidth: .infinity)
                         }
                     }
-                    .padding(.horizontal, ACABTheme.pad)
-                    .padding(.top, 8)
+                        .padding(.horizontal, ACABTheme.pad)
+                        .padding(.top, 8)
+                    }
+                    // Extra bottom margin only at accessibility sizes, so grown content never ends
+                    // under the tab bar; zero at default sizes (layout untouched).
+                    .contentMargins(.bottom, dynamicTypeSize.isAccessibilitySize ? 24 : 0, for: .scrollContent)
+                    .onChange(of: openDetectorsToken, initial: true) { _, token in
+                        guard token > 0 else { return }
+                        openSection = .detectors
+                        // The tab switch and disclosure expansion happen in this update. Scroll on
+                        // the next run loop so the row has its final position before targeting it.
+                        DispatchQueue.main.async {
+                            withAnimation(.easeInOut(duration: 0.25)) {
+                                proxy.scrollTo(ConfigSection.detectors, anchor: .top)
+                            }
+                        }
+                    }
                 }
-                // Extra bottom margin only at accessibility sizes, so grown content never ends
-                // under the tab bar; zero at default sizes (layout untouched).
-                .contentMargins(.bottom, dynamicTypeSize.isAccessibilitySize ? 24 : 0, for: .scrollContent)
             }
             .navigationBarHidden(true)
             .confirmationDialog(
-                "Erase \(ble.status?.bufCount ?? 0) buffered detection\((ble.status?.bufCount ?? 0) == 1 ? "" : "s") on the board?",
+                clearBufferConfirmationCopy.title,
                 isPresented: $confirmEraseBuffer, titleVisibility: .visible
             ) {
                 Button("Erase", role: .destructive) { ble.clearBufferLog() }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("This permanently wipes the board's offline log and can't be undone. Detections already synced to this phone stay in your log; anything not yet synced is lost.")
+                Text(clearBufferConfirmationCopy.message)
             }
         }
         .onAppear(perform: sync)
@@ -130,6 +207,24 @@ struct DeviceView: View {
         // (the board echoing our write back) wouldn't move `status` and wouldn't clear the pending
         // hold. Watch it directly.
         .onChange(of: ble.motorolaOn) { _, _ in sync() }
+        // DetectionNotifier refreshes its cached authorization on foreground, but it is not an
+        // ObservableObject itself, so this view must nudge itself. Issue the refresh ourselves
+        // (cheap, idempotent, and it also covers activations without a willEnterForeground, like
+        // dismissing Control Center); the completion runs after the notifier's cache is written,
+        // so the revision bump re-renders against real state, never a stale cache.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            ble.notifier.refreshAuthorization {
+                systemPermissionRevision &+= 1
+            }
+        }
+        .alert("Couldn't apply setting", isPresented: Binding(
+            get: { configError != nil },
+            set: { if !$0 { configError = nil } }
+        )) {
+            Button("OK") { configError = nil }
+        } message: {
+            Text(configError ?? "The beacon did not confirm that change.")
+        }
     }
 
     // copy board state into local UI vars; runs on appear and on every status update
@@ -137,27 +232,94 @@ struct DeviceView: View {
         guard let s = ble.status else { return }
         // Hold the slider at the user's value while dragging + until the board echoes it back, so a
         // status frame mid-drag can't snap it to the board's stale volume (same idea as the toggles).
-        if pendingVolume { if s.volume == Int(master.rounded()) { pendingVolume = false } } else { master = Double(s.volume) }
+        if pendingVolume { if s.volume == Int(master.rounded()) { pendingVolume = false; confirm(.volume) } } else { master = Double(s.volume) }
         // Hold a just-toggled switch at the user's value until the board confirms it,
         // so the ~5s status frame can't snap it back to off before then.
-        if pendingFlock { if s.flock == flockOn { pendingFlock = false } } else { flockOn = s.flock }
-        if pendingDrone { if s.drone == droneOn { pendingDrone = false } } else { droneOn = s.drone }
-        if pendingDroneOui { if s.droui == droneOuiOn { pendingDroneOui = false } } else { droneOuiOn = s.droui }
-        if pendingBodyCam { if s.axon == bodyCamOn { pendingBodyCam = false } } else { bodyCamOn = s.axon }
+        if pendingFlock { if s.flock == flockOn { pendingFlock = false; confirm(.flock) } } else { flockOn = s.flock }
+        if pendingDrone { if s.drone == droneOn { pendingDrone = false; confirm(.drone) } } else { droneOn = s.drone }
+        if pendingDroneOui { if s.droui == droneOuiOn { pendingDroneOui = false; confirm(.droneOui) } } else { droneOuiOn = s.droui }
+        if pendingBodyCam { if s.axon == bodyCamOn { pendingBodyCam = false; confirm(.bodyCam) } } else { bodyCamOn = s.axon }
         // The Motorola sub-toggle rides "moto", which isn't part of DeviceStatus; BLEManager reads
         // it off the status frame, so mirror from there instead of `s`. Same hold-until-confirmed.
-        if pendingMotorola { if ble.motorolaOn == motorolaOn { pendingMotorola = false } } else { motorolaOn = ble.motorolaOn }
-        if pendingTracker { if s.tracker == trackerOn { pendingTracker = false } } else { trackerOn = s.tracker }
-        if pendingGlasses { if s.glasses == glassesOn { pendingGlasses = false } } else { glassesOn = s.glasses }
-        if pendingNetcam { if s.ncam == netcamOn { pendingNetcam = false } } else { netcamOn = s.ncam }
-        if pendingBuffer { if s.bufferingOn == bufferOn { pendingBuffer = false } } else { bufferOn = s.bufferingOn }
-        if pendingLed { if (!s.ledEnabled) == lightsOut { pendingLed = false } } else { lightsOut = !s.ledEnabled }
-        if pendingDesert { if s.desertMode == desertOn { pendingDesert = false } } else { desertOn = s.desertMode }
+        if pendingMotorola { if ble.motorolaOn == motorolaOn { pendingMotorola = false; confirm(.motorola) } } else { motorolaOn = ble.motorolaOn }
+        if pendingTracker { if s.tracker == trackerOn { pendingTracker = false; confirm(.tracker) } } else { trackerOn = s.tracker }
+        if pendingGlasses { if s.glasses == glassesOn { pendingGlasses = false; confirm(.glasses) } } else { glassesOn = s.glasses }
+        if pendingNetcam { if s.ncam == netcamOn { pendingNetcam = false; confirm(.netcam) } } else { netcamOn = s.ncam }
+        if pendingBuffer { if s.bufferingOn == bufferOn { pendingBuffer = false; confirm(.buffer) } } else { bufferOn = s.bufferingOn }
+        if pendingLed { if (!s.ledEnabled) == lightsOut { pendingLed = false; confirm(.led) } } else { lightsOut = !s.ledEnabled }
+        if pendingDesert { if s.desertMode == desertOn { pendingDesert = false; confirm(.desert) } } else { desertOn = s.desertMode }
         // Scan radios get the same hold: a periodic status frame generated before the write
         // lands would otherwise snap the switch back, inviting a duplicate tap and write.
-        if pendingBle { if s.ble == bleOn { pendingBle = false } } else { bleOn = s.ble }
-        if pendingWifi { if s.wifi == wifiOn { pendingWifi = false } } else { wifiOn = s.wifi }
-        if pendingWifiEco { if s.wifiEco == wifiEco { pendingWifiEco = false } } else { wifiEco = s.wifiEco }
+        if pendingBle { if s.ble == bleOn { pendingBle = false; confirm(.ble) } } else { bleOn = s.ble }
+        if pendingWifi { if s.wifi == wifiOn { pendingWifi = false; confirm(.wifi) } } else { wifiOn = s.wifi }
+        if pendingWifiEco { if s.wifiEco == wifiEco { pendingWifiEco = false; confirm(.wifiEco) } } else { wifiEco = s.wifiEco }
+    }
+
+    /// Arm a fresh deadline for one optimistic board write. The UUID makes an older deadline a
+    /// no-op when the user changes the same control again before it fires.
+    private func awaitConfirmation(_ control: PendingControl) {
+        // Sample data never arms a deadline: demo writes echo synchronously into the canned
+        // status at the writeConfig boundary, so there is nothing to wait for and no
+        // connection failure to manufacture ten seconds later.
+        if ble.demoMode {
+            clearPendingFlag(control)
+            return
+        }
+        let token = UUID()
+        pendingWriteTokens[control] = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            guard pendingWriteTokens[control] == token else { return }
+            pendingWriteTokens.removeValue(forKey: control)
+            revertPending(control)
+            configError = "Couldn't apply \(control.label). The beacon didn't confirm the change within 10 seconds."
+        }
+    }
+
+    private func confirm(_ control: PendingControl) {
+        pendingWriteTokens.removeValue(forKey: control)
+    }
+
+    private func clearPendingFlag(_ control: PendingControl) {
+        switch control {
+        case .volume: pendingVolume = false
+        case .flock: pendingFlock = false
+        case .drone: pendingDrone = false
+        case .droneOui: pendingDroneOui = false
+        case .bodyCam: pendingBodyCam = false
+        case .motorola: pendingMotorola = false
+        case .tracker: pendingTracker = false
+        case .glasses: pendingGlasses = false
+        case .netcam: pendingNetcam = false
+        case .ble: pendingBle = false
+        case .wifi: pendingWifi = false
+        case .wifiEco: pendingWifiEco = false
+        case .buffer: pendingBuffer = false
+        case .led: pendingLed = false
+        case .desert: pendingDesert = false
+        }
+    }
+
+    /// Reconcile the optimistic control with the newest status frame without sending another
+    /// write. A retry is an explicit user choice, never an automatic write loop.
+    private func revertPending(_ control: PendingControl) {
+        let s = ble.status
+        switch control {
+        case .volume:    pendingVolume = false; if let s { master = Double(s.volume) }
+        case .flock:     pendingFlock = false; if let s { flockOn = s.flock }
+        case .drone:     pendingDrone = false; if let s { droneOn = s.drone }
+        case .droneOui:  pendingDroneOui = false; if let s { droneOuiOn = s.droui }
+        case .bodyCam:   pendingBodyCam = false; if let s { bodyCamOn = s.axon }
+        case .motorola:  pendingMotorola = false; motorolaOn = ble.motorolaOn
+        case .tracker:   pendingTracker = false; if let s { trackerOn = s.tracker }
+        case .glasses:   pendingGlasses = false; if let s { glassesOn = s.glasses }
+        case .netcam:    pendingNetcam = false; if let s { netcamOn = s.ncam }
+        case .ble:       pendingBle = false; if let s { bleOn = s.ble }
+        case .wifi:      pendingWifi = false; if let s { wifiOn = s.wifi }
+        case .wifiEco:   pendingWifiEco = false; if let s { wifiEco = s.wifiEco }
+        case .buffer:    pendingBuffer = false; if let s { bufferOn = s.bufferingOn }
+        case .led:       pendingLed = false; if let s { lightsOut = !s.ledEnabled }
+        case .desert:    pendingDesert = false; if let s { desertOn = s.desertMode }
+        }
     }
 
     // MARK: 1g composition
@@ -176,7 +338,10 @@ struct DeviceView: View {
         statsGrid                            // UPTIME + DETECTIONS (2-up)
         configPanel                          // scan radios / detectors / alerts / drive / desert+buffer / LED
         managedDevicesRow                    // -> watched + ignored sub-screen
-        helpImproveRow                       // -> contribute a field observation (manual export)
+        if improveDetectionAvailable(isSessionReady: ble.sessionReady,
+                                     isDemoMode: ble.demoMode) {
+            helpImproveRow                   // -> contribute a field observation (manual export)
+        }
         helpSupportRow                       // -> bundled FAQ + support routes
         disconnectButton
         if showPowerOff { powerOffButton }   // rev-B only: shut the board down over BLE
@@ -225,41 +390,47 @@ struct DeviceView: View {
     }
 
     // MARK: config fold panel (one open section at a time)
-    private var configPanel: some View {
-        VStack(spacing: 0) {
+    // Keep this type-erased. Combining every disclosure row into one concrete SwiftUI type can
+    // overflow the main-thread stack while the runtime resolves its mangled metadata. That is the
+    // same failure documented on firmwareCard below, and it can happen as soon as this tab appears.
+    private var configPanel: AnyView {
+        AnyView(VStack(spacing: 0) {
             // Firmware lives here as a plain fold row only when there's no banner (up to date).
             if !updateExists {
                 foldRow(.firmware, glyph: "memorychip", title: "Firmware", kicker: firmwareRowKicker) { firmwareCard }
                 rowDivider
             }
             foldRow(.radios, glyph: "antenna.radiowaves.left.and.right",
-                    title: "Scan radios", kicker: radiosKicker) { radiosCard }
+                    title: "Scan radios", kicker: radiosKicker) { AnyView(radiosCard) }
             rowDivider
             foldRow(.detectors, glyph: "scope",
-                    title: "Detectors", kicker: detectorsKicker) { detectorsCard }
+                    title: "Detectors", kicker: detectorsKicker) { AnyView(detectorsCard) }
+                .id(ConfigSection.detectors)
             if ble.status?.isMeshDetect != true {   // mesh board has no buzzer -> no Alerts row
                 rowDivider
-                foldRow(.alerts, glyph: "bell", title: "Alerts", kicker: alertsKicker) { buzzerCard }
+                foldRow(.alerts, glyph: "bell", title: "Alerts", kicker: alertsKicker) { AnyView(buzzerCard) }
             }
             rowDivider
             // NOT gated on isMeshDetect, unlike Alerts: these are PHONE notifications, so they work
             // the same on a board with no buzzer. That is precisely the board where they matter most.
-            foldRow(.notify, glyph: "app.badge", title: "Notifications", kicker: notifyKicker) { notifyCard }
+            foldRow(.notify, glyph: "app.badge", title: "Notifications", kicker: notifyKicker) { AnyView(notifyCard) }
             rowDivider
             // Board LED sits with Alerts (both are local feedback), above the situational modes.
-            foldRow(.led, glyph: "lightbulb", title: "Board LED", kicker: ledKicker) { lightsOutCard }
+            foldRow(.led, glyph: "lightbulb", title: "Board LED", kicker: ledKicker) { AnyView(lightsOutCard) }
             rowDivider
-            foldRow(.drive, glyph: "car", title: "Drive mode", kicker: driveKicker) { driveModeCard }
+            foldRow(.drive, glyph: "dot.radiowaves.left.and.right", title: "Live Mode", kicker: driveKicker) {
+                AnyView(driveModeCard)
+            }
             rowDivider
             foldRow(.desert, glyph: "mountain.2",
                     title: "Desert mode + buffer", kicker: desertKicker) {
-                VStack(spacing: 12) { desertModeCard; offlineBufferCard }
+                AnyView(VStack(spacing: 12) { desertModeCard; offlineBufferCard })
             }
         }
         .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
         .clipShape(RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous)
-            .strokeBorder(ACABTheme.line, lineWidth: 1))
+            .strokeBorder(ACABTheme.line, lineWidth: 1)))
     }
 
     private var rowDivider: some View {
@@ -268,11 +439,10 @@ struct DeviceView: View {
 
     // Hand-rolled disclosure row: glyph + title + live kicker + flipping chevron. Open ->
     // accent-tinted glyph, flipped chevron, faint accent wash, and today's card verbatim below.
-    @ViewBuilder
-    private func foldRow<Content: View>(_ section: ConfigSection, glyph: String, title: String,
-                                        kicker: String, @ViewBuilder content: () -> Content) -> some View {
+    private func foldRow(_ section: ConfigSection, glyph: String, title: String,
+                         kicker: String, content: () -> AnyView) -> AnyView {
         let open = openSection == section
-        VStack(alignment: .leading, spacing: 0) {
+        return AnyView(VStack(alignment: .leading, spacing: 0) {
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) { openSection = open ? nil : section }
             } label: {
@@ -305,7 +475,7 @@ struct DeviceView: View {
             if open { content().padding(.bottom, 14) }
         }
         .padding(.horizontal, 16)
-        .background(open ? ACABTheme.accent.opacity(0.04) : Color.clear)
+        .background(open ? ACABTheme.accent.opacity(0.04) : Color.clear))
     }
 
     // MARK: managed devices row -> watched + ignored sub-screen
@@ -354,7 +524,11 @@ struct DeviceView: View {
     }
 
     private var helpSupportRow: some View {
-        NavigationLink { HelpView() } label: {
+        NavigationLink {
+            HelpView(canImproveDetection: improveDetectionAvailable(
+                isSessionReady: ble.sessionReady,
+                isDemoMode: ble.demoMode))
+        } label: {
             HStack(spacing: 12) {
                 Image(systemName: "questionmark.circle")
                     .font(.system(size: 16, weight: .medium)).foregroundStyle(ACABTheme.dim).frame(width: 22)
@@ -377,11 +551,30 @@ struct DeviceView: View {
             ACABTheme.bg.ignoresSafeArea()
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    if ble.managedListSavePending {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(ACABTheme.warn)
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("CHANGES NOT SAVED")
+                                    .font(ACABTheme.mono(10, weight: .bold))
+                                    .foregroundStyle(ACABTheme.warn)
+                                Text("Your latest watch or mute change is active for this session, but protected storage rejected it.")
+                                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.dim)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Button("RETRY SAVE") { ble.retryManagedListPersistence() }
+                                    .font(ACABTheme.mono(10, weight: .bold))
+                                    .foregroundStyle(ACABTheme.accent)
+                                    .padding(.top, 3)
+                            }
+                        }
+                        .panel()
+                    }
                     if !ble.watched.isEmpty { watchedCard }
-                    if !ble.ignored.isEmpty { ignoredCard }
+                    if !ble.ignored.isEmpty || ble.boardOnlyMuteCount > 0 { ignoredCard }
                     // Both lists empty: say so, or the pushed screen reads as a loading failure.
-                    if ble.watched.isEmpty && ble.ignored.isEmpty {
-                        Text("No watched or ignored devices yet.")
+                    if ble.watched.isEmpty && ble.ignored.isEmpty && ble.boardOnlyMuteCount == 0 {
+                        Text("No watched or muted devices yet.")
                             .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.dim)
                     }
                     Spacer(minLength: 8)
@@ -466,7 +659,20 @@ struct DeviceView: View {
     }
 
     private var driveKicker: String {
-        "COUNTER \(ble.driveModeWanted ? "ON" : "OFF") \u{00B7} LOCK SCREEN \(ble.redactLockScreen ? "HIDDEN" : "SHOWN")"
+        "\(liveModeState.uppercased()) \u{00B7} COUNTS \(ble.settingsRedactLockScreen ? "PRIVATE" : "VISIBLE")"
+    }
+
+    /// Report the system surface that actually exists, not just the persisted toggle intent.
+    /// `driveModeOn` leads so a short end/start transition can never call a visible activity Off.
+    private var liveModeState: String {
+        if ble.demoMode { return ble.settingsDriveModeWanted ? "Preview on" : "Off" }
+        if ble.driveModeOn { return "Active" }
+        if !ble.driveModeWanted { return "Off" }
+        if !ble.liveActivitiesEnabled { return "Blocked by iOS" }
+        if ble.connectionState == .connected, !ble.demoMode, !ble.locationAuthorized {
+            return "Location needed"
+        }
+        return "Waiting for beacon"
     }
 
     private var desertKicker: String {
@@ -481,7 +687,7 @@ struct DeviceView: View {
     private var ledKicker: String { lightsOut ? "LIGHTS OUT" : "HEARTBEAT ON" }
 
     private var managedKicker: String {
-        "\(ble.watched.count) WATCHED \u{00B7} \(ble.status?.watchCount ?? 0) ON BOARD \u{00B7} \(ble.ignored.count) IGNORED"
+        "\(ble.watched.count) WATCHED \u{00B7} \(ble.status?.watchCount ?? 0) ON BOARD \u{00B7} \(ble.ignored.count) MUTED"
     }
 
     // MARK: header
@@ -700,8 +906,8 @@ struct DeviceView: View {
     ///
     /// This is the deepest view in the app: a three-way state branch whose arms are themselves
     /// stacks of heavily-modified buttons (`.background(_:in:)` + `.overlay(strokeBorder:)` each
-    /// add another `ModifiedContent` layer), and the whole thing is handed to the GENERIC
-    /// `foldRow<Content:>` as its Content. Left concrete, the composed static type nests deep
+    /// add another `ModifiedContent` layer), and the whole thing was once handed to a generic
+    /// disclosure row as its Content. Left concrete, the composed static type nests deep
     /// enough that flipping the branch - which is exactly what tapping "update" does - made
     /// SwiftUI instantiate that type's metadata at runtime, and the Swift runtime's RECURSIVE
     /// demangler overflowed the 1 MB main-thread stack. The app died on the tap, every time.
@@ -1019,10 +1225,14 @@ struct DeviceView: View {
         VStack(alignment: .leading, spacing: 14) {
             Kicker("SCAN RADIOS")
             radioToggle("bluetooth", "ALPR \u{00B7} drone \u{00B7} trackers", isOn: Binding(
-                get: { bleOn }, set: { bleOn = $0; pendingBle = true; ble.setBLEScan($0) }))
+                get: { bleOn }, set: {
+                    bleOn = $0; pendingBle = true; awaitConfirmation(.ble); ble.setBLEScan($0)
+                }))
             Divider().overlay(ACABTheme.line)
             radioToggle("Wi-Fi", "2.4 GHz \u{00B7} ALPR \u{00B7} drone RID", isOn: Binding(
-                get: { wifiOn }, set: { wifiOn = $0; pendingWifi = true; ble.setWiFiScan($0) }))
+                get: { wifiOn }, set: {
+                    wifiOn = $0; pendingWifi = true; awaitConfirmation(.wifi); ble.setWiFiScan($0)
+                }))
             // Eco: only on battery boards (the board reports "bat" only when it has the sense
             // divider), and only meaningful while Wi-Fi is on. Duty-cycles the Wi-Fi RX to stretch
             // runtime; Bluetooth is untouched. Honest about the tradeoff right below the pills.
@@ -1038,7 +1248,8 @@ struct DeviceView: View {
                     HStack(spacing: 6) {
                         ForEach([(0, "MAX"), (3, "3s"), (7, "7s"), (15, "15s")], id: \.0) { v, label in
                             Button {
-                                wifiEco = v; pendingWifiEco = true; ble.setWifiEco(v)
+                                wifiEco = v; pendingWifiEco = true
+                                awaitConfirmation(.wifiEco); ble.setWifiEco(v)
                             } label: {
                                 Text(label)
                                     .font(ACABTheme.mono(11, weight: .bold)).tracking(0.5)
@@ -1067,15 +1278,22 @@ struct DeviceView: View {
         VStack(alignment: .leading, spacing: 14) {
             Kicker("DETECTORS")
             radioToggle("alpr radio signals", "flock, raven, when they broadcast over bluetooth or 2.4 GHz wifi \u{00B7} many installs now stay silent", isOn: Binding(
-                get: { flockOn }, set: { flockOn = $0; pendingFlock = true; ble.setFlockEnabled($0) }))
+                get: { flockOn }, set: {
+                    flockOn = $0; pendingFlock = true; awaitConfirmation(.flock); ble.setFlockEnabled($0)
+                }))
             Divider().overlay(ACABTheme.line)
             radioToggle("drones (remote ID)", "FAA remote ID \u{00B7} operator location", isOn: Binding(
-                get: { droneOn }, set: { droneOn = $0; pendingDrone = true; ble.setDroneEnabled($0) }))
+                get: { droneOn }, set: {
+                    droneOn = $0; pendingDrone = true; awaitConfirmation(.drone); ble.setDroneEnabled($0)
+                }))
             // Sub-option of the drone detector: the vendor-OUI fallback. Inset + disabled while the
             // parent drone detector is off, to read as subordinate to the toggle above it. Off by
             // default because an OUI match alone can't tell a stationary Parrot gadget from a drone.
             radioToggle("non-broadcasting drones", "OUI match only, off by default, may false-positive", isOn: Binding(
-                get: { droneOuiOn }, set: { droneOuiOn = $0; pendingDroneOui = true; ble.setDroneOuiEnabled($0) }))
+                get: { droneOuiOn }, set: {
+                    droneOuiOn = $0; pendingDroneOui = true
+                    awaitConfirmation(.droneOui); ble.setDroneOuiEnabled($0)
+                }))
                 .padding(.leading, 22)
                 .disabled(!droneOn)
                 .opacity(droneOn ? 1 : 0.4)
@@ -1085,7 +1303,10 @@ struct DeviceView: View {
             // old "Axon signature" copy read oddly directly above a Motorola control. Matches
             // Android's DeviceScreen wording so the two platforms describe the switch the same way.
             radioToggle("body cams", "Axon \u{00B7} Utility BodyWorn \u{00B7} Motorola vendor match", isOn: Binding(
-                get: { bodyCamOn }, set: { bodyCamOn = $0; pendingBodyCam = true; ble.setBodyCamEnabled($0) }))
+                get: { bodyCamOn }, set: {
+                    bodyCamOn = $0; pendingBodyCam = true
+                    awaitConfirmation(.bodyCam); ble.setBodyCamEnabled($0)
+                }))
             // Sub-option of the body-cam detector, laid out like the drone-OUI one above: inset,
             // and disabled while the parent category is off (classification needs both switches).
             // The broad Motorola Solutions OUI is a vendor proxy, not a camera signature, so the
@@ -1097,23 +1318,35 @@ struct DeviceView: View {
                 // Say what the switch matches and what it costs you, and let the parent row's
                 // "Axon · Utility BodyWorn · Motorola vendor match" carry the rest.
                 radioToggle("motorola solutions", "vendor match only \u{00B7} their radios and docks too", isOn: Binding(
-                    get: { motorolaOn }, set: { motorolaOn = $0; pendingMotorola = true; ble.setMotorolaEnabled($0) }))
+                    get: { motorolaOn }, set: {
+                        motorolaOn = $0; pendingMotorola = true
+                        awaitConfirmation(.motorola); ble.setMotorolaEnabled($0)
+                    }))
                     .padding(.leading, 22)
                     .disabled(!bodyCamOn)
                     .opacity(bodyCamOn ? 1 : 0.4)
             }
             Divider().overlay(ACABTheme.line)
             radioToggle("bluetooth trackers", "AirTag \u{00B7} Tile \u{00B7} SmartTag \u{00B7} opt-in", isOn: Binding(
-                get: { trackerOn }, set: { trackerOn = $0; pendingTracker = true; ble.setTrackerEnabled($0) }))
+                get: { trackerOn }, set: {
+                    trackerOn = $0; pendingTracker = true
+                    awaitConfirmation(.tracker); ble.setTrackerEnabled($0)
+                }))
             Divider().overlay(ACABTheme.line)
             radioToggle("recording glasses", "Ray-Ban / Oakley Meta \u{00B7} Snap \u{00B7} Vuzix \u{00B7} Luxottica \u{00B7} experimental", isOn: Binding(
-                get: { glassesOn }, set: { glassesOn = $0; pendingGlasses = true; ble.setGlassesEnabled($0) }), exp: true)
+                get: { glassesOn }, set: {
+                    glassesOn = $0; pendingGlasses = true
+                    awaitConfirmation(.glasses); ble.setGlassesEnabled($0)
+                }), exp: true)
             Divider().overlay(ACABTheme.line)
             // Opt-in, off by default: enabling it turns on the board's 802.11 DATA-frame
             // source-MAC path (added CPU + 2.4GHz load), which is why it is gated. Honest copy:
             // it matches known IP-camera BRANDS on the host WiFi and cannot find every camera.
             radioToggle("network cameras", "known IP-camera brands on wifi, opt-in, cannot find every camera", isOn: Binding(
-                get: { netcamOn }, set: { netcamOn = $0; pendingNetcam = true; ble.setNetcamEnabled($0) }))
+                get: { netcamOn }, set: {
+                    netcamOn = $0; pendingNetcam = true
+                    awaitConfirmation(.netcam); ble.setNetcamEnabled($0)
+                }))
         }
         .panel()
     }
@@ -1123,9 +1356,23 @@ struct DeviceView: View {
     private var offlineBufferCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             Kicker("OFFLINE BUFFER")
+            // A buffer control must not look trustworthy while firmware says evidence was lost
+            // or a privacy/lifecycle write is still retrying. Logbook shows the same notices.
+            ForEach(ble.status?.bufferHealthNotices ?? [], id: \.self) {
+                BufferHealthBanner(notice: $0)
+            }
             radioToggle("store detections offline", "board buffers while away \u{00B7} replays on reconnect", isOn: Binding(
-                get: { bufferOn }, set: { bufferOn = $0; pendingBuffer = true; ble.setBufferingEnabled($0) }))
-            if bufferOn {
+                get: { bufferOn }, set: {
+                    bufferOn = $0; pendingBuffer = true
+                    awaitConfirmation(.buffer); ble.setBufferingEnabled($0)
+                }))
+            if shouldOfferBufferClear(
+                isDemoMode: ble.demoMode,
+                bufferOn: bufferOn,
+                bufferedCount: ble.status?.bufCount ?? 0,
+                keyMismatch: ble.status?.bufferKeyMismatch == true,
+                wiping: ble.bufferWiping
+            ) {
                 Divider().overlay(ACABTheme.line)
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
@@ -1165,7 +1412,10 @@ struct DeviceView: View {
         VStack(alignment: .leading, spacing: 12) {
             Kicker("BOARD LED")
             radioToggle("lights out", "no LEDs \u{00B7} for covert or stationary deploys", isOn: Binding(
-                get: { lightsOut }, set: { lightsOut = $0; pendingLed = true; ble.setLedEnabled(!$0) }))
+                get: { lightsOut }, set: {
+                    lightsOut = $0; pendingLed = true
+                    awaitConfirmation(.led); ble.setLedEnabled(!$0)
+                }))
             Text("On by default the board LED gives a slow heartbeat so you can see it's alive, and flashes on a hit. Lights out keeps it completely dark.")
                 .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1173,26 +1423,80 @@ struct DeviceView: View {
         .panel()
     }
 
-    // MARK: drive mode (Live Activity)
+    // MARK: Live Mode (Live Activity)
     private var driveModeCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Kicker("DRIVE MODE")
+            Kicker("LIVE MODE")
+
+            HStack(spacing: 9) {
+                Circle()
+                    .fill((liveModeState == "Active" || liveModeState == "Preview on") ? ACABTheme.accent
+                          : ((liveModeState == "Blocked by iOS" || liveModeState == "Location needed")
+                             ? ACABTheme.warn : ACABTheme.faint))
+                    .frame(width: 8, height: 8)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(liveModeState)
+                        .font(ACABTheme.display(14, weight: .semibold))
+                        .foregroundStyle(ACABTheme.text)
+                    Text(liveModeStatusDetail)
+                        .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Live Mode status, \(liveModeState). \(liveModeStatusDetail)")
+
+            Divider().overlay(ACABTheme.line)
             radioToggle("live activity counter",
-                        "lock screen + dynamic island \u{00B7} live count while you drive",
-                        isOn: Binding(get: { ble.driveModeWanted },
+                        "lock screen + supported system surfaces \u{00B7} nearby-now count while the beacon is connected",
+                        isOn: Binding(get: { ble.settingsDriveModeWanted },
                                       set: { on in if on { ble.startDriveMode() } else { ble.endDriveMode() } }))
             Divider().overlay(ACABTheme.line)
+            // SCOPE, and it is NARROWER than the Android twin on purpose. Here this switch governs
+            // the Live Activity alone, which is exactly what the subtitle claims. Android's
+            // same-named toggle also strips the category from a locked per-detection alert and the
+            // count from the Android 16 status-bar chip (see _redactLockScreen in AcabBleManager),
+            // so its subtitle names three surfaces where this one names one. Both are accurate
+            // about their own platform; on this product a toggle may be quieter than advertised,
+            // never louder, so the fix was to widen the Android copy, not to widen this behaviour.
             radioToggle("hide counts on lock screen",
-                        "show only \u{201C}Drive mode active\u{201D} when locked \u{00B7} counts stay in the Dynamic Island + app",
-                        isOn: Binding(get: { ble.redactLockScreen },
-                                      set: { ble.redactLockScreen = $0 }))
-            if !ble.liveActivitiesEnabled {
-                Text("Turn on live activities for beacons in Settings to use this.")
+                        "show only \u{201C}Live Mode active\u{201D} when locked \u{00B7} counts stay in the app + other supported surfaces",
+                        isOn: Binding(get: { ble.settingsRedactLockScreen },
+                                      set: { ble.setSettingsRedactLockScreen($0) }))
+            if !ble.demoMode, !ble.liveActivitiesEnabled {
+                Text("iOS is blocking Live Activities for beacons. Turn them on in Settings to show Live Mode on system surfaces.")
                     .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.warn)
                     .fixedSize(horizontal: false, vertical: true)
+                openSettingsButton
+            } else if liveModeState == "Location needed" {
+                Text("Location keeps Live Mode current when the app is in the background. Detection still works if you decline, but the system surface stays off.")
+                    .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.warn)
+                    .fixedSize(horizontal: false, vertical: true)
+                if ble.locationDenied {
+                    openSettingsButton
+                } else {
+                    Button("ENABLE LOCATION") { ble.requestLocationAccessIfNeeded() }
+                        .font(ACABTheme.mono(10.5, weight: .bold)).tracking(0.7)
+                        .foregroundStyle(ACABTheme.accent)
+                        .frame(minHeight: 44)
+                }
             }
         }
         .panel()
+    }
+
+    private var liveModeStatusDetail: String {
+        if ble.demoMode, liveModeState == "Off" {
+            return "Sample preview only. Your saved setting and system surfaces stay unchanged."
+        }
+        switch liveModeState {
+        case "Active": return "The Live Activity is running on supported system surfaces."
+        case "Preview on": return "Sample preview only. Your saved setting and system surfaces stay unchanged."
+        case "Waiting for beacon": return "Ready to start automatically when the beacon link is ready."
+        case "Location needed": return "Allow Location to keep the Live Activity reliable in the background."
+        case "Blocked by iOS": return "Live Activities are disabled in system settings."
+        default: return "Live Mode system surfaces are disabled."
+        }
     }
 
     // MARK: desert mode (report every device)
@@ -1202,12 +1506,22 @@ struct DeviceView: View {
             radioToggle("report every device",
                         "show + log ANY device nearby \u{00B7} best out in the open",
                         isOn: Binding(get: { desertOn },
-                                      set: { desertOn = $0; pendingDesert = true; ble.setDesertMode($0) }))
+                                      set: {
+                                          desertOn = $0; pendingDesert = true
+                                          awaitConfirmation(.desert); ble.setDesertMode($0)
+                                      }))
             Text("Off the grid, anything new on the air means something arrived. Each device is tagged hardware vs. randomized (phone) MAC.")
                 .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
                 .fixedSize(horizontal: false, vertical: true)
             if desertOn {
-                Text("Alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. Switch sound back on anytime.")
+                // The startup jingle is NOT exempt from the mute (alerts.cpp, 2026-08-24: the boot
+                // motif is a UserAlert, so a muted board never announces itself - an unattended
+                // power restore is indistinguishable from a hand on the plug). The shutdown motif
+                // is the cue that still plays muted. Said plainly here so a user who mutes the
+                // board, power-cycles it and hears nothing does not read silence as a dead board.
+                // Worded as the JINGLE, not as "starts silently": the rev-B hold-to-start ack is a
+                // separate cue and does still chirp through the mute.
+                Text("Detection alerts are muted while Desert mode runs. With every nearby device reporting in, a beep for each would never let up. The shutdown cue still plays unless volume is 0; the startup jingle is muted along with everything else.")
                     .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.warn)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1261,14 +1575,24 @@ struct DeviceView: View {
                 .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
                 .fixedSize(horizontal: false, vertical: true)
 
+            // LIVE IN ALL THREE MODES. Vibrate and Silent turn detection beeps off, so the only
+            // thing this level still governs there is the shutdown cue the caption above names -
+            // and volume 0 is the ONLY thing that silences it (firmware alerts.cpp buzzerTone: a
+            // PowerState cue bypasses the alert mute, a zero volume does not). Greying the slider
+            // out in those two modes made the remedy their own copy names unreachable from them.
+            // Android twin: the same rule on VolumeSlider in DeviceScreen.kt's BuzzerCard.
             VStack(spacing: 14) {
                 slider("Master volume", value: $master, tone: ACABTheme.accent, bold: true,
                        onEditing: { editing in if editing { pendingVolume = true } }) {
-                    ble.setVolume(Int(master), preview: true)
+                    awaitConfirmation(.volume)
+                    // Round, don't truncate: the echo check compares against Int(master.rounded()),
+                    // so a truncated send (49.7 -> 49) could never match and would false-timeout.
+                    // The preview chirp is a detection-alert sound, so ask for it only in Buzzer
+                    // mode. The board plays it as a UserAlert and therefore already drops it while
+                    // alerts are muted; asking only when it can be heard keeps the request honest.
+                    ble.setVolume(Int(master.rounded()), preview: ble.alertMode == .buzzer)
                 }
             }
-            .opacity(muted ? 0.4 : 1)
-            .disabled(muted)
         }
         .panel()
     }
@@ -1283,27 +1607,29 @@ struct DeviceView: View {
         VStack(alignment: .leading, spacing: 14) {
             Kicker("PHONE NOTIFICATIONS")
 
-            if ble.notifier.mutedBySystem {
+            if !ble.demoMode, ble.notifier.mutedBySystem {
                 // A green toggle over a dead feature is the worst outcome here: the user believes
                 // they are covered. Say it plainly instead.
                 Text("iOS is blocking these. Turn notifications on for beacons in Settings, or nothing here will arrive.")
                     .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.warn)
                     .fixedSize(horizontal: false, vertical: true)
+                openSettingsButton
             }
 
-            Text("Pick what's worth a notification. Every category is off until you turn it on, and iOS asks permission the first time you do.")
+            Text(ble.demoMode
+                 ? "Preview which categories you could enable. Nothing is saved and iOS won't ask permission."
+                 : "Pick what's worth a notification. Every category is off until you turn it on, and iOS asks permission the first time you do.")
                 .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
                 .fixedSize(horizontal: false, vertical: true)
 
             VStack(spacing: 12) {
                 ForEach(DetectionNotifier.notifiableTypes, id: \.self) { t in
-                    let on = notifyOn[t.rawValue] ?? DetectionNotifier.isEnabled(t)
+                    let on = ble.phoneNotificationEnabled(t)
                     VStack(alignment: .leading, spacing: 4) {
                         radioToggle(t.label, notifySubtitle(t), isOn: Binding(
                             get: { on },
                             set: { v in
-                                notifyOn[t.rawValue] = v
-                                ble.notifier.setEnabled(v, for: t)
+                                ble.setPhoneNotificationEnabled(v, for: t)
                             }), exp: t.isExperimental)
                         // A notification for a detector the BOARD is not running can never fire.
                         // Left unsaid, that is the worst kind of dead switch: it reads as coverage.
@@ -1317,7 +1643,7 @@ struct DeviceView: View {
                 }
             }
 
-            Text("The same device won't notify again for ten minutes, so one camera can't keep buzzing you. Ignored devices never notify at all.")
+            Text("The same device won't notify again for ten minutes, so one camera can't keep buzzing you. Muted devices never notify at all.")
                 .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -1395,16 +1721,46 @@ struct DeviceView: View {
     /// "3 ON" / "OFF", so the collapsed row says whether anything will interrupt you.
     private var notifyKicker: String {
         let n = DetectionNotifier.notifiableTypes.filter {
-            notifyOn[$0.rawValue] ?? DetectionNotifier.isEnabled($0)
+            ble.phoneNotificationEnabled($0)
         }.count
+        if !ble.demoMode, ble.notifier.mutedBySystem, n > 0 {
+            return "\(n) ON \u{00B7} BLOCKED BY IOS"
+        }
         return n == 0 ? "OFF" : "\(n) ON"
     }
 
+    private var openSettingsButton: some View {
+        Button(action: openAppSettings) {
+            Text("OPEN SETTINGS")
+                .font(ACABTheme.mono(11, weight: .bold)).tracking(1)
+                .foregroundStyle(ACABTheme.accent)
+                .frame(maxWidth: .infinity, minHeight: 44)
+                .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
+                    .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens this app's iOS settings")
+    }
+
+    /// "power cues" used to cover the boot jingle too, which the board no longer plays while muted
+    /// (alerts.cpp 2026-08-24: the boot motif is a UserAlert, so mute wins; see the Desert-mode
+    /// note above). Two cues still bypass the mute, both PowerState: the shutdown motif and the
+    /// rev-B hold-to-start ack. Only the shutdown one is named here, because it is the one every
+    /// SKU plays and the one a muted user is surprised by; the ack always directly follows the
+    /// user's own hold on the button, so it explains itself. Volume 0 silences both.
+    /// Android twin: DeviceScreen.kt's BuzzerCard. Buzzer and Silent are byte-identical there and
+    /// MUST stay so. Vibrate is NOT, deliberately: these haptics are UIKit feedback generators, so
+    /// they only fire while the app is foregrounded, which is why this string adds the scope
+    /// qualifier and the Live Mode pointer. Android's haptic fires in AcabBleManager.alertHaptic
+    /// on the detection ingest path, and it does buzz with the screen locked while Live Mode's
+    /// foreground service keeps ingest alive - so the qualifier would be wrong there. The
+    /// alert-modes paragraph in README.md records the difference. Sync the other two strings
+    /// freely; do not converge this one without changing the behaviour first.
     private var alertModeCaption: String {
         switch ble.alertMode {
         case .buzzer:  return "board beeps when it spots gear"
-        case .vibrate: return "board silent, this phone buzzes on new hits while the app is open. Use Drive mode for locked-screen alerts."
-        case .silent:  return "board silent, no phone feedback"
+        case .vibrate: return "detection beeps off, the shutdown cue still plays unless volume is 0. This phone buzzes on new hits while the app is open. Use Live Mode for locked-screen alerts."
+        case .silent:  return "detection beeps and phone feedback off, the shutdown cue still plays unless volume is 0"
         }
     }
 
@@ -1415,7 +1771,12 @@ struct DeviceView: View {
             HStack {
                 Text(label).font(ACABTheme.display(14, weight: bold ? .medium : .regular)).foregroundStyle(ACABTheme.text)
                 Spacer()
-                Text(muted ? "-" : "\(Int(value.wrappedValue))")
+                // Always the number, in every alert mode. It used to read "-" outside Buzzer, which
+                // hid the one value a Vibrate/Silent user needs to see: the caption there names
+                // volume 0 as the only thing that still silences the shutdown cue, and a dash
+                // cannot tell them whether they are already at it. Android twin: VolumeSlider in
+                // DeviceScreen.kt, which prints value.toInt() unconditionally.
+                Text("\(Int(value.wrappedValue))")
                     .font(ACABTheme.mono(12, weight: .semibold)).foregroundStyle(tone)
             }
             Slider(value: value, in: 0...100, step: 1) { editing in
@@ -1429,7 +1790,7 @@ struct DeviceView: View {
     // MARK: stats
     /// Glanceable stats that stay open: uptime + total detections (2-up). Alert/scanning
     /// state now lives in the fold-row kickers, so those tiles are gone.
-    /// DETECTIONS is the PHONE-SIDE LOG count (`detections.count`), matching Android's StatsGrid.
+    /// DETECTIONS is the PHONE-SIDE LOG count, including retained evidence hidden by active mutes.
     ///
     /// It used to read the board's since-boot session total (status "total"), and the comment even
     /// claimed that was "the same source as Android" - it was not: Android has always shown the
@@ -1445,7 +1806,7 @@ struct DeviceView: View {
             : [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
         return LazyVGrid(columns: cols, spacing: 12) {
             statTile("UPTIME", ble.status.map(uptimeText) ?? "-")
-            statTile("DETECTIONS", "\(ble.detections.count)")
+            statTile("DETECTIONS", "\(ble.logDetections.count)")
         }
     }
 
@@ -1571,11 +1932,11 @@ struct DeviceView: View {
         .panel()
     }
 
-    // MARK: ignored devices
+    // MARK: muted devices
     private var ignoredCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Kicker("IGNORED")
+                Kicker("MUTED")
                 Spacer()
                 // The board echoes how many MACs it's suppressing at the source.
                 if let n = ble.status?.ignoreCount, n > 0 {
@@ -1591,6 +1952,7 @@ struct DeviceView: View {
                             .lineLimit(1)
                         // MACs are stored lowercased; render uppercase, same as Android.
                         Text(dev.mac.uppercased()).font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                        Text(dev.scopeLabel.uppercased()).font(ACABTheme.mono(9)).foregroundStyle(ACABTheme.faint)
                     }
                     Spacer(minLength: 8)
                     // Naming a muted device matters as much as naming a starred one: six weeks on,
@@ -1619,6 +1981,21 @@ struct DeviceView: View {
                 }
                 if dev.id != ble.ignored.last?.id { Divider().overlay(ACABTheme.line) }
             }
+            if ble.boardOnlyMuteCount > 0 {
+                if !ble.ignored.isEmpty { Divider().overlay(ACABTheme.line) }
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "iphone.and.arrow.forward")
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(ACABTheme.faint)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("\(ble.boardOnlyMuteCount) board-only mute\(ble.boardOnlyMuteCount == 1 ? "" : "s")")
+                            .font(ACABTheme.display(14, weight: .medium)).foregroundStyle(ACABTheme.text)
+                        Text("Created from another phone. This beacon reports only the count, so this phone cannot show or remove those devices individually.")
+                            .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.faint)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .accessibilityElement(children: .combine)
+            }
         }
         .panel()
     }
@@ -1646,9 +2023,10 @@ struct DeviceView: View {
             }
             Divider().overlay(ACABTheme.line)
             // "no data leaves your device" stopped being true the day explicit export and the
-            // contribution flow shipped. The canonical claim is automatic-upload-shaped only.
+            // contribution flow shipped. Link the repository's canonical policy directly: the
+            // old soyboi.tech copy drifted and falsely said the GPS fix never left the phone.
             linkRow("Privacy", "nothing is uploaded automatically",
-                    URL(string: "https://soyboi.tech/privacy.html")!)
+                    URL(string: "https://soyboi1312.github.io/all-cameras-are-beacons/privacy.html")!)
             Link(destination: URL(string: "https://github.com/soyboi1312")!) {
                 Text("made by soyboi")
                     .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)

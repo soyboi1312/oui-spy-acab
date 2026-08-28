@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>All Cameras Are Beacons · Firmware Flasher</title>
-<meta name="description" content="Browser-based firmware flasher for All Cameras Are Beacons, counter-surveillance detection for the beacon board and the Colonel Panic OUI-Spy and Mesh-Detect boards.">
+<meta name="description" content="Browser-based firmware flasher for All Cameras Are Beacons, counter-surveillance detection for the Colonel Panic OUI-Spy and Mesh-Detect boards. The beacon board has its own flasher.">
 <!-- esp-web-tools 10.2.1, self-hosted. Vendored from unpkg (the full ?module import graph,
      27 JS chunks, with the ?module query stripped so each chunk resolves by plain relative
      name); see web/vendor/esp-web-tools/. Self-hosting keeps the flasher off a third-party CDN
@@ -40,6 +40,8 @@
     font-size:12.5px;padding:12px 14px;display:flex;gap:10px;align-items:flex-start}
   .caution .x{color:#e8b53a;font-weight:800}
   .caution b{color:var(--ink)}
+  .caution a{color:var(--ink);text-decoration:none;border-bottom:1px solid #6b5410}
+  .caution a:hover{border-color:#e8b53a}
   .caution ul{margin:6px 0 0;padding-left:16px;line-height:1.6;list-style:disc}
   .disclaimer{margin:18px 0 0;font-size:11px;line-height:1.55;color:var(--dim);
     border-top:1px solid var(--line);padding-top:12px}
@@ -157,10 +159,11 @@
   <header>
     <div class="mark"><b>A</b>C<b>A</b>B</div>
     <div class="expand">All&nbsp;Cameras&nbsp;Are&nbsp;Beacons</div>
-    <p class="lede">Counter-surveillance detection firmware for the <b>beacon board</b> and the
+    <p class="lede">Counter-surveillance detection firmware for the
       <a href="https://colonelpanic.tech/" target="_blank" rel="noopener">Colonel Panic
       <b>OUI-Spy</b> and <b>Mesh-Detect</b></a> boards (XIAO ESP32-S3). Plug the board
-      into USB, pick a build, and flash it from this page. No toolchain is required.</p>
+      into USB, pick a build, and flash it from this page. No toolchain is required.
+      The <b>beacon board</b> is not flashed from here; see below.</p>
     <div class="scope">ACAB is passive <b>detect-and-report</b> only. It listens for the
       advertisements these devices already broadcast, with no jamming, spoofing, or interference.</div>
   </header>
@@ -171,11 +174,35 @@
     desktop</b>. Safari and Firefox do not work. The board must be connected by USB-C.</span>
   </div>
 
+  <!-- Beacon-board routing. Both products are chipFamily ESP32-S3, so ESP Web Tools cannot
+       refuse the wrong one for us: the only guard is telling the owner before they click.
+       The XIAO builds below carry none of the beacon-board flags (dual radio, buzzer on
+       GPIO7, the soft-power gate), and the recovery images are revision-specific, which is why
+       there are two links rather than one. The power wording below is deliberate: the whole
+       soft-power path in src/beacon-board/main.cpp sits inside #ifdef ACAB_DUAL_RADIO, which is
+       defined once, in [env:beacon-board], and reaches only the envs that extend it. Neither
+       [env:oui-spy] nor [env:mesh-detect] does, so these images hold no deep-sleep code. The board
+       does not park, it never stops. Do not "correct" this back to a parking claim: an owner who
+       tests a symptom that cannot happen reads the whole box as scaremongering. -->
+  <div class="caution">
+    <span class="x">!</span>
+    <span><b>Own a beacon board? Don't flash it from this page.</b> These are the public XIAO
+      builds. On a beacon board they drop the second radio's detections and put the buzzer on the
+      wrong pin, so alerts go silent, and on rev-B hardware they leave out the power gate
+      entirely, so hold-to-off and the app's power-off both stop working: on battery there is then
+      no way to switch the unit off, and it runs until the cell is flat. USB recovery is the only
+      way back. Use the board's own flasher instead:
+      <a href="https://soyboi.tech/flash.html" target="_blank" rel="noopener">rev-A beacon
+      flasher</a> or <a href="https://soyboi.tech/flash-revb.html" target="_blank" rel="noopener">rev-B
+      beacon flasher</a>. Those two are not interchangeable either. Normally you don't need
+      either one: the app delivers beacon updates over Bluetooth.</span>
+  </div>
+
   <div class="grid">
     <div class="card">
-      <h2>beacon firmware <span class="tag">APP</span></h2>
+      <h2>OUI-Spy <span class="tag">APP</span></h2>
       <p>An app-controlled scanner that streams detections to the All Cameras Are Beacons phone apps (iPhone and Android) over BLE
-         and beeps a distinct tone for each target class. Runs on the beacon board and on the Colonel Panic OUI-Spy (XIAO ESP32-S3).</p>
+         and beeps a distinct tone for each target class. Runs on the Colonel Panic OUI-Spy (XIAO ESP32-S3).</p>
       <ul>
         <li>BLE + WiFi scanning</li>
         <li>ACAB GATT service</li>
@@ -242,8 +269,9 @@
   </div>
 
   <footer>
-    <span>All Cameras Are Beacons v2.0.5</span>
+    <span>All Cameras Are Beacons v2.0.6</span>
     <a href="https://github.com/soyboi1312/all-cameras-are-beacons" id="repoLink">source</a>
+    <a href="./privacy.html">privacy</a>
     <span style="flex:1"></span>
     <span class="steps">After flashing: open a serial monitor at <code>115200</code> to watch detections.</span>
   </footer>
@@ -271,8 +299,18 @@
   // checkbox (an <ew-checkbox>) on its erase screen. Erase wipes NVS, where the BLE
   // bond lives, so the phone must pair again. We fire ONLY once that checkbox is
   // actually checked (not when the screen merely appears), and show our own
-  // top-layer <dialog> above theirs. Backup: the real "erasing" flash state. Warns
-  // at most once per install session.
+  // top-layer <dialog> above theirs. Warns at most once per install session.
+  //
+  // THE ew-checkbox PROBE IS THE ONLY DETECTOR. There used to be a second listener here
+  // for a "state-changed" event on <esp-web-install-button>, described as a backup on a
+  // stable flash-state string. It never fired and never could: install-button.js contains
+  // no dispatchEvent at all, and the bundle's only "state-changed" is dispatched by the
+  // Improv Serial client (a bare EventTarget inside install-dialog) carrying a NUMERIC
+  // Improv state, not an "erasing" string, on a transport this firmware does not implement.
+  // Removed 2026-08-25 rather than left as coverage that isn't there. So: re-verify the
+  // <ew-checkbox> selector on EVERY esp-web-tools bump. If upstream renames that element,
+  // this warning stops appearing with nothing behind it, and people erase NVS and lose the
+  // BLE bond plus the ignore list with no warning at all.
   (function () {
     var dlg = document.getElementById('eraseDialog');
     if (!dlg || !dlg.showModal) return;
@@ -319,14 +357,6 @@
         if (!document.querySelector('ewt-install-dialog')) warned = false;
       }).observe(document.body, { childList: true, subtree: true });
     } catch (e) {}
-
-    // Backup trigger: the actual "erasing" flash state (stable, non-minified string).
-    document.querySelectorAll('esp-web-install-button').forEach(function (b) {
-      b.addEventListener('state-changed', function (e) {
-        var s = e && e.detail && e.detail.state;
-        if (s && String(s).toLowerCase().indexOf('eras') !== -1) warn();
-      });
-    });
   })();
 </script>
 </body>

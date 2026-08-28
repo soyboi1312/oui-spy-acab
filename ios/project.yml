@@ -23,7 +23,7 @@ packages:
 
 settings:
   base:
-    MARKETING_VERSION: "2.0.5"
+    MARKETING_VERSION: "2.0.6"
     # The build number RESTARTS AT 0 for each new MARKETING_VERSION, and only climbs when a SECOND
     # build of the SAME version has to go up. App Store Connect requires the build to be unique
     # within a version string, NOT across the app, so 0 is always free on a version that has never
@@ -85,8 +85,8 @@ targets:
         # App uses only standard/exempt encryption (BLE, HTTPS), declared so
         # TestFlight/App Store Connect stops asking for export compliance each build.
         ITSAppUsesNonExemptEncryption: false
-        NSBluetoothAlwaysUsageDescription: "This app connects to your beacon board over Bluetooth to receive detections."
-        NSLocationWhenInUseUsageDescription: "Used to map detections, keep Drive session pins updated in the background, and geotag detections on your board over encrypted Bluetooth. Coordinates are not automatically uploaded; you choose whether to include them in an export or contribution."
+        NSBluetoothAlwaysUsageDescription: "This app connects to your beacon over Bluetooth to receive detections."
+        NSLocationWhenInUseUsageDescription: "Used to map and geotag detections, share your current location with your own beacon over encrypted Bluetooth, and keep Live Mode active in the background. Coordinates are not automatically uploaded; you choose whether to include them in an export or contribution."
         NSFocusStatusUsageDescription: "This app checks whether a Focus or Do Not Disturb is active so it can stay silent and skip the vibrate alert while you have one on."
         UIBackgroundModes:
           - bluetooth-central
@@ -99,7 +99,7 @@ targets:
           - JetBrainsMono-Medium.ttf
           - JetBrainsMono-SemiBold.ttf
           - JetBrainsMono-Bold.ttf
-        # Custom scheme so the Drive Mode Live Activity (widgetURL beacons://log/new)
+        # Custom scheme so the Live Mode Live Activity (widgetURL beacons://log/new)
         # can deep-link into the Log tab. Handled in RootView's onOpenURL.
         CFBundleURLTypes:
           - CFBundleURLName: tech.beacons.app

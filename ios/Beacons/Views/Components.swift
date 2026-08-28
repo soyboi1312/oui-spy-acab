@@ -1,4 +1,49 @@
 import SwiftUI
+import UIKit
+
+// MARK: - Settings hand-off
+
+/// Jump to this app's page in the Settings app. The one shared site for the hand-off, so a
+/// future change (a different destination URL, an applicationState guard) lands everywhere
+/// at once instead of being edited into five views. Lives here rather than in Shared/ because
+/// the Shared/ files also compile into the widget extension, where UIApplication.shared
+/// does not exist.
+func openAppSettings() {
+    guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+    UIApplication.shared.open(url)
+}
+
+/// Persistent board-side evidence warning, shared by the Logbook and Offline Buffer control.
+/// It is intentionally not dismissible: the firmware flag remains authoritative until the
+/// physical buffer is successfully cleared and the firmware resets its latched health mask.
+struct BufferHealthBanner: View {
+    let notice: BufferHealthNotice
+
+    var body: some View {
+        let tone = notice.critical ? ACABTheme.accent : ACABTheme.warn
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(tone)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 4) {
+                Kicker(notice.title, color: tone)
+                Text(notice.detail)
+                    .font(ACABTheme.mono(11))
+                    .foregroundStyle(ACABTheme.text)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tone.opacity(0.10),
+                    in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
+            .strokeBorder(tone.opacity(0.48), lineWidth: 1))
+        .accessibilityElement(children: .combine)
+    }
+}
 
 // MARK: - Brand
 

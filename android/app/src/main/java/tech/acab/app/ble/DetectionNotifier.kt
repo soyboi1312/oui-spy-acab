@@ -127,6 +127,20 @@ class DetectionNotifier(private val ctx: Context) {
             val ch = nm.getNotificationChannel(CHANNEL_ID) ?: return false
             return ch.importance == NotificationManager.IMPORTANCE_NONE
         }
+
+        /** True when the Live Mode foreground notification can actually reach the shade:
+         *  runtime permission held, app-level notifications on, and the drive channel not
+         *  muted. THE single owner of this rule: MainActivity's automatic Live Mode start and
+         *  the Beacon readiness surface both read it, so they can never disagree about the
+         *  same phone. A null channel passes (it is created on the first service start). */
+        fun liveChannelDeliverable(ctx: Context): Boolean {
+            if (!hasPostPermission(ctx) ||
+                !NotificationManagerCompat.from(ctx).areNotificationsEnabled()) return false
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return true
+            val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            return nm?.getNotificationChannel(AcabLinkService.CHANNEL_ID)?.importance !=
+                NotificationManager.IMPORTANCE_NONE
+        }
     }
 
     private val lastByMac = ConcurrentHashMap<String, Long>()
@@ -163,7 +177,8 @@ class DetectionNotifier(private val ctx: Context) {
      * REDACTION: [redact] is the app's LOCK-SCREEN setting, so it is applied the way Android
      * actually models that, via setPublicVersion, exactly as AcabLinkService.buildPublic already
      * does for drive mode. The first version redacted the main content instead, which hid the
-     * category on an UNLOCKED phone too, i.e. in the state the feature exists for, and by default.
+     * category on an UNLOCKED phone too, i.e. in the state the feature exists for. (Redaction
+     * itself now defaults OFF; this path only runs for users who turned it on.)
      */
     fun notifyIfNeeded(d: Detection, redact: Boolean) {
         if (d.hist) return                             // an offline replay is not a live event

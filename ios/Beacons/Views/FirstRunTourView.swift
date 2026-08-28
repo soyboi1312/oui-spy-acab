@@ -1,19 +1,34 @@
 import SwiftUI
 
-/// One-time orientation, shown the first time a board connects (and re-openable from the Device
-/// tab). WHY THIS EXISTS: RootView switches straight from ConnectView to MainTabView the instant a
-/// board is found, so the moment of peak confusion - "I'm connected, now what?" - had zero
-/// guidance. New users landed on tabs full of vocabulary (Desert mode, watchlist, confidence,
+/// One-time orientation, shown after the first secure beacon connection and replayable from Help.
+/// RootView switches from ConnectView to MainTabView only after the encrypted stream is ready, but
+/// that is still the moment of peak confusion: "I'm connected, now what?" New users landed on
+/// tabs full of vocabulary (Desert mode, watchlist, confidence,
 /// category toggles) with nothing telling them where to look first. Friends kept getting stuck
 /// exactly here (2026-07-29).
 ///
 /// Deliberately NOT a feature tour. Four cards, each answering one question a first-timer actually
-/// asks, in the order they ask it. It is skippable, it never shows twice, and it teaches the two
-/// ideas the rest of the app assumes you already have: what a confidence number means, and that
-/// silence is a real (good) result rather than a broken device.
+/// asks, in the order they ask it. It is skippable; real-board onboarding appears once while the
+/// sample-data version is non-persisting. It teaches the ideas the rest of the app assumes you
+/// already have: what the beacon does, what quiet means, how to read confidence, and where detector
+/// coverage lives.
+///
+/// EVERY STRING HERE IS SHARED COPY. Android's FirstRunTour.kt carries the same cards word for
+/// word and its own doc comment says so, so a wording change made on one side alone is a silent
+/// drift the compiler cannot catch: the last one left the two platforms describing card 4's
+/// behaviour differently, with only iOS mentioning that tapping an OFF category opens its setting
+/// (both platforms have always done it - see DashboardView's category accessibilityHint and
+/// StatusScreen's onClickLabel). Edit both files in the same change.
 struct FirstRunTourView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var page = 0
+    /// Sample-data orientation is deliberately non-persisting: trying the app without hardware
+    /// must not spend the first real-board onboarding moment.
+    var isSampleData = false
+    /// RootView owns real onboarding persistence because only it can verify the encrypted session
+    /// and durably arm Finish setup before marking this tour seen. Help replay keeps the default
+    /// no-op, so opening setup help before pairing cannot spend or advance real onboarding.
+    var onFinish: () -> Void = {}
 
     private struct Card {
         let glyph: String
@@ -22,42 +37,50 @@ struct FirstRunTourView: View {
         let note: String?
     }
 
-    private let cards: [Card] = [
+    private let realCards: [Card] = [
         Card(glyph: "dot.radiowaves.left.and.right",
              title: "your beacon is listening",
-             body: "It scans on two radios at once and sends what it hears to your phone. You don't have to point it, aim it, or press anything.",
-             note: "Detection is passive: it does not jam, spoof, or control nearby devices. It only reports what they already broadcast."),
-        Card(glyph: "list.bullet.rectangle",
-             title: "the Log is the answer",
-             body: "Every device it recognizes lands in the Log, newest first. Tap any row to see what it is, how sure the beacon is, and where you were when it was heard.",
-             note: "The Log lives on your phone, not on the beacon. It survives the board going flat, and you can export it as CSV."),
-        Card(glyph: "percent",
-             title: "read the confidence number",
-             body: "Each hit carries a percentage. 80 and up is a strong signature match. Under 50 means something looked similar and is worth a second glance, not an alarm.",
-             note: "Tap a row for the full reasoning: which signal matched, and why the beacon scored it that way."),
-        // The empty-log sentence is canonical, shared with Android: the old wording ("nothing
-        // to find") over-promised. An empty log only means nothing RECOGNIZABLE was BROADCASTING,
-        // and equipment that is silent, wired, cellular-backhauled or off is invisible to this
-        // hardware by design.
+             body: "the beacon does the scanning and the app is its screen. keep it powered and nearby; you do not have to point it, aim it, or press anything.",
+             note: "detection is passive. it does not jam, spoof, or control nearby devices. it only reports what they already broadcast."),
         Card(glyph: "checkmark.circle",
-             title: "quiet is a real result",
-             body: "Most places are quiet. An empty log means no compatible radio broadcast was recognized nearby - not that nothing is there. Silent, wired, cellular-only, or powered-off equipment has nothing for beacons to hear.",
-             note: "Want to see it work? Body cams and drones are common. Trackers and network cameras are opt-in, switch them on in Beacon settings."),
-        // Closing trust card (kept word-for-word with Android). Prompted by the Improve detection
-        // and log export flows: users reasonably wonder what file access those need. The honest
-        // answer is a win: exports are written in app-private space, leave only via the share
-        // sheet, and iOS never shows a storage prompt because none is needed.
-        Card(glyph: "lock",
-             title: "nothing leaves without you",
-             body: "Log exports and Improve detection reports are files the app writes in its own private space. Sharing one opens the system share sheet, and you choose exactly where it goes.",
-             note: "Nothing is uploaded automatically. beacons never asks for storage permission and cannot see your photos or files."),
+             title: "quiet does not mean clear",
+             body: "zero nearby means no supported broadcast was recognized in the last 45 seconds. silent, wired, cellular-only, 5 GHz-only, powered-off, or unsupported gear can still be there.",
+             note: "the radar shows signal strength, not direction."),
+        Card(glyph: "list.bullet.rectangle",
+             title: "the Log keeps the details",
+             body: "each detection lands in the Log, newest first. tap one to see what matched and its confidence. when Location is allowed, it also shows where your phone heard it.",
+             note: "80 and up is a strong signature match. under 50 is worth a second look, not an alarm. the phone keeps the main Log. the optional offline buffer lets the beacon keep hits while your phone is away, tagged with the last location your phone shared until that fix is 18 hours old, then with no location."),
+        Card(glyph: "switch.2",
+             title: "Status is your starting point",
+             body: "tap a category on Status to open its filtered Log. if that detector is off, the same tap opens its setting on the Beacon tab.",
+             note: "ALPR, drones, body cams, and glasses start on. trackers and network cameras start off because they can be noisy. desert mode reports every nearby broadcast when you want proof of life, so turn it back off when you are done."),
     ]
+
+    private let sampleCards: [Card] = [
+        Card(glyph: "dot.radiowaves.left.and.right",
+             title: "this is sample data",
+             body: "six fictional nearby devices fill the app so you can try every screen without a beacon. nothing here came from your surroundings.",
+             note: "sample settings are safe to explore. they do not configure hardware or replace the one-time orientation shown when your real beacon connects."),
+        Card(glyph: "list.bullet.rectangle",
+             title: "follow a sample hit",
+             body: "tap a category on Status to open its filtered Log, tap a row for the full details, and use Map to see where your phone heard each example.",
+             note: "the examples cover ALPR, a drone, body camera, tracker, recording glasses, and a network camera."),
+        Card(glyph: "switch.2",
+             title: "leave whenever you are ready",
+             body: "an Exit sample data banner stays at the top of the app, so you never have to hunt through settings to return to beacon scanning.",
+             note: "your real saved Log is restored after you exit. sample detections are never added to it."),
+    ]
+
+    private var cards: [Card] { isSampleData ? sampleCards : realCards }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
+                if isSampleData {
+                    Kicker("SAMPLE DATA TOUR")
+                }
                 Spacer()
-                Button("Skip") { finish() }
+                Button("skip") { finish() }
                     .font(ACABTheme.mono(12, weight: .medium))
                     .foregroundStyle(ACABTheme.dim)
                     .frame(minWidth: 44, minHeight: 44)
@@ -72,16 +95,22 @@ struct FirstRunTourView: View {
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
 
-            // dots
-            HStack(spacing: 7) {
-                ForEach(cards.indices, id: \.self) { i in
-                    Circle()
-                        .fill(i == page ? ACABTheme.accent : ACABTheme.faint)
-                        .frame(width: i == page ? 7 : 5, height: i == page ? 7 : 5)
+            VStack(spacing: 8) {
+                Text("step \(page + 1) of \(cards.count)")
+                    .font(ACABTheme.mono(10, weight: .medium))
+                    .foregroundStyle(ACABTheme.faint)
+                HStack(spacing: 7) {
+                    ForEach(cards.indices, id: \.self) { i in
+                        Circle()
+                            .fill(i == page ? ACABTheme.accent : ACABTheme.faint)
+                            .frame(width: i == page ? 7 : 5, height: i == page ? 7 : 5)
+                    }
                 }
             }
             .padding(.bottom, 18)
             .animation(.easeOut(duration: 0.18), value: page)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("step \(page + 1) of \(cards.count)")
 
             Button {
                 if page < cards.count - 1 {
@@ -90,7 +119,8 @@ struct FirstRunTourView: View {
                     finish()
                 }
             } label: {
-                Text(page < cards.count - 1 ? "Next" : "Start listening")
+                Text(page < cards.count - 1 ? "next"
+                     : (isSampleData ? "explore sample data" : "open Status"))
                     .font(ACABTheme.mono(14, weight: .bold))
                     .foregroundStyle(ACABTheme.bg)
                     .frame(maxWidth: .infinity)
@@ -147,7 +177,7 @@ struct FirstRunTourView: View {
     }
 
     private func finish() {
-        FirstRunTour.markSeen()
+        onFinish()
         dismiss()
     }
 }
@@ -157,8 +187,13 @@ struct FirstRunTourView: View {
 /// re-arm it for a user who wants to read it again.
 enum FirstRunTour {
     private static let key = "acab.firstRunTour.seen"
-    static var hasSeen: Bool { UserDefaults.standard.bool(forKey: key) }
-    static func markSeen() { UserDefaults.standard.set(true, forKey: key) }
+    static var hasSeen: Bool { hasSeen(in: .standard) }
+    static func hasSeen(in defaults: UserDefaults) -> Bool { defaults.bool(forKey: key) }
+    static func markSeen(in defaults: UserDefaults = .standard) {
+        defaults.set(true, forKey: key)
+    }
     /// "Show the tour again" from Device settings.
-    static func reset() { UserDefaults.standard.set(false, forKey: key) }
+    static func reset(in defaults: UserDefaults = .standard) {
+        defaults.set(false, forKey: key)
+    }
 }

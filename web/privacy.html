@@ -26,7 +26,7 @@
   <div class="sub">Last updated August 2026</div>
 
   <div class="panel">
-    <p><b>Short version: no accounts, analytics, tracking, or automatic detection uploads.</b> Your detections stay on your board and phone unless you deliberately export or contribute them. The app uses the network to load map tiles, check for firmware updates, and, if you opt in, download the known-ALPR map layer.</p>
+    <p><b>Short version: no accounts, analytics, tracking, or automatic detection uploads.</b> Your detections stay on your board and phone unless you deliberately export or contribute them. The app uses the network to load map tiles, check for firmware updates, and download the known-ALPR map layer, which is on by default and can be switched off in the map layers panel.</p>
   </div>
 
   <h2>What the app does</h2>
@@ -36,7 +36,12 @@
   <p>Bluetooth is used only to connect to your own detection board. The app receives detections and status from it, sends settings you choose, and can send your current location fix over the encrypted local link so the board can geotag detections. The app does not connect to or control nearby detected devices.</p>
 
   <h2>Location</h2>
-  <p>If you grant location access, your approximate position is used to pin detections on the map and can appear in Log CSV and GPX exports. Your phone also sends its current fix to your own board over the encrypted local Bluetooth link, so hits the board records while your phone is away still land in the right place. The app does not automatically send those coordinates to us or an internet service. Apart from the encrypted local link to your board, they leave your phone only when you choose to export or contribute them.</p>
+  <p>If you grant location access, your approximate position is used to pin detections on the map and can appear in Log CSV and GPX exports. Your phone also sends its current fix to your own board over the encrypted local Bluetooth link. The board holds that fix in memory, so a restart discards it, and it stops using the fix once it is about 18 hours old. Hits it records while your phone is away can carry a position for that long, and hits recorded after that carry no position at all. The one place a fix from your phone reaches the board's own storage is the offline detection buffer, described in the next section, which is off until you turn it on. The app does not automatically send those coordinates to us or an internet service. Apart from the encrypted local link to your board, they leave your phone only when you choose to export or contribute them.</p>
+
+  <h2>Offline detection buffer (off by default)</h2>
+  <p>Off by default; you turn it on in the app. With it on, the board records detections to its own flash while your phone is away and replays them to your phone when you reconnect, over the same encrypted local link. Nothing in it is uploaded anywhere.</p>
+  <p>A buffered hit that is not a drone is written to that flash together with the last position your phone shared, whenever the board still holds one inside the 18-hour limit above. That is where your coordinates reach the board's storage. A drone's record carries the drone's own broadcast position instead, and a record the board has no usable fix for is stored with no position at all.</p>
+  <p>Those records are encrypted at rest on the board with a key your phone supplies. While the buffer is switched on, the board also keeps a copy of that key in its own flash so it can carry on recording across a restart. The tradeoff is deliberate, and it is the thing to weigh before switching the buffer on: someone who takes the board gets both the key and what it stored, including those coordinates. The buffer is not sealed against a seized board. Switching the buffer off erases the key from the board. Records left uncollected across about six restarts are erased by the board on its own, and clearing the log from the app erases them on demand.</p>
 
   <h2>Maps</h2>
   <p>When you open the map, the map images are loaded from a map provider (OpenStreetMap on Android, Apple Maps on iOS). Like any web request, that provider can see your device's IP address and which area of the map you are viewing. No detections, detection identifiers, or board data are attached to those requests.</p>
@@ -49,13 +54,13 @@
   <p>When you choose Review &amp; Share, the app opens a mail composer or your system share flow with the CSV and optional photo. It fills in logs@soyboi.tech where the selected mail app supports a recipient field and otherwise identifies that address in the message for you to paste. Nothing is sent until you confirm it in the mail or sharing app. You can change the recipient or save the files instead.</p>
 
   <h2>Firmware updates</h2>
-  <p>The app fetches a small static version file from soyboi.tech to learn whether new firmware exists for your board, and downloads the firmware image if you choose to install it. These are plain file downloads from a static site: no account, location, or detection data is attached. The site host (GitHub Pages) sees the request, including your IP address, the way any web server does.</p>
+  <p>The app fetches a small static version file from soyboi.tech to learn whether new firmware exists for your board, and downloads the firmware image if you choose to install it. These are plain file downloads from a static site: no account, location, or detection data is attached. The site host sees the request, including your IP address, the way any web server does.</p>
 
-  <h2>Known-ALPR map layer (opt-in)</h2>
-  <p>Off by default. If you turn on the "known cameras" layer, the app downloads one static dataset of community-mapped license-plate-reader locations from soyboi.tech and draws it on your map. It is a plain file download like the firmware check: your map viewport and detections are not attached, there are no per-view lookups, and the site host sees the ordinary request and IP address. The locations come from OpenStreetMap contributors (the registry the DeFlock project maintains), used under the ODbL.</p>
+  <h2>Known-ALPR map layer (on by default)</h2>
+  <p>On by default; the map layers panel turns it off. With the layer on, the app downloads one static dataset of community-mapped license-plate-reader locations from soyboi.tech and draws it on your map. It is a plain file download like the firmware check: your map viewport and detections are not attached, there are no per-view lookups, and the site host sees the ordinary request and IP address. The locations come from OpenStreetMap contributors (the registry the DeFlock project maintains), used under the ODbL.</p>
 
   <h2>Third parties</h2>
-  <p>The app has no advertising, analytics, or tracking. Its automatic network use is limited to the map provider that supplies map tiles and the static soyboi.tech site for firmware and the opt-in ALPR dataset, both described above. A detection export or contribution reaches another service only when you explicitly hand it to a mail or sharing app and confirm the destination.</p>
+  <p>The app has no advertising, analytics, or tracking. Its automatic network use is limited to the map provider that supplies map tiles and the static soyboi.tech site for firmware and the known-ALPR dataset, both described above. A detection export or contribution reaches another service only when you explicitly hand it to a mail or sharing app and confirm the destination.</p>
 
   <h2>Contact</h2>
   <p>Questions? Open an issue at <a href="https://github.com/soyboi1312/all-cameras-are-beacons">github.com/soyboi1312/all-cameras-are-beacons</a>.</p>

@@ -4,9 +4,17 @@ import SwiftUI
 /// Built around the radar scope, fed by live BLE detections.
 struct DashboardView: View {
     @EnvironmentObject var ble: BLEManager
+    var onOpenDetectors: () -> Void = {}
     // Accessibility text sizes reflow the six-across tile strip into a grid and pad the scroll
     // bottom; read once here so every consumer keys off the same threshold.
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    // SF Symbols have different intrinsic bounds (the wide tracker radio waves are taller than
+    // the glasses, for example), and lowercase "off" has a shorter optical height than a digit.
+    // Give every tile the same three scaled slots so neither glyph choice nor state changes the
+    // card's outer height. The value/caption metrics follow the same Dynamic Type curves as the
+    // matching ACABTheme fonts below.
+    @ScaledMetric(relativeTo: .title) private var categoryValueLineHeight: CGFloat = 22
+    @ScaledMetric(relativeTo: .caption) private var categoryCaptionLineHeight: CGFloat = 10
 
     // Staleness moves with the clock, not with @Published state, so nothing would invalidate
     // this screen as rows go quiet: without the tick the count freezes at its last-publish
@@ -15,7 +23,14 @@ struct DashboardView: View {
     // tidied away. 1 s cadence, same as Android's StatusScreen, so a device crossing the
     // 45 s boundary ages off the radar at the same moment on both platforms.
     @State private var tick = Date()
-    private let staleTick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    /// Held in @State so the SAME publisher survives a re-render, exactly like the dossier's
+    /// followTick. MainTabView holds the manager, so its body re-runs on every publish and builds
+    /// this view fresh with it: as a plain `let` the timer was rebuilt each time and onReceive
+    /// cancelled and resubscribed with it, so under a streaming feed it never lived the whole
+    /// second it needs to fire once. `tick` then stuck at the instant Status appeared - and it
+    /// stuck hardest during a drive or Desert mode, which is exactly when a row that went quiet
+    /// has to age off instead of holding the radar at "SEEN < 45s".
+    @State private var staleTick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     /// Only what we can still hear. The store is capped, never time-evicted, so an
     /// unfiltered read hands "strongest signal" to a Flock heard at 9:00 and left fifteen
@@ -124,6 +139,19 @@ struct DashboardView: View {
                         HStack {
                             BrandMark(size: 21)
                             Spacer()
+                            NavigationLink {
+                                HelpView(canImproveDetection: improveDetectionAvailable(
+                                    isSessionReady: ble.sessionReady,
+                                    isDemoMode: ble.demoMode))
+                            } label: {
+                                Image(systemName: "questionmark.circle")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundStyle(ACABTheme.dim)
+                                    .frame(width: 44, height: 44)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("help and support")
                             LinkChip(version: ble.status?.version, connected: ble.connectionState == .connected, demo: ble.demoMode)
                         }
                         HStack(spacing: 8) {
@@ -309,34 +337,62 @@ struct DashboardView: View {
     /// reader would speak as gibberish, so each tile carries its full-word name too.
     @ViewBuilder
     private func tileSet(_ counts: [DeviceType: Int]) -> some View {
-        tile(.flockCamera, "ALPR",  spoken: "ALPR cameras",  (counts[.flockCamera] ?? 0) + (counts[.flockRaven] ?? 0))
-        tile(.drone,       "DRONE", spoken: "Drones",        counts[.drone] ?? 0)
-        tile(.axonBodyCam, "BODY",  spoken: "Body cameras",  counts[.axonBodyCam] ?? 0)
-        tile(.tracker,     "TRKR",  spoken: "Trackers",      counts[.tracker] ?? 0)
-        tile(.recordingGlasses, "GLAS", spoken: "Glasses",   counts[.recordingGlasses] ?? 0)
-        tile(.networkCamera,    "NETCAM", spoken: "Network cameras", counts[.networkCamera] ?? 0)
+        tile(.flockCamera, "ALPR",  spoken: "ALPR cameras", enabled: detectorEnabled(.flockCamera),
+             (counts[.flockCamera] ?? 0) + (counts[.flockRaven] ?? 0))
+        tile(.drone,       "DRONE", spoken: "Drones", enabled: detectorEnabled(.drone), counts[.drone] ?? 0)
+        tile(.axonBodyCam, "BODY",  spoken: "Body cameras", enabled: detectorEnabled(.axonBodyCam), counts[.axonBodyCam] ?? 0)
+        tile(.tracker,     "TRKR",  spoken: "Trackers", enabled: detectorEnabled(.tracker), counts[.tracker] ?? 0)
+        tile(.recordingGlasses, "GLAS", spoken: "Glasses", enabled: detectorEnabled(.recordingGlasses), counts[.recordingGlasses] ?? 0)
+        tile(.networkCamera, "NETCAM", spoken: "Network cameras", enabled: detectorEnabled(.networkCamera),
+             counts[.networkCamera] ?? 0)
+    }
+
+    private func detectorEnabled(_ type: DeviceType) -> Bool? {
+        guard let s = ble.status else { return nil }
+        switch type {
+        case .flockCamera, .flockRaven: return s.flock
+        case .drone: return s.drone
+        case .axonBodyCam: return s.axon
+        case .tracker: return s.tracker
+        case .recordingGlasses: return s.glasses
+        case .networkCamera: return s.ncam
+        default: return true
+        }
     }
 
     /// Each tile deep-links to the Log tab with its category filter armed (LogFocus is the
     /// same one-shot static-slot pattern MapFocus uses, session-only on purpose), so the
     /// at-a-glance count answers "show me those" in one tap instead of being a dead number.
-    private func tile(_ type: DeviceType, _ label: String, spoken: String, _ n: Int) -> some View {
-        Button {
-            LogFocus.pendingCategory = type.category
-            NotificationCenter.default.post(name: LogFocus.notification, object: nil)
+    private func tile(_ type: DeviceType, _ label: String, spoken: String,
+                      enabled: Bool?, _ n: Int) -> some View {
+        let off = enabled == false
+        return Button {
+            if off {
+                onOpenDetectors()
+            } else {
+                LogFocus.pendingCategory = type.category
+                NotificationCenter.default.post(name: LogFocus.notification, object: nil)
+            }
         } label: {
             VStack(spacing: 5) {
                 Image(systemName: type.symbol)
                     .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(n == 0 ? ACABTheme.faint : type.tint)
-                Text("\(n)")
+                    .foregroundStyle(off || n == 0 ? ACABTheme.faint : type.tint)
+                    .frame(width: 22, height: 18)
+                // Uppercase keeps OFF on the same cap-height as the numeric state. Both still use
+                // one exact font and one exact line box across all six categories.
+                Text(off ? "OFF" : "\(n)")
                     .font(ACABTheme.display(18, weight: .bold))
-                    .foregroundStyle(n == 0 ? ACABTheme.faint : ACABTheme.text)
+                    .foregroundStyle(off || n == 0 ? ACABTheme.faint : ACABTheme.text)
                     .monospacedDigit()
+                    .lineLimit(1)
+                    .frame(height: categoryValueLineHeight)
                 Text(label)
                     .font(ACABTheme.mono(8, weight: .semibold))
                     .tracking(0.8)
-                    .foregroundStyle(n == 0 ? ACABTheme.faint : type.tint)
+                    .foregroundStyle(off || n == 0 ? ACABTheme.faint : type.tint)
+                    .lineLimit(1)
+                    .frame(height: categoryCaptionLineHeight)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 10)
@@ -347,8 +403,8 @@ struct DashboardView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(spoken), \(n) active")
-        .accessibilityHint("Opens the log filtered to this category")
+        .accessibilityLabel(off ? "\(spoken), detector off" : "\(spoken), \(n) active")
+        .accessibilityHint(off ? "opens detector settings on Beacon" : "opens the Log filtered to this category")
     }
 
     /// Tappable card for the closest device (highest RSSI).

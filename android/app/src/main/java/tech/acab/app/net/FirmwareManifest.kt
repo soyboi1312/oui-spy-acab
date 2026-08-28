@@ -47,6 +47,21 @@ internal fun trustedFirmwareArtifactUrl(raw: String): URL? = runCatching {
     }
 }.getOrNull()
 
+/**
+ * The flasher entry is a web page we hand the user, not an artifact we execute, so it is NOT
+ * pinned to the product origin the way [trustedFirmwareArtifactUrl] is: the Colonel Panic boards
+ * flash from the project's GitHub Pages site. What it must be is a plain https web address, so a
+ * mis-published or hostile manifest string can never aim ACTION_VIEW at some other component, or
+ * at a scheme no browser answers. Returns the original string when it passes, null otherwise.
+ * Mirrors the iOS scheme check in Views/SettingsView.swift (flasherURL); the empty host is refused
+ * here as well, because Uri.parse would still hand ACTION_VIEW an unresolvable "https:///…".
+ */
+internal fun trustedFlasherUrl(raw: String): String? = runCatching {
+    URL(raw).takeIf { url ->
+        url.protocol.equals("https", ignoreCase = true) && !url.host.isNullOrEmpty()
+    }?.let { raw }
+}.getOrNull()
+
 /** Redirects are refused even when their destination would otherwise be trusted. */
 internal fun firmwareArtifactResponseAllowed(initial: URL, final: URL, statusCode: Int): Boolean =
     statusCode == HttpURLConnection.HTTP_OK &&
@@ -229,26 +244,26 @@ class FirmwareManifest private constructor(context: Context) {
             updated = "",
             builds = mapOf(
                 "beacon board" to FirmwareBuild(
-                    version = "2.0.5", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.6", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi.tech/flash.html", notes = "",
                 ),
                 // rev-B rides the beacon version line but flashes from its own page: its image
                 // must never land on rev-A hardware, so the fallback must not point it at
                 // flash.html. Matches the iOS fallback.
                 "beacon board rev-B" to FirmwareBuild(
-                    version = "2.0.5", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.6", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi.tech/flash-revb.html", notes = "",
                 ),
                 "ACAB-ouispy" to FirmwareBuild(
-                    version = "2.0.5", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.6", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
                 "mesh-detect-ACAB" to FirmwareBuild(
-                    version = "2.0.5", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.6", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
                 "mesh-detect-ACAB-ch1" to FirmwareBuild(
-                    version = "2.0.5", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.6", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
             ),
@@ -275,7 +290,13 @@ class FirmwareManifest private constructor(context: Context) {
                     sha256 = app?.optString("sha256", "")?.lowercase() ?: "",
                     size = app?.optLong("size", 0L) ?: 0L,
                     sig = app?.optString("sig", "")?.lowercase() ?: "",
-                    flasher = b.optString("flasher", ""),
+                    // Confined here rather than at the tap: a non-https flasher string is dropped
+                    // so the caller's baked-in flasher page takes over, instead of becoming an
+                    // ACTION_VIEW target. The cache holds the raw body, so a bad publish is
+                    // re-screened by this same gate on every load. (appUrl is confined the other
+                    // way round, by trustedFirmwareArtifactUrl at download time, because the OTA
+                    // path needs the exact origin, not just a scheme.)
+                    flasher = trustedFlasherUrl(b.optString("flasher", "")) ?: "",
                     notes = b.optString("notes", ""),
                     nrf = b.optJSONObject("nrf")?.let { n ->
                         NrfBuild(
@@ -298,17 +319,25 @@ class FirmwareManifest private constructor(context: Context) {
             )
         }
 
-        /** Plain HTTPS GET on the caller's thread. Returns the body, or null on any error. */
+        /** Plain HTTPS GET on the caller's thread. Returns the body, or null on any error.
+         *  The manifest goes through the same origin gate as the artifacts it points at: this
+         *  body decides the version string, the update banner and the flasher link, so a 30x
+         *  must not be allowed to move it to another host. [firmwareArtifactResponseAllowed]
+         *  already encodes that rule, and iOS refuses the same redirect with
+         *  FirmwareManifestRejectRedirectsDelegate. */
         private fun httpGet(url: String): String? {
             var conn: HttpURLConnection? = null
             return try {
-                conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                val initial = trustedFirmwareArtifactUrl(url) ?: return null
+                conn = (initial.openConnection() as HttpURLConnection).apply {
                     requestMethod = "GET"
                     connectTimeout = 8_000
                     readTimeout = 8_000
+                    instanceFollowRedirects = false
                     setRequestProperty("Accept", "application/json")
                 }
-                if (conn.responseCode != HttpURLConnection.HTTP_OK) return null
+                val status = conn.responseCode
+                if (!firmwareArtifactResponseAllowed(initial, conn.url, status)) return null
                 val bytes = conn.inputStream.use { input ->
                     readBoundedManifestBody(input, conn.contentLengthLong, MAX_MANIFEST_BYTES)
                 } ?: return null

@@ -609,28 +609,19 @@ extension BLEManager {
         }
     }
 
-    /// True for a plain dotted-numeric version like "2", "1.7", "2.0.0" (optionally a trailing
-    /// "-suffix"). Rejects a non-numeric fw string before a version compare, so a degraded
-    /// lexical compare can't falsely confirm success and disarm rollback.
-    ///
-    /// ASCII digits ONLY. `Character.isNumber` alone accepts every Unicode number (fullwidth
-    /// digits, Arabic-Indic, Roman numerals, fractions), and the running-version string comes off
-    /// the board's Status frame, which this product's own threat model treats as
-    /// attacker-influenced. A field is also capped at 4 digits: the firmware packs 10-bit fields
-    /// (max 1023), so anything longer is malformed on its face.
+    /// The exact release grammar shared by the board, Android, and release tooling: one to three
+    /// dotted ASCII-numeric fields, each <= 1023 and not all zero, plus an optional nonempty dash
+    /// suffix made from ASCII alphanumerics/dot/dash. The whole value must fit esp_app_desc's
+    /// 31-byte text field. Rejecting any other board/manifest string before comparison prevents a
+    /// degraded lexical compare from falsely confirming an OTA and disarming rollback.
     static func isNumericVersion(_ s: String) -> Bool {   // internal, not private: pinned by OtaVersionGateTests
-        // omittingEmptySubsequences: false is LOAD-BEARING on the "-" split too: the default
-        // omits empties, so "-1" produced core "1" and passed, while Android's
-        // substringBefore("-") yields "" and rejects. Same board state must read the same on
-        // both platforms.
-        let core = s.split(separator: "-", maxSplits: 1,
-                           omittingEmptySubsequences: false).first.map(String.init) ?? s
-        guard !core.isEmpty else { return false }
-        return core.split(separator: ".", omittingEmptySubsequences: false)
-            .allSatisfy { field in
-                !field.isEmpty && field.count <= 4
-                    && field.allSatisfy { $0.isASCII && $0.isNumber }
-            }
+        FirmwareVersionPolicy.isValid(s)
+    }
+
+    /// Compare the same packed numeric core as firmware/Android, padding a missing minor/patch
+    /// field with zero and ignoring the already-validated release suffix.
+    static func isFirmwareVersionAtLeast(_ have: String, _ want: String) -> Bool {
+        FirmwareVersionPolicy.isAtLeast(have, want)
     }
 
     private func decideRebootOutcome(_ wait: OTARebootWait, generation: UInt64,
@@ -646,13 +637,13 @@ extension BLEManager {
         let runningLabel = otaSawFreshStatus ? currentFwLabel : nil
         // Confirm only on a PARSEABLE a.b[.c] version that is >= the target. A non-numeric string
         // (e.g. a fallback "ESP32") must not disarm rollback via a degraded lexical compare.
-        let parseable = Self.isNumericVersion(running)
+        let parseable = Self.isNumericVersion(running) && Self.isNumericVersion(wait.targetVersion)
         // The firmware label is the hardware/product target (including the distinct rev-B build).
         // A numerically-current image with the wrong label must stay on trial so rollback can
         // recover it; confirming on version alone could permanently accept a wrong-board image.
         let labelMatches = runningLabel == wait.fwLabel
         let ok = parseable && labelMatches
-            && running.compare(wait.targetVersion, options: .numeric) != .orderedAscending
+            && Self.isFirmwareVersionAtLeast(running, wait.targetVersion)
         if ok {
             // New firmware booted. Confirm to disarm the board's rollback (belt-and-braces:
             // the board also self-heals ~20 s after a healthy boot).

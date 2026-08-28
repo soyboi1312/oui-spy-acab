@@ -8,6 +8,10 @@ import UniformTypeIdentifiers
 
 private let contributionPhotoSourceByteLimit = 64 * 1024 * 1024
 
+func contributionCaptureCanStart(isSessionReady: Bool, isDemoMode: Bool) -> Bool {
+    improveDetectionAvailable(isSessionReady: isSessionReady, isDemoMode: isDemoMode)
+}
+
 /// "Help improve detection" - a structured MANUAL export composer. iOS twin of Android's
 /// ContributeScreen.kt; keep the copy in step.
 ///
@@ -90,22 +94,37 @@ struct ContributeView: View {
     // purpose: the location toggles stay live in review, so redaction happens per-share, not at
     // Stop. Cleared by Start over and confirmed Discard.
     @State private var frozenCsv = ""
+    // The frozen CSV's data-row count, counted ONCE at Stop for the same reason photoThumb is
+    // decoded once (above): review is a live SwiftUI body. `ble` is an @EnvironmentObject, so
+    // every publish tick invalidates this body while the board keeps scanning, and the review
+    // branch reads the count several times per evaluation - which meant re-parsing an unbounded
+    // capture CSV on the main thread each time. Set and cleared ONLY alongside frozenCsv, so the
+    // number on screen still cannot disagree with the file that leaves.
+    @State private var frozenRowCount = 0
     // Non-nil while the "Discard this capture?" confirmation is up; names what a confirm does
     // (close the flow, restart at idle, or start a fresh capture). Mirrors Android's DiscardTarget.
     @State private var confirmDiscard: DiscardTarget?
-    private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    // @State, not let: this struct re-initializes whenever the parent re-renders (per BLE
+    // publish while a board streams), and a plain let hands onReceive a fresh publisher each
+    // time, so the 1 s tick never fired. Same rule as DashboardView.staleTick.
+    @State private var ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     private static func nowMillis() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
     private var liveCount: Int {
         switch phase {
         case .capturing: return ble.windowObservationCount(startMs: startMs, stopMs: nowMs)
         // Review counts the ARTIFACT (data rows of the frozen CSV), not the membership map, so
-        // the number on screen can never disagree with the file that leaves.
-        case .review:    return Self.csvRowCount(frozenCsv)
+        // the number on screen can never disagree with the file that leaves. Counted at Stop,
+        // not here: this getter is read repeatedly per body evaluation (see frozenRowCount).
+        case .review:    return frozenRowCount
         case .idle:      return 0
         }
     }
     private var exportBusy: Bool { preparing || photoLoading }
+    private var canStartCapture: Bool {
+        contributionCaptureCanStart(isSessionReady: ble.sessionReady,
+                                    isDemoMode: ble.demoMode)
+    }
 
     // Built in PLAIN SWIFT, not inside the ViewBuilder: a multi-line concat with a ternary is what
     // makes the SwiftUI type-checker time out. Window-aware, and states the actual result. The
@@ -222,7 +241,13 @@ struct ContributeView: View {
            + "then stop. Only what the beacon heard during that window is exported, so your "
            + "contribution is a focused diagnostic capture, not your whole history.")
             .font(ACABTheme.mono(12)).foregroundStyle(ACABTheme.dim)
+        if !canStartCapture {
+            Text("connect a real beacon before starting a capture.")
+                .font(ACABTheme.mono(11)).foregroundStyle(ACABTheme.warn)
+        }
         primaryButton("START CAPTURE") { startCapture() }
+            .disabled(!canStartCapture)
+            .opacity(canStartCapture ? 1 : 0.5)
         discardLink
     }
 
@@ -246,6 +271,9 @@ struct ContributeView: View {
                 snapshot.rows,
                 includeObserverLocation: true, includeDroneLocation: true,
                 includeOperatorLocation: true)
+            // One parse of the artifact, here, instead of one per body evaluation for as long
+            // as the user reads the review screen.
+            frozenRowCount = Self.csvRowCount(frozenCsv)
             phase = .review
         }
     }
@@ -613,18 +641,21 @@ struct ContributeView: View {
         cleanupTemp()
         capturedAtByID = [:]
         frozenCsv = ""
+        frozenRowCount = 0
         switch target {
         case .close:      phase = .idle; dismiss()
         case .restart:    phase = .idle
-        case .newCapture: startCapture()
+        case .newCapture: phase = .idle; startCapture()
         }
     }
 
     /// Arm a fresh capture window. Any previous window's frozen state is gone by now
     /// (performDiscard), or never existed (idle).
     private func startCapture() {
+        guard canStartCapture else { return }
         capturedAtByID = [:]
         frozenCsv = ""
+        frozenRowCount = 0
         startMs = Self.nowMillis(); nowMs = startMs
         ble.beginContributionCapture(startMs: startMs)
         phase = .capturing

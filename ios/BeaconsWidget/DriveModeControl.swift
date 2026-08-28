@@ -11,15 +11,15 @@ struct DriveModeControl: ControlWidget {
     var body: some ControlWidgetConfiguration {
         StaticControlConfiguration(kind: "tech.beacons.app.drivemode") {
             ControlWidgetToggle(
-                "Drive Mode",
+                "Live Mode",
                 isOn: !Activity<DetectionActivityAttributes>.activities.isEmpty,
                 action: ToggleDriveModeIntent()
             ) { isOn in
-                Label(isOn ? "Detecting" : "Drive Mode",
-                      systemImage: isOn ? "car.fill" : "car")
+                Label(isOn ? "Detecting" : "Live Mode",
+                      systemImage: "dot.radiowaves.left.and.right")
             }
         }
-        .displayName("Beacons Drive Mode")
+        .displayName("beacons Live Mode")
         .description("Start or stop the surveillance-detection counter.")
     }
 }

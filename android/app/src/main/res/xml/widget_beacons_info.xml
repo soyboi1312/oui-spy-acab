@@ -5,15 +5,21 @@
      updatePeriodMillis is the OS-driven
      floor (30 min is the platform minimum); while the app process is alive it pushes fresher
      updates on every detection and on connect/disconnect (AcabBleManager.updateWidget), so the
-     30-min tick only keeps the relative "ago" honest when the app is not running. -->
+     30-min tick only keeps the relative "ago" honest when the app is not running.
+     widgetCategory stays home_screen ONLY. The face renders the TODAY count, the per-category
+     strip and the last hit's category, and nothing in this package reads the "keep counts private
+     on lock screen" switch, so a keyguard-hosted instance would disclose all three on a locked
+     (possibly seized) phone with the switch ON. Adding keyguard back means gating the content on
+     that switch first, via the host category in AppWidgetManager.getAppWidgetOptions. iOS ships no
+     lock-screen family either (DetectionsWidget supportedFamilies is systemSmall/systemMedium). -->
 <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
     android:minWidth="250dp"
     android:minHeight="110dp"
     android:targetCellWidth="4"
     android:targetCellHeight="2"
     android:updatePeriodMillis="1800000"
-    android:initialLayout="@layout/widget_beacons"
-    android:previewLayout="@layout/widget_beacons"
+    android:initialLayout="@layout/glance_default_loading_layout"
+    android:previewLayout="@layout/widget_beacons_preview"
     android:description="@string/widget_description"
     android:resizeMode="horizontal|vertical"
     android:widgetCategory="home_screen" />

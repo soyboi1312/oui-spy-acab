@@ -13,6 +13,12 @@ have no token to rescue them. The eyewear-only IDs ship enabled (like Axon) and 
 honestly as "possible recording glasses." Still capture-pending: the `META_RB_GLASS` token's
 exact byte framing, and worn-advertising confirmation for Snap and Vuzix.
 
+**The detector reads THREE surfaces, not just manufacturer data.** Most of this page was written
+when it read one, so read it with that in mind: the company-ID material below is current and
+complete for that surface, and the two service-UUID surfaces added 2026-07-31 are covered under
+*Service-UUID surfaces* near the end. The shipped tables for all three live in
+[docs/signatures.md](signatures.md), which is the file to trust on values, confidences and gating.
+
 ## Its own category, not trackers and not body cam
 
 Recording glasses are a distinct threat and get their own device type,
@@ -30,11 +36,12 @@ a camera.
 
 ## Verified BLE company IDs
 
-Match is on the BLE **manufacturer-specific data** (AD type `0xFF`): the first two
-payload bytes are the company ID, **little-endian**. This is the existing `M_MFG_ID`
-method. Keying on the payload company ID (not the MAC) is deliberate: it survives the
-BLE MAC randomization that these devices do, which is the whole point of an external
-detector.
+One of the three match surfaces, and the last one the firmware evaluates: the BLE
+**manufacturer-specific data** (AD type `0xFF`), whose first two payload bytes are the company ID,
+**little-endian**. This is the existing `M_MFG_ID` method (`meth:3`). Keying on the payload
+company ID (not the MAC) is deliberate: it survives the BLE MAC randomization that these devices
+do, which is the whole point of an external detector. The two service-UUID surfaces are described
+under *Service-UUID surfaces* below and use their own methods.
 
 | Company ID | Registrant | Product | Eyewear-specific? | Confidence |
 |---|---|---|---|---|
@@ -44,10 +51,11 @@ detector.
 | `0x058E` | Meta Platforms Technologies, LLC | Ray-Ban / Oakley Meta AI glasses **and** Meta Quest VR | no, shared across Meta hardware | bare hit gated off; token-confirmed only (72) |
 | `0x01AB` | Meta Platforms, Inc. | Meta corporate/parent ID, appears across Meta hardware | no, not eyewear-specific | bare hit ships at 45 (weak match); token-confirmed 72 |
 | `0x0BC6` | TCL COMMUNICATION EQUIPMENT CO.,LTD. | RayNeo AR/smart glasses (a TCL sub-brand), also TCL phones/tablets/TVs | no, TCL corporate ID | gated off (no token to confirm) |
+| `0x05D6` | Zhuhai Jieli Technology Co. | Rogbird VisionPro / Rollme VistaView camera glasses | no, a Bluetooth AUDIO SoC vendor | gated off (no token to confirm) |
 | none | RayNeo | RayNeo smart glasses | no dedicated SIG company ID exists | n/a |
 
-**Provenance.** All seven were pulled from the Bluetooth SIG Assigned Numbers company-ID
-list (mirrored in the Nordic DB) during the Signatures phase and matched against the
+**Provenance.** Every company ID above was pulled from the Bluetooth SIG Assigned Numbers
+company-ID list (mirrored in the Nordic DB) during the Signatures phase and matched against the
 authoritative registrant strings:
 
 - Bluetooth SIG Assigned Numbers (company IDs): https://www.bluetooth.com/specifications/assigned-numbers/
@@ -114,19 +122,50 @@ Two things gate promoting this from capture-pending to field-validated:
    glasses, but
    per Help Net Security's reporting that name is generally only exposed during pairing, so
    it is rarely visible in the field against someone who paired in advance. Net: continuous
-   field detection has to rely on the company ID (plus, for Meta, the payload subtype below),
-   not the name.
+   field detection has to rely on the payload surfaces - company ID, service UUIDs, and for
+   Meta the payload token below - not the name.
 2. **A Quest discriminator (already gating).** The way to separate Ray-Ban/Oakley Meta
    glasses from a Quest under the shared `0x058E` ID is a manufacturer-data payload
    **token**, not a service UUID: the glasses' BLE manufacturer data is reported to carry
    the ASCII token **`META_RB_GLASS`**, which detection projects (the Spectacle keychain,
-   the "nearby glasses" app) parse before alerting. No distinguishing 16-bit service UUID
-   has been documented. The shipped firmware already relies on this: a bare Meta ID stays
-   silent, and a Meta-ID advert only emits when the token co-signals, which raises the hit
-   to a confident glasses call and drops the Quest caveat. What is still capture-pending is
+   the "nearby glasses" app) parse before alerting. No 16-bit service UUID has been
+   documented that tells glasses from a Quest either: the member UUIDs the firmware does
+   match are split by REGISTRANT, which is an inference about who ships what, not a
+   glasses-versus-headset discriminator. What the shipped firmware relies on is narrower
+   than this section used to claim: a bare **`0x058E`** advert stays silent and emits only
+   when the token co-signals, which raises the hit to a confident glasses call and drops the
+   Quest caveat, while the corporate parent ID **`0x01AB`** was un-gated on 2026-07-31 and
+   now emits a conf-45 weak match on its own, token or not. What is still capture-pending is
    confirming the token's exact byte framing against a real worn-and-recording advert, so
    for now the token is only a confidence bump layered on the company-ID (`M_MFG_ID`) match,
    never a standalone signal.
+
+## Service-UUID surfaces
+
+Added 2026-07-31. Manufacturer data is not the only place a vendor names itself, so the detector
+also reads two service-UUID surfaces. Both are payload-borne, so they survive MAC randomization
+the same way the company ID does, and both work on an advert that carries **no** `0xFF` record at
+all, which is why the firmware evaluates them before it looks for manufacturer data:
+
+- **16-bit SIG member service UUIDs** (method `M_SERVICE_UUID`, `meth:4`), read from the AD
+  `0x02`/`0x03` UUID lists and the first two bytes of an AD `0x16` service-data record. A
+  **separate namespace** from company IDs, and easily confused with them: `0xFEB7` is not company
+  ID `0xFEB7`. Shipped: Meta `0xFEB7` / `0xFEB8` at conf 45 un-gated, Snap `0xFE45` at conf 70,
+  and Meta Platforms Technologies' `0xFD5F` gated off for the same Quest reason as `0x058E`.
+- **The HeyCyan SDK's 128-bit service UUID** (method `M_SERVICE_DATA`, `meth:8`), read from the AD
+  `0x06`/`0x07` 128-bit lists or AD `0x21` service data, at conf 68. It names the glasses
+  SOFTWARE rather than a corporate registrant, so it carries neither the Quest nor the earbud
+  ambiguity. It must only ever match on the **full 16 bytes**: it shares its whole base with
+  Apple's ANCS UUID, so a prefix match would fire on most notification-consuming wearables.
+
+**All three surfaces are scored, and the best confidence wins, not the first hit.** Order decides
+ties only, and the firmware's order is HeyCyan, then 16-bit member UUID, then company ID, with a
+`<=` comparison so an equal-confidence later surface never displaces an earlier one. An advert
+carrying both Snap's `0xFE45` (70) and Snap's `0x03C2` (70) therefore reports `meth:4`.
+
+The gating, confidences and provenance for every row live in
+[docs/signatures.md](signatures.md); the wire fields are in
+[docs/ble-protocol.md](ble-protocol.md).
 
 ## The beacon advantage
 
@@ -145,8 +184,10 @@ Status JSON reports it as `"glasses"` beside `"axon"` and `"tracker"`. Detail st
 the vendor and say "possible recording glasses"; a bare `0x01AB` hit emits as a weak match at
 confidence 45, the still-gated shared IDs (`0x058E`, `0x0BC6`, `0x05D6`) do not emit on their
 own, and a token-confirmed Meta hit reports as "Ray-Ban Meta: recording glasses" with no
-Quest caveat. See [docs/ble-protocol.md](ble-protocol.md) for the wire fields and
-[docs/signatures.md](signatures.md) for the signature table.
+Quest caveat. One switch covers all three surfaces; there is no per-surface toggle, and the
+`meth` field on the wire (`3` mfg ID, `4` member UUID, `8` HeyCyan 128-bit) is what says which
+one fired. See [docs/ble-protocol.md](ble-protocol.md) for the wire fields and
+[docs/signatures.md](signatures.md) for the signature tables.
 
 ## Sources
 

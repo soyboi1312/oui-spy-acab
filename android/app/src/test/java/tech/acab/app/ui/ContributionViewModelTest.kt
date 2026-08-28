@@ -15,6 +15,33 @@ class ContributionViewModelTest {
         assertEquals(1, vm.frozenRowCount)
     }
 
+    /** The count is frozen when the CSV is, rather than re-derived on every read, so the one
+     *  thing that can now go wrong is a count outliving the artifact it describes: a discarded
+     *  capture would leave REVIEW claiming observations that no longer exist anywhere. Every
+     *  reset path has to take the count with it. */
+    @Test
+    fun frozenRowCountIsClearedWithEveryCaptureReset() {
+        val vm = ContributionViewModel().apply {
+            open = true
+            phase = CapturePhase.REVIEW
+            frozenCsv = "a,b\n1,2\n3,4"
+        }
+        assertEquals(2, vm.frozenRowCount)
+
+        // Start over: back to IDLE, and the artifact plus its count are gone together.
+        vm.requestRestart()
+        vm.confirmDiscardNow()
+        assertNull(vm.frozenCsv)
+        assertEquals(0, vm.frozenRowCount)
+
+        // Closing the composer is the other reset path.
+        vm.frozenCsv = "a,b\n1,2"
+        assertEquals(1, vm.frozenRowCount)
+        vm.requestExit()
+        assertNull(vm.frozenCsv)
+        assertEquals(0, vm.frozenRowCount)
+    }
+
     @Test
     fun beginExportLocksFlowAndReturnsImmutablePolicySnapshot() {
         val vm = ContributionViewModel().apply {

@@ -69,6 +69,234 @@ class OtaSafetyPolicyTest {
         assertFalse(otaDoneCanAdvance(OtaPhase.SENDING, imageEnded = false))
         assertFalse(otaDoneCanAdvance(OtaPhase.CHECKING, imageEnded = true))
         assertTrue(otaDoneCanAdvance(OtaPhase.SENDING, imageEnded = true))
+
+        assertTrue(otaAbortAllowed(true, 9, 9, OtaPhase.SENDING, false, false))
+        assertFalse(otaAbortAllowed(false, 9, 9, OtaPhase.SENDING, false, false))
+        assertFalse(otaAbortAllowed(true, 8, 9, OtaPhase.SENDING, false, false))
+        assertFalse(otaAbortAllowed(true, 9, 9, OtaPhase.VERIFYING, false, false))
+        assertFalse(otaAbortAllowed(true, 9, 9, OtaPhase.SENDING, true, false))
+        assertFalse(otaAbortAllowed(true, 9, 9, OtaPhase.SENDING, false, true))
+    }
+
+    @Test
+    fun `board mutation waits for confirmed foreground promotion and fails closed`() {
+        assertEquals(
+            ForegroundServiceHoldDecision.FAILED,
+            foregroundServiceHoldDecision(
+                requestAccepted = false,
+                serviceActive = false,
+                elapsedMs = 0,
+                timeoutMs = OTA_HOLD_PROMOTION_TIMEOUT_MS,
+            ),
+        )
+        assertEquals(
+            ForegroundServiceHoldDecision.WAIT,
+            foregroundServiceHoldDecision(
+                requestAccepted = true,
+                serviceActive = false,
+                elapsedMs = OTA_HOLD_PROMOTION_TIMEOUT_MS - 1,
+                timeoutMs = OTA_HOLD_PROMOTION_TIMEOUT_MS,
+            ),
+        )
+        assertEquals(
+            ForegroundServiceHoldDecision.FAILED,
+            foregroundServiceHoldDecision(
+                requestAccepted = true,
+                serviceActive = false,
+                elapsedMs = OTA_HOLD_PROMOTION_TIMEOUT_MS,
+                timeoutMs = OTA_HOLD_PROMOTION_TIMEOUT_MS,
+            ),
+        )
+        assertEquals(
+            ForegroundServiceHoldDecision.READY,
+            foregroundServiceHoldDecision(
+                requestAccepted = true,
+                serviceActive = true,
+                elapsedMs = OTA_HOLD_PROMOTION_TIMEOUT_MS + 1,
+                timeoutMs = OTA_HOLD_PROMOTION_TIMEOUT_MS,
+            ),
+        )
+
+        val boardMutations = mutableListOf<String>()
+        fun beginIfReady(active: Boolean, elapsedMs: Long) {
+            if (foregroundServiceHoldDecision(
+                    requestAccepted = true,
+                    serviceActive = active,
+                    elapsedMs = elapsedMs,
+                    timeoutMs = OTA_HOLD_PROMOTION_TIMEOUT_MS,
+                ) == ForegroundServiceHoldDecision.READY) {
+                boardMutations += "begin"
+            }
+        }
+        beginIfReady(active = false, elapsedMs = 0)
+        assertTrue(boardMutations.isEmpty())
+        beginIfReady(active = true, elapsedMs = 1)
+        assertEquals(listOf("begin"), boardMutations)
+
+        assertTrue(rejectedForegroundRequestRemovesHolder(
+            holderInsertedByThisRequest = true,
+            requestAccepted = false,
+        ))
+        assertFalse(rejectedForegroundRequestRemovesHolder(
+            holderInsertedByThisRequest = false,
+            requestAccepted = false,
+        ))
+
+        var ownRequests = 0
+        assertTrue(acquireOtaHoldBoundary(
+            reuseConfirmedHold = true,
+            serviceActive = true,
+            requestOwnHold = { ownRequests++; false },
+        ))
+        assertEquals(0, ownRequests)
+        assertFalse(acquireOtaHoldBoundary(
+            reuseConfirmedHold = true,
+            serviceActive = false,
+            requestOwnHold = { ownRequests++; true },
+        ))
+        assertEquals(0, ownRequests)
+        assertTrue(acquireOtaHoldBoundary(
+            reuseConfirmedHold = false,
+            serviceActive = true,
+            requestOwnHold = { ownRequests++; true },
+        ))
+        assertEquals(1, ownRequests)
+
+        assertFalse(nrfArmMutationAllowed(
+            ownsLiveSession = true,
+            phase = NrfDfuPhase.PREPARING,
+            protectedHoldReady = false,
+        ))
+        assertFalse(nrfArmMutationAllowed(
+            ownsLiveSession = false,
+            phase = NrfDfuPhase.PREPARING,
+            protectedHoldReady = true,
+        ))
+        assertTrue(nrfArmMutationAllowed(
+            ownsLiveSession = true,
+            phase = NrfDfuPhase.PREPARING,
+            protectedHoldReady = true,
+        ))
+    }
+
+    @Test
+    fun `nrf cancellation closes before destructive flash`() {
+        for (phase in listOf(
+            NrfDfuPhase.PREPARING,
+            NrfDfuPhase.TRIGGERING,
+            NrfDfuPhase.SCANNING,
+        )) assertTrue(phase.name, nrfUserCancellationAllowed(phase))
+
+        for (phase in listOf(
+            NrfDfuPhase.IDLE,
+            NrfDfuPhase.FLASHING,
+            NrfDfuPhase.CONFIRMING,
+            NrfDfuPhase.DONE,
+            NrfDfuPhase.FAILED,
+        )) assertFalse(phase.name, nrfUserCancellationAllowed(phase))
+
+        assertEquals(
+            NrfStartStallAction.KEEP_WAITING,
+            nrfStartStallAction(NrfDfuPhase.FLASHING, uploadProgressSeen = false),
+        )
+        assertEquals(
+            NrfStartStallAction.IGNORE,
+            nrfStartStallAction(NrfDfuPhase.FLASHING, uploadProgressSeen = true),
+        )
+        assertEquals(
+            NrfStartStallAction.IGNORE,
+            nrfStartStallAction(NrfDfuPhase.FAILED, uploadProgressSeen = false),
+        )
+    }
+
+    @Test
+    fun `foreground service loss cancels only pre-commit update phases`() {
+        for (phase in listOf(
+            OtaPhase.CHECKING,
+            OtaPhase.DOWNLOADING,
+            OtaPhase.VERIFYING,
+            OtaPhase.SENDING,
+        )) {
+            assertTrue(phase.name, otaUserCancellationAllowed(phase, imageEnded = false))
+            assertFalse(phase.name, otaUserCancellationAllowed(phase, imageEnded = true))
+        }
+        for (phase in listOf(
+            OtaPhase.IDLE,
+            OtaPhase.REBOOTING,
+            OtaPhase.CONFIRMING,
+            OtaPhase.DONE,
+            OtaPhase.FAILED,
+        )) assertFalse(phase.name, otaUserCancellationAllowed(phase, imageEnded = false))
+
+        assertEquals(
+            CombinedHoldLossAction.FAIL_BEFORE_MUTATION,
+            combinedHoldLossAction(
+                CombinedUpdatePhase.CHECKING,
+                s3Planned = true,
+                s3CanCancel = false,
+                nrfPhase = NrfDfuPhase.IDLE,
+            ),
+        )
+        assertEquals(
+            CombinedHoldLossAction.CANCEL_S3_AND_FAIL,
+            combinedHoldLossAction(
+                CombinedUpdatePhase.UPDATING_S3,
+                s3Planned = true,
+                s3CanCancel = true,
+                nrfPhase = NrfDfuPhase.IDLE,
+            ),
+        )
+        assertEquals(
+            CombinedHoldLossAction.IGNORE_CRITICAL,
+            combinedHoldLossAction(
+                CombinedUpdatePhase.UPDATING_S3,
+                s3Planned = true,
+                s3CanCancel = false,
+                nrfPhase = NrfDfuPhase.IDLE,
+            ),
+        )
+        for (phase in listOf(
+            NrfDfuPhase.PREPARING,
+            NrfDfuPhase.TRIGGERING,
+            NrfDfuPhase.SCANNING,
+        )) assertEquals(
+            phase.name,
+            CombinedHoldLossAction.CANCEL_NRF_AND_FAIL,
+            combinedHoldLossAction(
+                CombinedUpdatePhase.UPDATING_COPROC,
+                s3Planned = false,
+                s3CanCancel = false,
+                nrfPhase = phase,
+            ),
+        )
+        for (phase in listOf(NrfDfuPhase.FLASHING, NrfDfuPhase.CONFIRMING)) assertEquals(
+            phase.name,
+            CombinedHoldLossAction.IGNORE_CRITICAL,
+            combinedHoldLossAction(
+                CombinedUpdatePhase.UPDATING_COPROC,
+                s3Planned = false,
+                s3CanCancel = false,
+                nrfPhase = phase,
+            ),
+        )
+        assertEquals(
+            CombinedHoldLossAction.FAIL_BEFORE_MUTATION,
+            combinedHoldLossAction(
+                CombinedUpdatePhase.RECONNECTING,
+                s3Planned = false,
+                s3CanCancel = false,
+                nrfPhase = NrfDfuPhase.IDLE,
+            ),
+        )
+        assertEquals(
+            CombinedHoldLossAction.IGNORE_CRITICAL,
+            combinedHoldLossAction(
+                CombinedUpdatePhase.RECONNECTING,
+                s3Planned = true,
+                s3CanCancel = false,
+                nrfPhase = NrfDfuPhase.IDLE,
+            ),
+        )
     }
 
     @Test
@@ -103,7 +331,7 @@ class OtaSafetyPolicyTest {
         assertFalse(isNumericFirmwareVersion("٢.٠.٤"))      // Arabic-Indic
         assertFalse(isNumericFirmwareVersion("२.०.४"))      // Devanagari
         assertFalse(isNumericFirmwareVersion("2.０.4"))                // one smuggled field
-        assertFalse(isNumericFirmwareVersion("12345.0.0"))                 // field > 4 digits
+        assertFalse(isNumericFirmwareVersion("12345.0.0"))                 // field > 1023
         // Leading dash: substringBefore("-") yields "" here, rejected by isNotEmpty(). Pinned
         // because iOS's split() needed omittingEmptySubsequences: false to agree; same board
         // state must read the same on both platforms.
@@ -117,6 +345,34 @@ class OtaSafetyPolicyTest {
             OtaPostRebootDecision.UNKNOWN,
             decideOtaPostReboot("２.０.４", "beacon board", "2.0.4", "beacon board"),
         )
+    }
+
+    @Test
+    fun `firmware version gate matches the complete release grammar`() {
+        for (valid in listOf(
+            "2", "2.0", "2.0.6", "0.0.1", "1023.1023.1023", "2.0.6-rc1",
+            "2.0.6-rc.1", "2.0.6-r-1", "0000000000000000000000000000001",
+            "2.0.6-" + "r".repeat(25), // exactly 31 ASCII bytes including core + dash
+        )) assertTrue(valid, isNumericFirmwareVersion(valid))
+        // A release-valid long leading-zero field must also survive the comparison itself; using
+        // String.toInt here would accept it at the gate and then throw during post-reboot confirm.
+        assertTrue(isFirmwareVersionAtLeast("0000000000000000000000000000001", "1"))
+        assertTrue(isFirmwareVersionAtLeast("1", "0000000000000000000000000000001"))
+        assertTrue(isFirmwareVersionOlder("2.0.5", "2.0.6-rc1"))
+        assertFalse(isFirmwareVersionOlder("2.0.6-rc1", "2.0.6"))
+        assertFalse(isFirmwareVersionOlder("2.0.7", "2.0.6-rc1"))
+
+        for (invalid in listOf(
+            // Every numeric field is the board packer's complete 10-bit value, not just digits.
+            "1024", "2.1024", "2.0.1024", "2.0.6.1",
+            // Packed zero is the OTA policy's malformed sentinel.
+            "0", "0.0", "0.0.0", "000-rc1",
+            // The suffix is optional, but if the dash exists its constrained value is not.
+            "2.0.6-", "2.0.6-.rc1", "2.0.6-_rc1", "2.0.6-rc+1",
+            "2.0.6-rc/1", "2.0.6-ré", "2.0.6-" + "r".repeat(26),
+            // Complete core grammar: no empty fields or valid-prefix acceptance.
+            "", ".2", "2.", "2..6", "2.0.x", "2.0.6+meta",
+        )) assertFalse(invalid, isNumericFirmwareVersion(invalid))
     }
 
     @Test
