@@ -2,10 +2,12 @@ import CoreLocation
 
 /// Turns a tracker's breadcrumb trail into a sentence a person can judge, and nothing more.
 ///
-/// The firmware has always refused this call on purpose (acab_scanner.cpp:352): the board sees one
-/// advertisement at a time and has no idea where the phone was standing, so "is this thing
-/// FOLLOWING me" can only be answered here, from location over time. This file is that answer, and
-/// it is deliberately the smallest one that is defensible.
+/// The firmware has always refused this call on purpose (the TRACKER_ALERT_DEBOUNCE_MS banner in
+/// acab_scanner.cpp, and the note beside that debounce in handleDetection - named rather than
+/// line-cited, because that file's line numbers move): the board sees one advertisement at a time
+/// and has no idea where the phone was standing, so "is this thing FOLLOWING me" can only be
+/// answered here, from location over time. This file is that answer, and it is deliberately the
+/// smallest one that is defensible.
 ///
 /// The evidence is ALREADY gathered and already filtered. BLEManager appends a crumb of THE
 /// PHONE's own position for a separated tracker only when the record is live, the type is

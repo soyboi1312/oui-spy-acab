@@ -3,8 +3,10 @@ package tech.acab.app.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -22,6 +24,7 @@ import androidx.compose.material.icons.filled.RemoveRedEye
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -33,6 +36,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import tech.acab.app.model.DeviceType
+import tech.acab.app.model.BufferHealthNotice
 import tech.acab.app.model.TimeBasis
 import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.tone
@@ -85,6 +89,40 @@ fun Modifier.panel(strong: Boolean = false): Modifier = this
     .background(Acab.bg2, RoundedCornerShape(Acab.radius))
     .border(1.dp, if (strong) Acab.lineStrong else Acab.line, RoundedCornerShape(Acab.radius))
     .padding(Acab.padCard)
+
+/** Persistent board-side evidence warning, shared by the Logbook and Offline Buffer control.
+ *  These are deliberately not dismissible: the corresponding firmware flag stays authoritative
+ *  until a successful physical buffer clear resets the firmware's latched health mask. */
+@Composable
+fun BufferHealthBanner(notice: BufferHealthNotice) {
+    val tone = if (notice.critical) Acab.accent else Acab.warn
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(tone.copy(alpha = 0.10f), RoundedCornerShape(Acab.radiusSm))
+            .border(1.dp, tone.copy(alpha = 0.48f), RoundedCornerShape(Acab.radiusSm))
+            .padding(12.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
+        Icon(
+            Icons.Filled.WarningAmber,
+            contentDescription = null,
+            tint = tone,
+            modifier = Modifier.size(19.dp),
+        )
+        Spacer(Modifier.width(9.dp))
+        Column(verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(4.dp)) {
+            Kicker(notice.title, color = tone)
+            Text(
+                notice.detail,
+                color = Acab.text,
+                fontSize = 11.sp,
+                lineHeight = 16.sp,
+                fontFamily = Acab.mono,
+            )
+        }
+    }
+}
 
 /** The one EXP tag for experimental detectors: tinted amber, matching on both platforms.
  *  Amber text on amber 14% fill with an amber 40% border, radius 4. */

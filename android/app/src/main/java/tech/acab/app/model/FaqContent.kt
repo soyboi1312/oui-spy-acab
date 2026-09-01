@@ -8,7 +8,7 @@ import org.json.JSONObject
  * No webview, no fetch, no analytics on any help surface, which is the same no-cloud stance as the
  * rest of the product: opening Help must not tell anyone that you opened Help.
  *
- * WHY THIS PARSES JSON INSTEAD OF BEING A KOTLIN LITERAL. The content is 20 answers that have to
+ * WHY THIS PARSES JSON INSTEAD OF BEING A KOTLIN LITERAL. The answers have to
  * read identically on iOS and Android. Transcribing them into a Swift enum and a Kotlin object is
  * two hand-maintained copies of the same prose, and cross-platform copy drift is the single most
  * recurring defect class in this repo. So one file, `faq-content.json`, is copied verbatim into
@@ -58,7 +58,7 @@ class FaqContent private constructor(
 
     /**
      * Case-insensitive substring over question AND answer. Deliberately not fuzzy and not ranked:
-     * 20 answers is small enough that a plain contains() never surprises anyone, and a clever
+     * This set is small enough that a plain contains() never surprises anyone, and a clever
      * matcher that silently drops a result is worse than a dumb one that does not.
      */
     fun search(query: String): List<Pair<String, FaqQuestion>> {
@@ -70,9 +70,9 @@ class FaqContent private constructor(
     }
 
     /**
-     * Question ids worth surfacing on a dossier for this device type, or [] for the categories the
-     * handoff deliberately leaves alone (glasses / body cam already carry an experimental note, and
-     * stacking a second hedge under it reads as doubt about the detection itself).
+     * Question ids worth surfacing on a dossier for this device type, or [] for the two types
+     * with no faqKey (NEARBY_DEVICE and UNKNOWN, whose faqKey is ""). Every real key has an
+     * entry, enforced by check-signature-drift.py; see [DeviceType.faqKey].
      */
     fun related(type: DeviceType): List<FaqQuestion> =
         (relatedHelp[type.faqKey] ?: emptyList()).mapNotNull { question(it) }

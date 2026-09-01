@@ -1,234 +1,239 @@
 # All Cameras Are Beacons
 
-**All Cameras Are Beacons.** A little gadget that quietly notices when surveillance gear is around you and gives you a heads-up, either on your phone or out over a Meshtastic mesh.
+**All Cameras Are Beacons.** A little gadget that quietly notices when surveillance gear is around you and gives you a heads-up, either on your phone or over a Meshtastic mesh.
 
-It runs on the beacon (our own two-radio board) and on the **Colonel Panic OUI-Spy** and **Mesh-Detect** boards (tiny Seeed XIAO ESP32-S3 dev boards). Plug it in and it listens for the radio signals that cameras, sensors, and drones are already shouting into the air. When it detects one, it tells you.
+It runs on the beacon, our own dual-radio board, and on the **Colonel Panic OUI-Spy** and **Mesh-Detect** boards built around a Seeed XIAO ESP32-S3. Plug it in and it listens for radio signals that cameras, sensors, trackers, and drones already broadcast. When it recognizes one, it tells you.
 
-> **Important** detection of nearby devices is passive. It does not probe, jam,
-> spoof, control, or interfere with those devices. The board's encrypted bluetooth
-> link reports results and receives settings only from your phone. It is the radio
-> equivalent of noticing a camera on a pole and writing it down. Mapping surveillance
-> gear in public is a long-standing privacy practice (the folks at deflock.me have
-> been at it a while).
+> **Important:** detection of nearby devices is passive. Shipping firmware does not probe, jam,
+> spoof, control, or interfere with the devices it observes. The board uses a bonded, encrypted
+> Bluetooth link to exchange detections, status, and settings with the phone app. Mesh-Detect
+> separately transmits alerts through its wired Meshtastic node. This is the radio equivalent of
+> noticing a camera on a pole and writing it down.
+> Mapping surveillance gear in public is a long-standing privacy practice, and the folks at
+> [DeFlock](https://deflock.me) have been at it for a while.
+
+## Start here
+
+- **Want to look around without hardware?** Install the [iPhone](https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861) or [Android app](https://play.google.com/store/apps/details?id=tech.soyboi.beacons) and tap **See how it works**. It loads six clearly marked fictional detections. Sample settings never configure a board, sample rows never enter your real Log, and leaving the sample restores your saved data.
+- **Already have compatible hardware?** Power the beacon, OUI-Spy, or Mesh-Detect board and tap **Scan** in the app. Grant Bluetooth access on iPhone, Nearby devices on Android 12 or newer, or Location on Android 8 through 11. Choose the board and approve the system pairing prompt. The first encrypted connection opens a short walkthrough followed by the relevant permission and readiness prompts.
+- **Building your own OUI-Spy or Mesh-Detect?** Use the [one-click DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/) or follow the [command-line instructions](#flashing-from-the-command-line).
+- **Looking for the beacon?** Retail hardware is coming soon. Current availability and the waitlist are at [soyboi.tech](https://soyboi.tech).
+- **Need a hand?** Read the [getting-started guide](https://soyboi.tech/getting-started), check the [FAQ and support page](https://soyboi.tech/faq), or open a [GitHub issue](https://github.com/soyboi1312/all-cameras-are-beacons/issues).
+
+A board is required for live detection. Sample data and an existing saved Log remain available without one.
 
 ## the beacon
 
-the beacon is a pocket detector, about the size of an airpods case, that quietly maps the surveillance broadcasting around you. flip it on, drop it in a bag, and everything it hears shows up live on your phone.
+the beacon is a pocket detector, about the size of an AirPods case, that quietly maps the surveillance gear broadcasting around you. flip it on, drop it in a bag, and everything it recognizes shows up live on your phone.
 
-it is a **passive detector** on two bands, WiFi and bluetooth. surveillance gear announces itself over the air to do its job; the beacon recognizes those broadcasts and puts them on your map. it never probes, jams, or spoofs nearby devices; its encrypted bluetooth link exchanges results and settings only with your phone. it is a detector, not a weapon.
-
-**what it catches**
-- flock / ALPR license-plate cameras, plus flock's raven audio sensors
-- drones overhead: the FAA remote ID broadcast is the main tell, and DJI, Parrot, Skydio, Autel, and Yuneec craft are also flagged by their own radio hardware when they aren't broadcasting it
-- body-worn cameras in range (Axon, matched on its own registered hardware address and on its device tag. a broader Motorola Solutions vendor match sits on its own switch under body cam, opt-in and off by default: in our own capture every one of those hits was fixed equipment, not anything worn, so it reads as a weak match to verify rather than a confirmed camera)
-- BLE item trackers riding along with you (AirTag / Find My, Tile, SmartTag; off by default. your phone sees a tracker from the first sighting, and the buzzer holds quiet for that tracker's first minute, so one you merely walk past never sounds)
-- smart / recording glasses on the people around you (Ray-Ban / Oakley Meta, Snap Spectacles, Vuzix; honest "possible glasses" call, since the Meta signature can also be a VR headset)
-- network cameras on the WiFi you're on (opt-in, off by default; branded IP-camera OUIs like Hikvision, Dahua, Amcrest, Axis, Reolink on the host network. it matches known camera brands, not every camera, and is never a hidden-camera claim)
+it listens to Wi-Fi and Bluetooth, two protocols on the 2.4 GHz band. surveillance gear announces itself over the air to do its job; the beacon recognizes supported broadcasts and puts them in your Log. it is a detector, not a weapon.
 
 **the device**
-- dual radio: a dedicated bluetooth scanner runs flat-out while a second radio handles WiFi and the app link, so neither starves the other. single-radio boards time-slice one antenna between scanning and the phone link, which costs them about half their bluetooth listening time; the beacon's bluetooth scan is continuous, a measured 100% duty against ~51%, and a street drive found 2.5x more unique bluetooth devices over the same route. the numbers are in [how much does it actually hear?](#how-much-does-it-actually-hear) below
-- location tagged via your phone's GPS
-- an on-board buzzer alerts you, so it works with your phone put away
-- optional offline logging: opt in once and it keeps what it heard while you were gone, encrypted, waiting when you reconnect
-- ships pre-flashed and ready to pair, nothing to set up out of the box
-- USB-C powered (the battery model recharges over the same port). when new firmware lands the app flags it and installs it over-the-air over bluetooth, no cable and no toolchain; you can also flash from your browser in one click at [soyboi.tech/flash](https://soyboi.tech/flash.html)
 
-**free app, paid hardware.** the iOS and android apps are free and open source, and so is the firmware, read every line before you trust it. the beacon hardware is what we sell. buy the beacon, own the data: no accounts, no cloud, no telemetry, and no automatic detection uploads. detections stay on your beacon and phone unless you explicitly export or send them.
+- dual radio: a dedicated nRF52840 scanner listens continuously for Bluetooth while an ESP32-S3 handles Wi-Fi and the app link, so neither job starves the other. the duty-cycle details are in [how much does it actually hear?](#how-much-does-it-actually-hear)
+- optional location context from your phone's GPS
+- an onboard buzzer, so alerts still work with your phone put away
+- optional offline logging that stores detections on the board, encrypted, until you reconnect
+- USB-C power, with charging over the same port on the battery model
+- app-delivered firmware updates over Bluetooth, with revision-specific USB recovery available when needed
 
-**get one.** everything about the beacon lives at [soyboi.tech](https://soyboi.tech). preorder on [tindie](https://www.tindie.com/stores/soyboitech/).
+Retail units are designed to arrive pre-flashed. You will still need to power the board, pair it with the app, and choose any optional permissions or detector categories you want.
 
-**honest about limits.** silent gear stays invisible: wired cameras and purely optical systems emit no radio and won't show up. this is not an SDR or a bug sweeper, it listens to two bands for known signatures, nothing more. a quiet screen means nothing announced itself, not that you're unwatched.
+**free app, paid hardware.** the iPhone and Android apps and the ESP32-S3 firmware in this repository are free and open source. the beacon hardware is what we plan to sell. there are no accounts, analytics, third-party tracking, or automatic detection uploads. detections stay on your board and phone unless you explicitly export or contribute them. the apps do make ordinary network requests for map tiles, update files, and the optional mapped-camera dataset, but those requests do not include your detections. the full policy is in [web/privacy.html](web/privacy.html).
 
-## What it looks for
+**honest about limits.** silent gear stays invisible. wired cameras and purely optical systems emit no supported radio signal and will not show up. this is not an SDR or a bug sweeper. a quiet screen means the scanner did not recognize a supported broadcast while it was listening, not that you are unwatched.
 
-| What | How it's spotted | Notes |
+**privacy limits.** the board currently advertises a fixed factory Bluetooth address so bonded iPhones can reconnect reliably. that means a passive observer can correlate the board itself over time. the offline buffer is encrypted, but its key is stored on the board while buffering is enabled. it protects against casual reads, not forensic access to a captured unit. both tradeoffs are detailed in [docs/ble-protocol.md](docs/ble-protocol.md).
+
+## What it detects
+
+| What | How it is spotted | Default and limits |
 |---|---|---|
-| **Flock cameras** (automated license-plate readers) | Bluetooth (+ WiFi when a unit is provisioning) | reliable over Bluetooth; the WiFi path depends on a camera scanning for a network, which units on cellular backhaul may never do |
-| **Flock Raven** (their audio / gunshot sensor) | Bluetooth | very reliable |
-| **Drones** broadcasting FAA Remote ID | Bluetooth + WiFi | very reliable. a separate opt-in fallback, off by default, flags DJI, Parrot, Skydio, Autel and Yuneec hardware when Remote ID is silent; that one means vendor gear nearby, which may be a controller rather than an aircraft |
-| **Axon body cameras** | Bluetooth | field-validated June 2026; on by default |
-| **BLE item trackers** (AirTag / Find My, Tile, Samsung SmartTag) | Bluetooth | off by default, flip it on from the app; the buzzer holds quiet for a tracker's first minute in range, so one you walk past never sounds, while the sighting still reaches the app straight away |
-| **Smart / recording glasses** (Ray-Ban / Oakley Meta, Snap Spectacles, Vuzix) | Bluetooth | on by default; one field capture behind it, with the Quest discriminator still capture-pending; reports as "possible glasses" since the Meta signature can also be a VR headset |
-| **Network cameras** (branded IP cameras: Hikvision, Dahua, Amcrest, Axis, Reolink) | WiFi | opt-in, off by default; the board never joins a network, it listens promiscuously and matches camera-brand OUIs in frames already on the air, at 65-88 confidence (an OUI match is 65, or 75 field-validated; an Arlo base station naming itself in its SSID is 88); known brands only, cannot find every camera, never a hidden-camera claim. now 180 vendor blocks including Ring, Wyze and Anker/eufy, where a hit may be another product from the same maker |
+| **Flock cameras** (automated license-plate readers) | Bluetooth, plus Wi-Fi when a unit advertises or probes | On by default. Product-specific names and SSIDs are the clearest matches; Flock and Lite-On address-prefix paths are supporting leads (the Lite-On evidence grade is documented in docs/signatures.md) |
+| **Flock Raven** audio sensors | Bluetooth service UUIDs | On by default; built from field-captured Raven-specific services |
+| **Drones broadcasting FAA Remote ID** | Bluetooth + Wi-Fi | Remote ID is on by default and can include aircraft coordinates; a separate vendor-hardware fallback matching drone makers' own address blocks (DJI, Parrot, Skydio, Autel, Yuneec, Anduril, Zipline, and more; the full table is `firmware/lib/acab_core/drone_signatures.h`) is opt-in and may identify a controller rather than an aircraft |
+| **Body cameras** (Axon and Utility BodyWorn) | Bluetooth + Wi-Fi | On by default; Axon's device tag is the strongest match. A broad Motorola Solutions vendor proxy has its own opt-in switch, starts off, and is always a weak match to verify |
+| **Item trackers** (Apple Find My, Google Find Hub/FMDN in separated state, Tile, Samsung SmartTag) | Bluetooth | Off by default; sightings reach the app immediately. The board never beeps for a tracker in any mode, and it keeps the tracker's first minute out of its offline buffer so a brief pass-by does not spend the capture |
+| **Smart or recording glasses** (Ray-Ban and Oakley Meta, Snap Spectacles, Vuzix) | Bluetooth | On by default; eyewear-specific registrations are stronger. Shared Meta identifiers can also belong to a Quest headset, so those results are labeled as possible glasses |
+| **Network cameras** | passive 2.4 GHz Wi-Fi frames | Off by default; 180 registered vendor blocks across 18 brands, including Axis, Dahua, Hikvision, i-PRO, Reolink, Ring, Verkada, Vivotek, Wyze, and Anker/eufy. This identifies a vendor family, not necessarily a camera, and is never a hidden-camera claim |
 
-Flock and Raven detection is built from publicly documented signatures, the IEEE OUI registry, Bluetooth SIG assigned numbers, and independent Flock research, all mapped out in [docs/signatures.md](docs/signatures.md). Drone detection reads the public FAA / ASTM Remote ID broadcast via the open-source [OpenDroneID](https://github.com/opendroneid/opendroneid-core-c) decoder, with a secondary hardware-signature fallback for DJI, Parrot, Skydio, Autel, and Yuneec when a craft isn't broadcasting Remote ID. BLE tracker detection is opt-in; Axon body-cam detection is field-validated (notes in [docs/axon.md](docs/axon.md)). Smart/recording-glasses detection keys off Bluetooth SIG company IDs and has one field capture behind it, with the Quest discriminator still capture-pending (notes in [docs/glasses.md](docs/glasses.md)).
+The signature sources, confidence choices, and rejected broad matches are documented in [docs/signatures.md](docs/signatures.md). Drone detection uses the public FAA and ASTM Remote ID broadcast through the open-source [OpenDroneID](https://github.com/opendroneid/opendroneid-core-c) decoder. Axon notes are in [docs/axon.md](docs/axon.md), and the glasses evidence is in [docs/glasses.md](docs/glasses.md).
+
+Diagnostic capture builds also include support for i-PRO BWC4000 cameras and activation accessories, Getac BC-series cameras and vehicle or holster triggers, and exact IEEE address-prefix candidates related to several ALPR manufacturers. These are **capture candidates, not production detections**. Capture firmware marks the i-PRO and Getac names as capture candidates. ALPR prefix lines say `vendor prefix candidate` and `product unknown`. The raw evidence is printed to the serial capture stream, where [firmware/tools/capture-log.py](firmware/tools/capture-log.py) can save it for review. It never reaches either phone app. A company registration alone does not prove which product transmitted. The evidence boundary and deliberate exclusions, including broad Motorola and Ubiquiti blocks, are recorded in [docs/signatures.md](docs/signatures.md).
 
 ## How reliable is it?
 
-It depends on *how* a device matched, and the app tells you. ACAB flags things by the radio signatures they broadcast: a Bluetooth name, a service ID, or the MAC vendor prefix (OUI). Name and Bluetooth matches are specific to Flock and very reliable. An OUI match is weaker: it only identifies the chipset vendor, and Flock is built on commodity WiFi and cellular modules (Liteon, Espressif, USI, and friends) that also ship in consumer cameras, routers, and IoT gear. So an OUI-only hit can occasionally be a home device on the same part; we have seen a home security camera flagged this way. The app shows the real registered hardware vendor and marks OUI-only matches as possible false positives, so treat those as leads to confirm rather than certainties.
+It depends on how a device matched, and the apps tell you. A self-identifying Remote ID payload, a device-specific service, or a narrow validated name is stronger than a corporate address prefix. An OUI identifies the registered owner or vendor family of a radio address. It does not, by itself, identify the exact product using that address.
+
+The detector excludes many shared chip and module suppliers because their address blocks appear in unrelated laptops, routers, and consumer devices. Where a broader clue is still useful, it is constrained to a relevant frame type, put behind an opt-in switch, or assigned a low confidence. Tap a detection to see the method, confidence, exact reason, and the registered vendor when available. Treat weak results as leads to confirm, not certainties.
 
 ## How much does it actually hear?
 
-The limits above are about *what* matches. These are about *how hard it looked*, which is the part
-a quiet screen depends on and which is easy to leave unsaid. All of it is measurable, so here it is.
+The limits above are about *what* matches. These are about *how hard it looked*, which is the part a quiet screen depends on and which is easy to leave unsaid.
 
-**2.4 GHz only. There is no 5 GHz radio.** The ESP32-S3 does not have one, so the entire 5 GHz band
-is invisible to this device, and a growing share of IP cameras and drone control links are 5 GHz
-first. This is a hardware limit, not a setting, and it is the single largest gap in coverage.
+**2.4 GHz only. There is no 5 GHz radio.** The ESP32-S3 cannot hear 5 GHz, so that entire band is invisible. A growing share of IP cameras and drone control links prefer 5 GHz. This is a hardware limit, not a setting, and it is the largest coverage gap.
 
-**WiFi listens to one channel at a time, and not evenly. This is identical on every board.** The
-ESP32-S3 owns WiFi on the dual-radio beacon too, so the second radio buys the 802.11 side nothing:
-it is dedicated to Bluetooth. The scan walks a 24-slot sequence that returns to channel 6 between
-every other step, because 6 is where most consumer gear sits:
+**Wi-Fi listens to one channel at a time, and not evenly. This is identical on every board.** The scanner walks a 24-slot sequence that returns to channel 6 between every other step because OpenDroneID uses channel 6 as its Wi-Fi social channel. That channel is also common for other 2.4 GHz traffic.
 
-| channel | share of listening time |
+| Channel | Share of listening time |
 |---|---|
-| 6 | 50% |
-| each of 1-5, 7-13 | 4.2% |
+| 6 | 50 percent |
+| each of 1 to 5 and 7 to 13 | about 4.2 percent |
 
-So a camera beaconing on channel 11 as you drive past has a real chance of being missed. That is a
-deliberate trade, not a bug: spreading evenly would lower the odds on the busiest channel to raise
-them on twelve quiet ones. Battery-saver eco mode adds 3, 7 or 15 seconds of radio-off after each
-full sweep, which lowers all of these further in exchange for runtime.
+A camera beaconing on channel 11 as you drive past can be missed. The schedule deliberately improves the chance of hearing brief Wi-Fi Remote ID traffic while still touching all 13 channels. Battery-saver eco mode adds 3, 7, or 15 seconds of Wi-Fi receiver-off time after each full sweep, lowering Wi-Fi coverage in exchange for runtime. Bluetooth scanning is unaffected.
 
-**Bluetooth duty cycle depends on which board you have,** and this is the clearest reason the
-dual-radio board exists:
+**Bluetooth duty cycle depends on the board.**
 
-- **Single-radio builds** (oui-spy, mesh-detect) share one antenna between BLE and WiFi, so BLE
-  listens about **51%** of the time. Half of every second, it is not hearing Bluetooth at all.
-- **The dual-radio beacon board** gives BLE its own nRF52840, so it scans **continuously** and
-  never pauses for a WiFi channel hop. A measured street drive found 2.5x more unique BLE devices
-  than a single radio over the same route.
+- **Single-radio builds** such as OUI-Spy and Mesh-Detect share one antenna between Bluetooth and Wi-Fi, so Bluetooth listens about **51 percent** of the time.
+- **The dual-radio beacon** gives Bluetooth its own nRF52840, so it scans **continuously** and does not pause for ESP32-S3 Wi-Fi channel hops.
 
-None of this makes a detection less trustworthy. It makes *silence* less trustworthy, which is the
-direction that matters: a quiet screen means nothing announced itself on a band and channel we
-happened to be listening to at that moment.
+None of this makes a match less trustworthy. It makes silence less trustworthy.
+
+## The phone apps
+
+There are two native apps, one for iPhone and one for Android, with the same core job: pair with a beacon, OUI-Spy, or Mesh-Detect board and show what it hears. Both provide Status, Map, Log, and Beacon tabs.
+
+- **Status** counts devices heard in roughly the last 45 seconds. Tap a category to open its filtered Log, or its detector setting when that category is off.
+- **Log** stays on the phone and remains available while the board is disconnected. Filter it, inspect signal history and match evidence, and export the rows you are viewing as CSV or GPX.
+- **Map** adds optional location context. Most live pins show where your phone heard a signal, not the device's exact location. Remote ID drones are the exception because they broadcast their own coordinates. The optional known-camera layer is a separate community dataset, and a missing map pin is never evidence that no camera exists.
+- **Beacon** controls detector categories, buzzer or phone alert behavior, radio settings, encrypted offline buffering, firmware updates, and platform status or blockers.
+
+Every detection shows a confidence percentage that describes how specific the matching evidence is. It is not a signal-strength score. Tap a row to see identifiers, first and last sighting, signal history, location context, and why it matched. Tracker details can summarize cautious **Seen with you** evidence from the current app session, but the app does not turn one sighting into a stalking verdict.
+
+Star an exact device to create a watched category. Mute known gear permanently, for 1 hour, for 24 hours, or within 50 meters of a saved place. Permanent mutes are copied to the board and can silence its alerts while the phone is away. Timed and place mutes are enforced by the connected phone, so the board can still sound. Muted history remains in the Log with a **MUTED** label. Stars and mutes follow an exact hardware address, which means devices that rotate addresses can appear again. Managed devices can be renamed, unstarred, or unmuted in one place.
+
+Vibrate mode silences the board and uses category-shaped phone haptics. For example, glasses use a double tap and body cameras use a repeating pattern. On iPhone these haptics fire while the app is open, and both apps respect Focus or Do Not Disturb. Separately, opt-in per-category phone notifications can play sound after notification permission is granted. Every notification category starts off.
+
+Both apps provide VoiceOver or TalkBack descriptions for key status, map, and control surfaces, and their main layouts reflow for larger text.
+
+### Live Mode and widgets
+
+Live Mode is the nearby-now count shown on supported system surfaces. It is enabled by default after first setup, but the operating system decides whether it can appear.
+
+- On iPhone, Live Mode uses a Live Activity on the Lock Screen and Dynamic Island. Location permission is required before the surface can start because Location keeps it reliable in the background.
+- On Android, Live Mode uses an ongoing notification or Live Update where supported. Android 13 and newer require notification permission for that surface.
+
+Detection and the Log still work if Live Mode is unavailable or switched off. Counts are visible on the Lock Screen by default and can be hidden under Beacon.
+
+The home-screen widget is separate and must be added by the user. It shows today's detection total and connection state, plus the latest hit and category breakdown where space permits. Live Mode can also be toggled from Control Center on iPhone or Quick Settings on Android. On supported iOS 26 setups, the compact Live Activity can appear in the CarPlay Dashboard and Apple Watch Smart Stack. Compatible Android car hosts may show the standard widget. These are system-provided glances, not dedicated navigation, Apple Watch, or Wear OS apps.
+
+### iPhone
+
+The iPhone app lives in [ios/](ios/) and requires iOS 18 or newer. Try the beta through [TestFlight](https://testflight.apple.com/join/RC3j99A8). Install Apple's free [TestFlight app](https://apps.apple.com/us/app/testflight/id899247664) first if needed.
+
+### Android
+
+The Android app lives in [android/](android/), is built with Kotlin and Jetpack Compose, and supports Android 8 or newer. It uses OpenStreetMap rather than a Google map dependency. Install it from [Google Play](https://play.google.com/store/apps/details?id=tech.soyboi.beacons), or use the build and release instructions in [android/README.md](android/README.md).
+
+Location is optional on iPhone and on Android 12 or newer. Android 8 through 11 require Location permission for Bluetooth scanning because those system versions gate discovery behind it. Bluetooth access on iPhone or Nearby devices on newer Android versions is needed to connect. Platform-specific prompts cover optional mapping, phone notifications, and offline buffering. On iPhone, Location is also required before Live Mode can start. Android Live Mode does not request background Location.
+
+An unowned board accepts its first phone at any time, so make that first pairing in trusted surroundings. After a board already has a bond, that phone can reconnect normally. A different phone is accepted only during the two-minute window after a physical power-on.
+
+Both apps currently ship in English only. Most interface copy lives alongside the native views, while the shared FAQ is mirrored byte for byte from one JSON document and checked for drift. The BLE protocol is documented in [docs/ble-protocol.md](docs/ble-protocol.md).
 
 ## Flashing
 
-**Got a beacon?** It ships pre-flashed and ready to pair. New firmware installs over-the-air from the app over Bluetooth with no cable, or in one click from your browser at [soyboi.tech/flash](https://soyboi.tech/flash.html) with a USB-C cable. The DIY flasher below is for rolling your own, you don't need it.
+### Production beacon
 
-**Building your own** oui-spy or mesh-detect on a bare XIAO board? No tools to install, there's a one-click flasher hosted online:
+App-delivered updates are the normal path. USB recovery images are board-revision specific:
 
-**https://soyboi1312.github.io/all-cameras-are-beacons/**
+- [rev-A beacon flasher](https://soyboi.tech/flash.html)
+- [rev-B beacon flasher](https://soyboi.tech/flash-revb.html)
 
-1. Open that link in **Chrome or Edge** on a computer. (Safari and Firefox can't talk to USB devices, so they won't work here.)
-2. Plug your board in with a USB-C cable.
-3. Click **Flash firmware** or one of the **Flash Mesh-Detect** buttons (public or private channel), choose the board when the browser asks, and let it run.
+Do not cross-flash these images. A rev-B image on rev-A hardware, or a rev-A image on rev-B hardware, can leave the board needing USB recovery. The production pages identify whether a current USB image is available.
 
-If you'd rather host your own copy of the flasher, it all lives in [web/](web/).
+### DIY OUI-Spy and Mesh-Detect
 
-## Flashing from the command line (for tinkering)
+The hosted [DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/) works in Chrome or Edge on a computer with Web Serial support.
 
-If you're poking at the firmware itself, PlatformIO is the best method:
+1. Plug the XIAO ESP32-S3 into the computer with a data-capable USB-C cable.
+2. Open the flasher and choose **Flash firmware**, **Flash Mesh-Detect**, or the private-channel Mesh-Detect option.
+3. Select the board when the browser asks and let the flash finish.
+
+Safari and Firefox do not expose the required USB interface. The self-hosted flasher source lives in [web/](web/).
+
+### Flashing from the command line
+
+PlatformIO is the easiest route when changing firmware:
 
 ```bash
 cd firmware
 
-pio run -e oui-spy     -t upload    # the app-controlled scanner
-pio run -e mesh-detect -t upload    # the Meshtastic version
+pio run -e oui-spy -t upload
+pio run -e mesh-detect -t upload
 
-pio device monitor -b 115200        # watch what it's finding, live
+pio device monitor -b 115200
 ```
 
-Changed the firmware? Rebuild the browser flasher images with `./web/build-flasher.sh` (add `--unsigned-usb-only` if you don't hold the OTA signing key), push, and the hosted page updates itself.
+Shipping PlatformIO environments are `oui-spy`, `mesh-detect`, `mesh-detect-ch1`, `beacon-board` for rev-A, and `beacon-board-revb` for rev-B. The `beacon-board-capture` and `beacon-board-revb-capture` environments are diagnostic builds. They record nearby MAC addresses, SSIDs, names, and raw payloads, so keep those logs private and return the board to a shipping image after a capture. `odid-sim` is a bench-only Remote ID simulator.
 
-## Two flavors, same detector
+From the repository root, rebuild the hosted OUI-Spy and Mesh-Detect images with:
 
-Both builds run every detector at once. The only real difference is where the alerts go:
+```bash
+./web/build-flasher.sh --unsigned-usb-only
+```
 
-- **OUI-Spy** streams them to the **All Cameras Are Beacons** phone app (iPhone or Android) over Bluetooth.
-- **Mesh-Detect** sends labeled messages out over a wired Heltec V3 running Meshtastic, on whatever channel you pick. Each one is plain-spoken: `Flock camera detected`, `Drone detected`, and so on. It **also pairs with the phone app** the same way OUI-Spy does, and while a phone is connected it tags each Meshtastic message with the phone's location as a tap-to-open maps link.
+Release signing uses the protected signing workflow instead. The DIY script does not build or publish production beacon images.
+
+## Firmware targets
+
+Every shipping target uses the same detector engine and honors the same per-category settings. The difference is the hardware and where alerts go.
+
+- **OUI-Spy** is a single-radio XIAO ESP32-S3 build that streams detections to either phone app.
+- **Mesh-Detect** is the same single-radio detector with an additional serial uplink to a Heltec V3 running Meshtastic. Messages use labels such as `ALPR camera detected` and `Drone detected`. It also pairs with the phone app, and can add the phone's location to Meshtastic alerts while connected.
+- **the beacon rev-A and rev-B** use a dedicated nRF52840 for continuous Bluetooth scanning while the ESP32-S3 handles Wi-Fi and the app link. The two revisions require different ESP32-S3 images.
 
 Wiring and Meshtastic setup are in [docs/mesh-setup.md](docs/mesh-setup.md).
 
-## The phone apps
-
-There are two native apps, one for **iPhone** and one for **Android**, that do the same job: pair with a beacon, OUI-Spy, or Mesh-Detect board over Bluetooth and show what it's finding in real time. Both give you a live status view, a map of where things were seen, a running logbook, and controls for the board's buzzer and radios. Tap any detection to open its detail card: a signal-strength history, when the device was **first** and **last** heard, and its identifiers. If something hasn't been heard in a while its signal chart greys out, so live hits stand apart from stale ones. Both apps also carry the newer features: star any device to make it your own custom category (the beacon then calls it out every time it's seen), an ignore list for your own gear, an opt-in known-cameras map layer built from community-mapped ALPR sites, and the opt-in encrypted offline buffer.
-
-A few things worth knowing about how the apps read a detection:
-
-- **Every row shows a confidence percentage.** It grades how uniquely the thing that matched identifies that device class, and it has nothing to do with signal strength. 80 and up is a strong signature match, under 50 is a weak one worth verifying rather than an alarm. Tap the row to see exactly which signal fired.
-- **Name your devices.** Anything you star or ignore can be renamed on the managed-devices screen, and that name then replaces the generic label everywhere: the log, the detail card, map pins, notifications, and the CSV export. Call a tag "Jane's tag" once and you never read "Tracker" again.
-- **The known-cameras layer names the manufacturer.** Tap a mapped camera and it tells you who makes it (Flock Safety, Ubicquia, Genetec, Motorola/Vigilant, and others). When a live ALPR detection lands within 150 m of a mapped camera, the detail card says so, which is independent corroboration that the hit is real. Absence is never treated as evidence: an unmapped area only means nobody has mapped it.
-- **A first-run walkthrough** appears the first time a board connects, and there is a full demo mode running on sample data if you want to look around before buying anything. How the apps and firmware talk is in [docs/ble-protocol.md](docs/ble-protocol.md).
-
-### iPhone
-
-**All Cameras Are Beacons** lives in [ios/](ios/). Try the beta on TestFlight at [testflight.apple.com/join/RC3j99A8](https://testflight.apple.com/join/RC3j99A8). Grab Apple's free [TestFlight app](https://apps.apple.com/us/app/testflight/id899247664) first, then open the link to install.
-
-### Android
-
-**All Cameras Are Beacons for Android** lives in [android/](android/): native Kotlin / Jetpack Compose, the same feature set, with an OpenStreetMap map (no Google dependency). It isn't on the Play Store yet, so for now you build it from source or sideload the APK. Build and release notes are in [android/README.md](android/README.md). You can also join the Android open beta on the [web here](https://play.google.com/apps/testing/tech.soyboi.beacons) or on [Android here](https://play.google.com/store/apps/details?id=tech.soyboi.beacons).
-
-Either app needs an OUI-Spy or Mesh-Detect board to actually detect anything, but you can poke around the interface without one.
-
-**English only, deliberately.** Every string in both apps is authored in Swift and Kotlin source
-rather than in resource files, and there is no localization layer. That is a choice, not an
-oversight. The parity between the two apps is enforced by comparing strings as code (the bundled
-FAQ is byte-guarded across platforms, and the follow-evidence copy is fixture-compared), and moving
-copy into `.lproj` / `strings.xml` would give that up. The detection targets are also mostly US
-infrastructure. If a second language ever becomes a goal, the route is the one the FAQ already
-takes: a single shared, drift-guarded content file both platforms parse, which keeps byte-parity
-and gains a translation unit at the same time.
-
 ## How the project is organized
 
-```
+```text
 firmware/
-├── platformio.ini            # the builds: beacon-board, oui-spy, mesh-detect (+ mesh-detect-ch1)
-├── lib/acab_core/            # the shared detection engine (radio-agnostic)
-│   ├── detection.h           #   the common "what did we find" event model
-│   ├── flock_detect.*        #   Flock cameras + Raven
-│   ├── drone_detect.*        #   Remote ID (wraps opendroneid/)
-│   ├── axon_detect.*         #   Axon body cameras (field-validated)
-│   ├── tracker_detect.*      #   BLE item trackers (AirTag, Tile, SmartTag; opt-in)
-│   ├── glasses_detect.*      #   smart / recording glasses (Meta, Snap, Vuzix)
-│   ├── desert_detect.*       #   desert mode (report everything nearby)
-│   ├── acab_scanner.*        #   the BLE + WiFi scanning and dedup
-│   └── opendroneid/          #   vendored opendroneid-core-c
-├── src/beacon-board/              # build 1: streams to the phone app
-└── src/mesh-detect/          # build 2: sends out over Meshtastic
+├── platformio.ini            # shipping, capture, and bench build environments
+├── lib/acab_core/            # shared detectors, scanner, BLE service, and OTA logic
+├── src/beacon-board/         # app-connected OUI-Spy and beacon entry point
+├── src/mesh-detect/          # Meshtastic entry point
+├── src/odid-sim/             # bench Remote ID simulator
+└── tools/                    # host tests, drift checks, capture, and release tooling
 
-ios/                          # the native iPhone app
-android/                      # the native Android app
-web/                          # the browser flasher
-docs/                         # protocol, mesh wiring, Axon notes
+ios/                          # native iPhone app and Live Activity/widget extension
+android/                      # native Android app, Live Mode service, and widget
+web/                          # browser flashers and release manifests
+docs/                         # protocol, signatures, evidence, and mesh wiring
 ```
+
+The companion nRF firmware and the beacon hardware design, PCB, enclosure, and manufacturing files are not published in this repository.
 
 ## Where things stand
 
-The firmware works, the mesh side has been tested on real hardware, and there are native apps for both iPhone and Android. Detection works by recognizing known signatures, so part of the ongoing work is keeping those signatures matching real-world gear as it changes.
+The current source version is **2.0.6** for the ESP32-S3 firmware and both phone apps. Public app and firmware distribution can lag the source tree.
 
-Firmware updates are handled two ways: the one-click browser flasher, and over-the-air updates over Bluetooth built into both apps (the app checks a hosted version manifest, so new firmware ships without waiting on an app-store release). The over-the-air path is validated end-to-end on hardware, including signature verification and automatic rollback if an update ever fails to boot. Both radios update from one button: the board firmware first, then the companion nRF, in a single flow. That combined flow has been run to completion on an iPhone and on an Android phone against the same board, each ending with the board back on the new version and detection resumed.
+The detector, Meshtastic path, native apps, and firmware update flows have been exercised on real hardware. Retail beacon hardware is still coming soon. Detection depends on known, defensible radio signatures, so field capture and ground-truth validation remain ongoing work.
+
+ESP32-S3 updates verify a signed image on the board and use a health-confirmation rollback path. On the dual-radio beacon, a combined update installs the nRF package first, then the ESP32-S3 image. The phone verifies the nRF package before transfer; the stock nRF bootloader itself provides CRC validation rather than the ESP32-S3's on-device signature check. Triggering that update also requires the encrypted app session and the physical power-on authorization window. The combined sequence has completed successfully from both iPhone and Android test devices.
 
 Still on the list:
-- Getting the iPhone app onto the App Store and the Android app onto the Play Store
-- Field-proving the newer detectors. The dual-radio board is done and shipping: both
-  radios, power, and over-the-air updates for BOTH processors are proven on hardware from
-  both apps, the ESP32-S3 over its own OTA and the companion nRF over Bluetooth DFU.
-  What is still open is ground truth, not code: the glasses signatures have one capture
-  behind them and the WiFi body-cam path has none. The board bring-up checklist ships with
-  the hardware rather than living here, since the nRF firmware tree is not public.
 
+- bring the iPhone app from TestFlight to a public App Store release
+- publish current signed 2.0.6 recovery images for both board revisions before the retail launch
+- replace the development OTA key with a production key, keep it offline, and back it up securely before the retail launch
+- field-validate newer capture candidates before promoting any of them into production detection
+- keep the signature evidence, apps, firmware, and public documentation in sync as real-world gear changes
 
 ## Licensing
 
-The **applications and firmware** in this repository are licensed under
-[Apache-2.0](LICENSE).
+The project-owned **application and ESP32-S3 firmware code** published in this repository is licensed under [Apache-2.0](LICENSE). Bundled third-party components retain their own licenses, including the OFL-1.1 app fonts and BSD-licensed Nordic DFU libraries. See [CREDITS.md](CREDITS.md), the vendored license files, and each dependency's distribution terms.
 
-The **Beacon hardware design, PCB layout, enclosure, manufacturing files, product name, and
-trademarks are NOT included in that license** unless explicitly stated otherwise. Apache-2.0 here
-covers the code, not the physical product or the name it ships under.
+The **companion nRF firmware, beacon hardware design, PCB layout, enclosure, manufacturing files, product name, and trademarks are not included in that license** unless explicitly stated otherwise. Apache-2.0 here covers the published code, not the physical product or the name it ships under.
 
-Apache-2.0 also carries obligations that travel with the code: keep the applicable
-[LICENSE](LICENSE) and [NOTICE](NOTICE) material with any firmware-bearing product and with any app
-distribution you build from this source. That is a condition of the licence, not a courtesy.
+Apache-2.0 carries obligations that travel with the code. Keep the applicable [LICENSE](LICENSE) and [NOTICE](NOTICE) material with any firmware-bearing product and with any app distribution you build from this source. Full app distributions must also carry the notices required by their bundled third-party components.
 
-Worth stating plainly, because the licence is sometimes read as covering more than it does: nothing
-here is a defence against a compatible clone board. Apache-2.0 is a permissive code licence and is
-not the instrument for that. Preventing clones is a trademark, patent, hardware-design and
-distribution-strategy question, and it is answered outside this repository or not at all.
+Worth stating plainly, because the license is sometimes read as covering more than it does: nothing here is a defense against a compatible clone board. Apache-2.0 is a permissive code license and is not the instrument for that. Preventing clones is a trademark, patent, hardware-design, and distribution-strategy question, and it is answered outside this repository or not at all.
 
 ## Thanks to
 
-- The **Colonel Panic OUI-Spy** ecosystem, whose hardware this runs on and whose
-  earlier work pointed the way.
-- Remote ID decoding from
-  [opendroneid-core-c](https://github.com/opendroneid/opendroneid-core-c) (Apache-2.0).
-- Flock signature research from the [deflock.me](https://deflock.me) community and the
-  independent researchers cited in [docs/signatures.md](docs/signatures.md).
+- The **Colonel Panic OUI-Spy** ecosystem, whose compatible hardware this runs on and whose earlier work pointed the way.
+- Remote ID decoding from [opendroneid-core-c](https://github.com/opendroneid/opendroneid-core-c) under Apache-2.0.
+- Flock signature research from the [DeFlock](https://deflock.me) community and the independent researchers cited in [docs/signatures.md](docs/signatures.md).
 
-All Cameras Are Beacons is an independent project and is not affiliated with, endorsed by,
-or sponsored by Colonel Panic. "OUI-Spy" and "Mesh-Detect" are Colonel Panic's product
-names, used here only to identify compatible hardware.
+All Cameras Are Beacons is an independent project and is not affiliated with, endorsed by, or sponsored by Colonel Panic. "OUI-Spy" and "Mesh-Detect" are Colonel Panic's product names, used here only to identify compatible hardware.

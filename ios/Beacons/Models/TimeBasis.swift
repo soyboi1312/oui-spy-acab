@@ -51,9 +51,6 @@ extension TimeBasis {
         case .bracketed, .unknown:   return true
         }
     }
-
-    /// True for anything that came off the offline buffer, i.e. anything not observed live.
-    var isDerived: Bool { self != .exact }
 }
 
 /// The error bar on a reconstructed time, and where it comes from.

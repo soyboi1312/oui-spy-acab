@@ -41,3 +41,4 @@ firmware/tools/ota_signing/*.pem
 __pycache__/
 *.pyc
 firmware/tools/c5-sniff/
+CLAUDE.md

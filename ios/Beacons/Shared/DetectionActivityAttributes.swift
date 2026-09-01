@@ -7,9 +7,14 @@ import Foundation
 /// Compiled into BOTH the app and the widget extension. Deliberately dependency-free
 /// and Color-free: the widget maps each bucket to a symbol/tint with its own tokens,
 /// so we never drag the app's `DeviceType`/`ACABTheme` (which pull SwiftUI `Color`)
-/// into the extension. The five buckets mirror the dashboard tiles exactly
-/// (ALPR = flockCamera + flockRaven, drone, body cam, tracker, glasses); there is no police
-/// bucket because the app drops firmware `t=6` in Detection's decoder.
+/// into the extension. The six buckets mirror the dashboard tiles exactly
+/// (ALPR = flockCamera + flockRaven, drone, body cam, tracker, glasses, camera - `cameras` joined
+/// them 2026-07-31, see ContentState below); there is no police bucket because the retired
+/// firmware `t=6` has no `DeviceType` raw value. The decoder does NOT drop it: Detection's
+/// init(from:) deliberately files an unrecognized `t` as `.unknown` so this platform never hides a
+/// row Android shows; `.unknown` stays off these surfaces because it has no
+/// `DeviceType.widgetCategoryKey`, the gate `recomputeLiveCounts` filters on
+/// (`onDriveSurface` only gates the escalated first-sighting push).
 struct DetectionActivityAttributes: ActivityAttributes {
     typealias ContentState = DetectionState
 
@@ -29,7 +34,9 @@ struct DetectionActivityAttributes: ActivityAttributes {
         var lastKind: String   // "ALPR" / "DRONE" / "BODY CAM" / "TRACKER" / "GLASSES" / ""
         var lastSeen: Date
         var connected: Bool    // false -> show "Reconnecting…" instead of a frozen count
-        var redact: Bool       // hide counts on the Lock Screen banner (user setting, default on)
+        var redact: Bool       // hide counts on the Lock Screen banner (user setting, ships OFF;
+                               // decode + placeholder fall back to true only as a fail-private
+                               // stance for payloads that predate or lack the field)
 
         /// WidgetCategory rawValues for the detectors the BOARD currently has switched on, or nil
         /// when no status has arrived yet.
@@ -137,18 +144,6 @@ public enum WidgetCategory: String, CaseIterable {
 
     /// App Group key holding today's count for this category.
     public var defaultsKey: String { "w_c_" + rawValue }
-
-    /// Short label for the strip. Kept to four characters so six of them fit a medium widget.
-    public var short: String {
-        switch self {
-        case .alpr: return "ALPR"
-        case .drone: return "DRON"
-        case .body: return "BODY"
-        case .tracker: return "TRKR"
-        case .glasses: return "GLAS"
-        case .camera: return "NCAM"
-        }
-    }
 
     /// SF Symbol, matching each type's glyph in the app.
     public var symbol: String {

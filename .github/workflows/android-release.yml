@@ -1,6 +1,6 @@
 name: Android release
 
-# Push a tag like v0.1.0 to build, sign, and publish a GitHub Release with the
+# Push a tag like android-v2.0.4 to build, sign, and publish a GitHub Release with the
 # APK + AAB. A manual run (workflow_dispatch) builds and uploads the artifacts
 # without publishing a release, which is a handy dry run for the secrets.
 #

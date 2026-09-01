@@ -3,14 +3,56 @@ import MapKit
 import Combine
 import CryptoKit
 
+/// Owns the one manifest/dataset fetch task. Keeping the Task handle, rather than only a Boolean,
+/// is what lets the layer switch cancel URL loading instead of merely hiding the eventual result.
+/// A serial token retires the cancelled task's completion so an immediate re-enable can start a
+/// replacement without the old task clearing or restarting the new generation.
+@MainActor
+final class ALPRFetchSlot {
+    private(set) var isRunning = false
+    private var serial: UInt = 0
+    private var task: Task<Void, Never>?
+
+    @discardableResult
+    func start(
+        operation: @escaping @MainActor () async -> Void,
+        onFinish: @escaping @MainActor () -> Void
+    ) -> Task<Void, Never>? {
+        guard task == nil else { return nil }
+        serial &+= 1
+        let mine = serial
+        isRunning = true
+        let started = Task { @MainActor [weak self] in
+            await operation()
+            guard let self, self.serial == mine else { return }
+            self.task = nil
+            self.isRunning = false
+            onFinish()
+        }
+        task = started
+        return started
+    }
+
+    func cancel() {
+        serial &+= 1
+        let cancelled = task
+        task = nil
+        isRunning = false
+        cancelled?.cancel()
+    }
+}
+
 /// The "known ALPR cameras" map overlay , community-mapped license-plate-reader
 /// locations from OpenStreetMap (the registry the DeFlock project maintains), shown as a
 /// quiet reference layer under the live detections.
 ///
 /// PRIVACY: the phone downloads ONE static file from soyboi.tech and renders it locally.
-/// It never queries Overpass and never puts its viewport into this dataset request; the fetch
-/// happens only after the user opts in. The base map provider still receives ordinary map tile
-/// requests, as the privacy disclosure states.
+/// It never queries Overpass and never puts its viewport into this dataset request. The layer
+/// now SHIPS ENABLED (most users never found the toggle), so the download happens on first
+/// launch; it still carries no location, no viewport, and nothing about the user beyond an
+/// ordinary HTTPS request. The LAYERS panel (or the map settings dropdown) turns it off, and an
+/// explicit choice, either way, is preserved over the shipped default. The base map provider
+/// still receives ordinary map tile requests, as the privacy disclosure states.
 ///
 /// Wire format is versioned ALP1 through ALP4. ALP4 retains the compact ALP3 coordinate, maker,
 /// and attribution blocks, then adds stable OSM identity and freshness metadata per row. Older
@@ -52,7 +94,9 @@ final class ALPRStore: ObservableObject {
     /// legend's auto-expand off `loading` popped it open and shut across that round-trip with
     /// nothing to show. Auto-expand is worth it for a real download, never for a freshness ping.
     @Published private(set) var downloading = false
-    /// User opt-in. Persisted; flipping it on triggers the first download.
+    /// The layer switch. ON by default for a fresh install; only setEnabled() writes the key,
+    /// so a user who ever explicitly flipped the layer keeps that stored choice over the
+    /// shipped default. Being on (by default or by choice) triggers the first download.
     @Published private(set) var enabled: Bool
     /// When the last manifest freshness check COMPLETED (success or already-up-to-date; a dead
     /// network stamps nothing). Persisted so the map settings caption survives relaunch.
@@ -143,7 +187,7 @@ final class ALPRStore: ObservableObject {
     private let versionKey = "acab.alpr.version"      // last-downloaded dataset `updated`
     private let shaKey = "acab.alpr.sha256"           // exact bytes behind the version caption
     private let lastCheckedKey = "acab.alpr.lastChecked"   // epoch seconds of the last completed manifest check
-    private var inFlight = false
+    private let fetchSlot = ALPRFetchSlot()
     private var restartWanted = false
 
     /// Bumped on every enable/disable. fetch() snapshots it and abandons publication if it changed.
@@ -159,7 +203,10 @@ final class ALPRStore: ObservableObject {
     nonisolated static let maxDatasetBytes = 8 * 1024 * 1024
 
     private init() {
-        enabled = UserDefaults.standard.bool(forKey: enabledKey)
+        // Nil-check, not bool(forKey:): a missing value is a fresh install and takes the
+        // shipped default (ON), while a stored Bool is an explicit past choice and wins.
+        // Only setEnabled() ever writes the key, so the default never turns into a choice.
+        enabled = Self.resolveStoredEnabled(UserDefaults.standard.object(forKey: enabledKey))
         showUnverified = UserDefaults.standard.bool(forKey: showUnverifiedKey)   // default false
         let t = UserDefaults.standard.double(forKey: lastCheckedKey)
         lastChecked = t > 0 ? Date(timeIntervalSince1970: t) : nil
@@ -171,7 +218,14 @@ final class ALPRStore: ObservableObject {
         }
     }
 
-    // MARK: opt-in
+    // MARK: layer switch
+
+    /// Fresh-install default resolution for the layer switch: a stored Bool (written only by an
+    /// explicit setEnabled) always wins; no stored value at all - a fresh install, or a value of
+    /// an unexpected type - resolves to the shipped default of ON.
+    nonisolated static func resolveStoredEnabled(_ stored: Any?) -> Bool {
+        (stored as? Bool) ?? true
+    }
 
     /// Turn the layer on (loads cache + refreshes, downloading on first enable) or off
     /// (clears the in-memory points; the cache is kept so re-enabling is instant).
@@ -189,6 +243,11 @@ final class ALPRStore: ObservableObject {
                 refresh()
             }
         } else {
+            // Cancellation reaches boundedData's URLSession cancellation handler, aborting either
+            // the manifest request or the body of the (up to 8 MB) dataset request immediately.
+            // The slot retires the old completion before cancelling, so re-enable can launch a new
+            // generation even if URLSession takes a moment to deliver its cancellation error.
+            fetchSlot.cancel()
             nodes = []
             nodeMakers = []
             nodeConfirmed = []
@@ -245,7 +304,12 @@ final class ALPRStore: ObservableObject {
         guard !nodes.isEmpty else { return nil }
         let box = 0.02                                   // ~2.2 km half-window
         let cosLat = cos(coord.latitude * .pi / 180)
-        var bestM = Double.greatestFiniteMagnitude
+        // .infinity, NOT .greatestFiniteMagnitude: the return below uses isFinite as the
+        // "nothing in the box" sentinel, and greatestFiniteMagnitude is itself finite - so past
+        // the non-empty guard this function could never return nil, and an empty box handed the
+        // caller a 1.8e308-metre phantom match whose `Int(meters.rounded())` traps. Android's
+        // guard (AlprDataset.kt nearest(): `if (bestM < Double.MAX_VALUE)`) never had the hole.
+        var bestM = Double.infinity
         var bestMaker = ""
         var bestConfirmed = true
         var bestTier: UInt8 = 1
@@ -275,19 +339,11 @@ final class ALPRStore: ObservableObject {
     /// hash mismatch leaves the cached points in place and never throws into the UI.
     func refresh() {
         guard enabled else { return }
-        if inFlight {
+        if fetchSlot.isRunning {
             restartWanted = true
             return
         }
-        inFlight = true
-        Task {
-            await fetch()
-            inFlight = false
-            if restartWanted, enabled {
-                restartWanted = false
-                refresh()
-            }
-        }
+        startFetch()
     }
 
     /// Awaitable variant for the map settings panel's "check for updates" row: same
@@ -295,21 +351,28 @@ final class ALPRStore: ObservableObject {
     /// to render the result inline. No-ops (like `refresh`) if a fetch is already running.
     func refreshNow() async {
         guard enabled else { return }
-        if inFlight {
+        if fetchSlot.isRunning {
             restartWanted = true
             return
         }
-        inFlight = true
-        await fetch()
-        inFlight = false
-        if restartWanted, enabled {
-            restartWanted = false
-            refresh()
-        }
+        guard let task = startFetch() else { return }
+        await task.value
+    }
+
+    @discardableResult
+    private func startFetch() -> Task<Void, Never>? {
+        fetchSlot.start(operation: { [weak self] in
+            await self?.fetch()
+        }, onFinish: { [weak self] in
+            guard let self, self.restartWanted, self.enabled else { return }
+            self.restartWanted = false
+            self.refresh()
+        })
     }
 
     private func fetch() async {
         let gen = enableGen
+        guard !Task.isCancelled else { return }
         loading = true
         var outcome: RefreshOutcome = .failed
         defer {
@@ -330,10 +393,15 @@ final class ALPRStore: ObservableObject {
             var req = URLRequest(url: manifestURL)
             req.cachePolicy = .reloadIgnoringLocalCacheData
             req.timeoutInterval = 15
-            guard let payload = try? await Self.boundedData(for: req, limit: Self.maxManifestBytes) else {
+            let payload: (data: Data, response: HTTPURLResponse)
+            do {
+                payload = try await Self.boundedData(for: req, limit: Self.maxManifestBytes)
+            } catch {
+                guard !Task.isCancelled, gen == enableGen, enabled else { return }
                 allNotPublished = false
                 break
             }
+            guard !Task.isCancelled, gen == enableGen, enabled else { return }
             if payload.response.statusCode == 404 { continue }
             allNotPublished = false
             guard (200..<300).contains(payload.response.statusCode),
@@ -381,10 +449,19 @@ final class ALPRStore: ObservableObject {
         // 2) binary. Past this point we are committed to a real download, so the legend may
         // auto-open to surface the data credit. Everything above was a freshness check.
         downloading = true
-        defer { downloading = false }
+        defer {
+            // A cancelled generation must not turn off the replacement generation's spinner.
+            if gen == enableGen, enabled { downloading = false }
+        }
         var breq = URLRequest(url: url)
         breq.timeoutInterval = 30
-        guard let payload = try? await Self.boundedData(for: breq, limit: Self.maxDatasetBytes),
+        let payload: (data: Data, response: HTTPURLResponse)
+        do {
+            payload = try await Self.boundedData(for: breq, limit: Self.maxDatasetBytes)
+        } catch {
+            return
+        }
+        guard !Task.isCancelled, gen == enableGen, enabled,
               (200..<300).contains(payload.response.statusCode) else { return }
         let bin = payload.data
         // 3) integrity: size + sha256 must match the manifest, or we discard it
@@ -395,6 +472,7 @@ final class ALPRStore: ObservableObject {
         guard let parsed = await Task.detached(priority: .utility, operation: {
             Self.parseDetailed(bin)
         }).value else { return }
+        guard !Task.isCancelled, gen == enableGen, enabled else { return }
         guard Self.channelFormatMatches(
             declaredFormat: d.format,
             expectedFormat: selectedEndpoint.expectedFormat,
@@ -418,7 +496,7 @@ final class ALPRStore: ObservableObject {
                 return false
             }
         }.value
-        guard cached, gen == enableGen, enabled else { return }
+        guard cached, !Task.isCancelled, gen == enableGen, enabled else { return }
         nodes = parsed.coords
         nodeMakers = parsed.makers
         nodeConfirmed = parsed.confirmed
@@ -662,32 +740,74 @@ final class ALPRStore: ObservableObject {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    private nonisolated static func boundedData(
+    nonisolated static func boundedData(
         for request: URLRequest,
-        limit: Int
+        limit: Int,
+        configuration: URLSessionConfiguration = .ephemeral
     ) async throws -> (data: Data, response: HTTPURLResponse) {
         guard isAllowedDatasetURL(request.url) else { throw ALPRFetchError.invalidResponse }
-        let configuration = URLSessionConfiguration.ephemeral
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         let session = URLSession(
             configuration: configuration,
             delegate: ALPRRejectRedirectsDelegate(),
             delegateQueue: nil
         )
-        defer { session.finishTasksAndInvalidate() }
-        let (bytes, response) = try await session.bytes(for: request)
-        guard let http = response as? HTTPURLResponse,
-              isAllowedDatasetURL(http.url) else { throw ALPRFetchError.invalidResponse }
-        if http.expectedContentLength > Int64(limit) { throw ALPRFetchError.tooLarge }
-        var data = Data()
-        if http.expectedContentLength > 0 {
-            data.reserveCapacity(min(limit, Int(http.expectedContentLength)))
-        }
-        for try await byte in bytes {
-            guard data.count < limit else { throw ALPRFetchError.tooLarge }
-            data.append(byte)
-        }
-        return (data, http)
+        return try await withTaskCancellationHandler(operation: {
+            // invalidateAndCancel is also the normal-exit cleanup. On cancellation the handler
+            // below invokes it immediately, including while bytes(for:) is suspended on the next
+            // network packet; this defer is intentionally idempotent with that path.
+            defer { session.invalidateAndCancel() }
+            try Task.checkCancellation()
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  isAllowedDatasetURL(http.url) else { throw ALPRFetchError.invalidResponse }
+            if http.expectedContentLength > Int64(limit) { throw ALPRFetchError.tooLarge }
+            // Stage bytes through a small array instead of appending each one straight into Data:
+            // the dataset is megabytes, and appending to a reserved [UInt8] is a bounds check and a
+            // store where Data.append(_: UInt8) is a call into its storage each time. The flush is
+            // one bulk copy per stage.
+            //
+            // Be clear about what this does NOT remove, so the next reader does not take this loop
+            // for solved: `bytes` is an AsyncSequence of UInt8, so the whole body is still pulled one
+            // iterator resumption per byte, and nothing here measured or removed that.
+            // URLSession.AsyncBytes has no chunked accessor, so dropping it needs a
+            // URLSessionDataDelegate that can cancel mid-body - the same per-byte loop still runs in
+            // BLEManager+OTA (S3 image), BLEManager+NrfDFU (nRF zip) and FirmwareManifest, and they
+            // all want that one change together rather than four separate ones.
+            //
+            // Staged rather than filling one [UInt8] and converting with Data(buffer) at the end,
+            // because that conversion copies: the whole payload would be live TWICE at that instant,
+            // so a body arriving at the full `limit` - 8 MB on the dataset call - would peak near
+            // 16 MB. Here the only second copy alive at any moment is the 16 KB stage.
+            //
+            // The per-byte CAP STAYS on purpose. expectedContentLength above is only the server's
+            // CLAIM, so aborting mid-stream the moment the body runs past `limit` is the one defence
+            // against a body that under-declares it; session.data(for:) would buffer the whole thing
+            // before anyone could object.
+            let stageCap = 16 * 1024
+            var data = Data()
+            var stage: [UInt8] = []
+            stage.reserveCapacity(stageCap)
+            if http.expectedContentLength > 0 {
+                data.reserveCapacity(min(limit, Int(http.expectedContentLength)))
+            }
+            for try await byte in bytes {
+                guard data.count + stage.count < limit else { throw ALPRFetchError.tooLarge }
+                stage.append(byte)
+                if stage.count == stageCap {
+                    // URLSession cancellation wakes a suspended iterator; this check also bounds
+                    // cancellation latency while already-buffered bytes are being drained.
+                    try Task.checkCancellation()
+                    stage.withUnsafeBufferPointer { data.append($0) }
+                    stage.removeAll(keepingCapacity: true)
+                }
+            }
+            try Task.checkCancellation()
+            if !stage.isEmpty { stage.withUnsafeBufferPointer { data.append($0) } }
+            return (data, http)
+        }, onCancel: {
+            session.invalidateAndCancel()
+        })
     }
 }
 

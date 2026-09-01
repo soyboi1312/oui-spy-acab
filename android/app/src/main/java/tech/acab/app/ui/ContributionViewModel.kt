@@ -3,6 +3,7 @@ package tech.acab.app.ui
 import android.content.Intent
 import android.net.Uri
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.setValue
@@ -66,13 +67,28 @@ class ContributionViewModel : ViewModel() {
      *  not the one they reviewed. Now REVIEW's count and the disclosure derive from THIS
      *  string, and share / save-a-copy apply redactCsvColumns over it - pure text ops.
      *  Unredacted on purpose: the location switches stay live in REVIEW, so redaction must be
-     *  applied per-export, not baked in at Stop. Never persisted; dies with the capture. */
-    var frozenCsv by mutableStateOf<String?>(null)
+     *  applied per-export, not baked in at Stop. Never persisted; dies with the capture.
+     *
+     *  Assigning it also freezes [frozenRowCount]; the count is derived HERE, in the setter,
+     *  rather than in a getter, so no caller can forget to keep the two in step. */
+    var frozenCsv: String?
+        get() = frozenCsvValue
+        set(value) {
+            frozenCsvValue = value
+            frozenRowCount = value?.let(::contributionCsvDataRowCount) ?: 0
+        }
+    private var frozenCsvValue by mutableStateOf<String?>(null)
 
     /** Logical CSV records in the frozen capture. Document-aware parsing matters because a quoted
-     *  field may legally contain a newline; physical-line counting would overstate the export. */
-    val frozenRowCount: Int
-        get() = frozenCsv?.let(::contributionCsvDataRowCount) ?: 0
+     *  field may legally contain a newline; physical-line counting would overstate the export.
+     *
+     *  Counted once per freeze, not on every read: this is displayed by REVIEW, which recomposes
+     *  while the board keeps reporting, and a capture CSV is unbounded (one row per unique device
+     *  heard in the window). Re-parsing it per read put a whole-document parse on the frame path
+     *  of the one screen where an unrepeatable field capture is reviewed. iOS twin: frozenRowCount
+     *  in ContributeView.swift, frozen in the same Stop action. */
+    var frozenRowCount by mutableIntStateOf(0)
+        private set
 
     var kind by mutableStateOf<String?>(null)
     var makerModel by mutableStateOf("")

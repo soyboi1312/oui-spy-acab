@@ -40,6 +40,28 @@ enum DriveModeState {
     }
 }
 
+extension Notification.Name {
+    /// Warm-app handoff for Control Center/Live Activity intents. Shared defaults remain the source
+    /// of truth for cold or cross-process execution; this notification closes the ordering gap
+    /// when an intent runs after an already-active scene's foreground reconciliation.
+    static let driveModeIntentChanged = Notification.Name("tech.beacons.app.liveModeIntentChanged")
+}
+
+let driveModeDarwinNotification = CFNotificationName(
+    "tech.beacons.app.liveModeIntentChanged.darwin" as CFString)
+
+/// Posts BOTH channels on purpose: the in-process notification reaches a warm app immediately,
+/// and the Darwin mirror is the only channel that crosses from the widget extension process.
+/// Darwin notifications also loop back to the posting process, so an in-app execution delivers
+/// twice - BLEManager coalesces bursts at the observer (scheduleDriveModeReconcile) and
+/// reconcile is idempotent, so any duplicate that outruns the coalescer is harmless. Do not
+/// "fix" the duplication here by dropping a leg: each leg is load-bearing.
+func postDriveModeIntentChanged() {
+    NotificationCenter.default.post(name: .driveModeIntentChanged, object: nil)
+    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                         driveModeDarwinNotification, nil, nil, true)
+}
+
 // Interactive intents for the Drive-mode Live Activity (the in-activity End button) and the
 // Control Center toggle. Deliberately dependency-free - they use only ActivityKit and the
 // shared DetectionActivityAttributes, NEVER BLEManager - so this one file compiles into BOTH
@@ -48,13 +70,14 @@ enum DriveModeState {
 
 /// Ends the Drive-mode Live Activity. Backs the "End" button shown inside the activity.
 struct EndDriveModeIntent: LiveActivityIntent {
-    static var title: LocalizedStringResource = "End Drive Mode"
+    static var title: LocalizedStringResource = "End Live Mode"
 
     func perform() async throws -> some IntentResult {
         DriveModeState.wanted = false   // an explicit End must not come back at the next launch
         for activity in Activity<DetectionActivityAttributes>.activities {
             await activity.end(nil, dismissalPolicy: .immediate)
         }
+        postDriveModeIntentChanged()
         return .result()
     }
 }
@@ -63,7 +86,7 @@ struct EndDriveModeIntent: LiveActivityIntent {
 /// opens the app and starts one, since iOS only lets a Live Activity begin while the app is
 /// foregrounded (openAppWhenRun brings it forward, and perform() then runs in-app).
 struct ToggleDriveModeIntent: SetValueIntent {
-    static var title: LocalizedStringResource = "Drive Mode"
+    static var title: LocalizedStringResource = "Live Mode"
     static var openAppWhenRun = true
 
     @Parameter(title: "On") var value: Bool
@@ -71,16 +94,13 @@ struct ToggleDriveModeIntent: SetValueIntent {
     func perform() async throws -> some IntentResult {
         let running = Activity<DetectionActivityAttributes>.activities
         DriveModeState.wanted = value   // Control Center is a real user choice; remember it too
-        if value {
-            if running.isEmpty {
-                let attrs = DetectionActivityAttributes(deviceName: "beacons", sessionStart: .now)
-                let content = ActivityContent(state: DetectionActivityAttributes.ContentState.empty,
-                                              staleDate: Date().addingTimeInterval(8 * 60))
-                _ = try? Activity.request(attributes: attrs, content: content, pushType: nil)
-            }
-        } else {
+        // On only records intent and opens the app. BLEManager owns creation after the encrypted
+        // Detections subscription and Location grant are both ready; creating an empty activity in
+        // the extension bypassed both gates and could leave "Reconnecting" stuck indefinitely.
+        if !value {
             for activity in running { await activity.end(nil, dismissalPolicy: .immediate) }
         }
+        postDriveModeIntentChanged()
         return .result()
     }
 }

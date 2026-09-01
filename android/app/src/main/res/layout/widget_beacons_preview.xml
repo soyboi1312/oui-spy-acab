@@ -1,0 +1,92 @@
+<!-- Static widget-picker preview for the responsive Glance implementation. Runtime widget state
+     is composed by BeaconsGlanceWidget; this layout is never used as a RemoteViews renderer. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@drawable/widget_bg"
+    android:paddingHorizontal="14dp"
+    android:paddingVertical="12dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="beacons"
+            android:textColor="#A99EA1"
+            android:textSize="11sp"
+            android:fontFamily="@font/space_grotesk_bold" />
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:text="● CONNECTED"
+            android:textColor="#EE4034"
+            android:textSize="10sp"
+            android:fontFamily="@font/jetbrains_mono_bold" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="5dp"
+        android:gravity="bottom"
+        android:orientation="horizontal">
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="4"
+            android:textColor="#F4EEF0"
+            android:textSize="38sp"
+            android:includeFontPadding="false"
+            android:fontFamily="@font/space_grotesk_bold" />
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_marginBottom="4dp"
+            android:text="TODAY"
+            android:textColor="#EE4034"
+            android:textSize="10sp"
+            android:fontFamily="@font/jetbrains_mono_bold" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="ALPR 2   BODY 1   TRACKER 1"
+        android:textColor="#A99EA1"
+        android:textSize="9sp"
+        android:fontFamily="@font/jetbrains_mono_bold" />
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+        <ImageView
+            android:layout_width="16dp"
+            android:layout_height="16dp"
+            android:src="@drawable/ic_w_alpr"
+            android:tint="#EE4034"
+            android:contentDescription="@null" />
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="7dp"
+            android:text="alpr · now"
+            android:textColor="#A99EA1"
+            android:textSize="11sp"
+            android:fontFamily="@font/jetbrains_mono_medium" />
+    </LinearLayout>
+</LinearLayout>

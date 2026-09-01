@@ -5,15 +5,18 @@ real Axon body cameras on patrolling officers in the field, so it ships enabled.
 
 ## How it works
 
-Axon body cams advertise BLE with a stable, non-randomised signature, so passive
-detection works. ACAB keys off two public facts:
+Axon body cams advertise BLE with a payload signature that survives MAC randomisation
+(Axon is moving to rotating BLE MACs, so a MAC-based match alone would not hold), which
+is what makes passive detection work. ACAB keys off two public facts:
 
 - **MAC OUI `00:25:DF`**: Axon Enterprise's only IEEE block (MA-L, registered 2010
   as TASER International, updated 2025-01-30). This is the loose match: it flags any
   Axon product (body cam, dock, TASER, fleet gear).
-- **The `BWCDEVICE` service-data tag**: when an advert on that OUI also carries this
-  tag, the classifier confirms it's specifically a *body-worn camera* (vs other Axon
-  hardware) and raises confidence to 90.
+- **The `BWCDEVICE` service-data tag**: a standalone, MAC-independent match (method
+  svc-data, confidence 90, detail "BWC DEVICE") that fires with or without the Axon
+  OUI - deliberately, because rotating BLE MACs break the OUI path but the tag rides
+  in the advert payload. The OUI stays the loose any-Axon-product match at
+  confidence 75.
 
 There is also a WiFi path. `axonClassifyWiFi` matches the same `00:25:DF` OUI (and the
 Utility BodyWorn OUIs) on WiFi management frames at confidence 65. Axon's WiFi estate is

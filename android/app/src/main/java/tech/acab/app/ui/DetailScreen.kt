@@ -88,6 +88,9 @@ import org.osmdroid.views.CustomZoomButtonsController
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import tech.acab.app.ble.AcabBleManager
+import tech.acab.app.ble.ConnState
+import tech.acab.app.ble.MuteRuleStatus
+import tech.acab.app.ble.MuteScope
 import tech.acab.app.model.Detection
 import tech.acab.app.model.FaqContent
 import tech.acab.app.model.DeviceType
@@ -115,6 +118,8 @@ fun DetailScreen(
     ble: AcabBleManager,
     onBack: () -> Unit,
     onOpenInMap: (Double, Double) -> Unit,
+    locationGranted: Boolean = false,
+    onRequestLocation: () -> Unit = {},
 ) {
     // Which FAQ answer a RELATED HELP row asked for; non-null opens the Help sheet on it.
     var helpDeepLink by remember { mutableStateOf<String?>(null) }
@@ -144,11 +149,33 @@ fun DetailScreen(
         ?: if (approxFirst) APPROX_TIME else relativeAgo(firstSeen)
     val watchedList by ble.watched.collectAsState()
     val isWatched = watchedList.any { it.mac == d.mac.lowercase() }
+    val ignoredList by ble.ignored.collectAsState()
+    val muteRule = ignoredList.firstOrNull { it.mac == d.mac.lowercase() }
+    val connectionState by ble.state.collectAsState()
     // Confirm before starring a randomized address: it rotates, so the star may stop matching.
     var showRandomWarn by remember { mutableStateOf(false) }
     // A star refused at the firmware's 256-entry cap: surface it instead of the WATCH tap
     // silently doing nothing (the manager's watchDevice returns without adding at the cap).
     var showWatchlistFull by remember { mutableStateOf(false) }
+    var showMuteOptions by remember { mutableStateOf(false) }
+    var muteError by remember { mutableStateOf<String?>(null) }
+    var locationRefreshTick by remember { mutableStateOf(0L) }
+    // A fix can arrive or age out without changing a Compose StateFlow. Poll only while the HERE
+    // affordance or a configured place rule is visible, so availability and the active label stay
+    // honest without putting a permanent timer behind every dossier.
+    LaunchedEffect(showMuteOptions, muteRule?.isPlaceRule, locationGranted, connectionState) {
+        if (!showMuteOptions && muteRule?.isPlaceRule != true) return@LaunchedEffect
+        while (true) {
+            locationRefreshTick++
+            delay(2_000L)
+        }
+    }
+    val freshLocationAvailable = remember(
+        locationRefreshTick, showMuteOptions, muteRule?.isPlaceRule, locationGranted, connectionState,
+    ) { ble.currentSelfCoord() != null }
+    val muteStatus = remember(locationRefreshTick, muteRule, connectionState) {
+        muteRule?.let { ble.muteRuleStatus(it) }
+    }
     var showRssiInfo by remember { mutableStateOf(false) }   // info dot next to SIGNAL explains the RSSI graph
     // One watch/star toggle shared by the CONFIRM IT chip and the big button below.
     val toggleWatch: () -> Unit = {
@@ -247,7 +274,13 @@ fun DetailScreen(
                         Kicker("BAND")
                     }
                 }
-                Sparkline(trend, tone, stale, Modifier.fillMaxWidth().height(46.dp))
+                SignalHistoryGraph(
+                    values = trend,
+                    currentRssi = d.rssi,
+                    tone = tone,
+                    stale = stale,
+                    modifier = Modifier.fillMaxWidth().height(46.dp),
+                )
                 if (showRssiInfo) {
                     Text("RSSI is signal strength, moment to moment. closer to 0 is stronger, so the line climbs as you get nearer the source and drops as you move away, use it to home in on a hit.",
                         color = Acab.dim, fontSize = 11.5.sp, fontFamily = Acab.mono, lineHeight = 16.sp)
@@ -366,7 +399,12 @@ fun DetailScreen(
             // ---- actions ----
             CopyMacButton(d.mac)
             WatchButton(watched = isWatched, onToggle = toggleWatch)
-            IgnoreButton { ble.ignoreDevice(d); onBack() }
+            MuteButton(
+                mutedScope = muteRule?.scopeLabel,
+                muteStatus = muteStatus,
+                onUnmute = { ble.unignore(d.mac) },
+                onOptions = { showMuteOptions = true },
+            )
         }
 
         // Randomized-address confirm sheet: star it anyway, but say plainly why it may lapse.
@@ -387,6 +425,31 @@ fun DetailScreen(
         // Refused star at the cap, iOS "Watchlist full" alert word for word.
         if (showWatchlistFull) {
             WatchlistFullDialog { showWatchlistFull = false }
+        }
+
+        if (showMuteOptions) {
+            ScopedMuteDialog(
+                locationAvailable = freshLocationAvailable,
+                locationPermissionGranted = locationGranted,
+                locationCanRefresh = connectionState == ConnState.READY,
+                addressRotates = d.isRandomAddr,
+                error = muteError,
+                onRequestLocation = onRequestLocation,
+                onDismiss = { showMuteOptions = false },
+                onChoose = { scope ->
+                    if (ble.ignoreDevice(d, scope)) {
+                        showMuteOptions = false
+                        muteError = null
+                    } else {
+                        muteError = if (scope == MuteScope.HERE && ble.currentSelfCoord() == null) {
+                            "A fresh location accurate to 50 meters is required for a place mute. " +
+                                "Keep the beacon connected and try again."
+                        } else {
+                            "The muted-device list is full. Unmute another device and try again."
+                        }
+                    }
+                },
+            )
         }
 
         // ---- top bar: back arrow + centered kicker, on a bg->clear scrim like iOS ----
@@ -443,8 +506,7 @@ private fun HelpOverlay(questionId: String, onClose: () -> Unit) {
                         event.changes.filterNot { it.isConsumed }.forEach { it.consume() }
                     }
                 }
-            }
-            .verticalScroll(rememberScrollState()),
+            },
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Row(
@@ -468,8 +530,8 @@ private fun HelpOverlay(questionId: String, onClose: () -> Unit) {
             Spacer(Modifier.weight(1f))
             Spacer(Modifier.size(48.dp))
         }
-        Box(Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
-            HelpScreen(scrollToId = questionId)
+        Box(Modifier.widthIn(max = 640.dp).fillMaxWidth().weight(1f)) {
+            HelpScreen(scrollToId = questionId, modifier = Modifier.fillMaxSize())
         }
         Spacer(Modifier.height(24.dp))
     }
@@ -855,6 +917,17 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
     val context = LocalContext.current
     val markers = rememberCategoryMarkers()
     val operatorMarker = rememberOperatorMarker()
+    // The corroboration line below asks the known-ALPR dataset for its nearest node, which is a
+    // full pass over every node it holds. The dossier live-shadows its row at ~3 Hz, so the
+    // answer is memoised on everything that can actually move it: the type, the spot, the parsed
+    // dataset, and the tier toggle that decides which records may vouch for a hit at all.
+    val alpr = remember { AlprStore.getInstance(context) }
+    val alprNodes by alpr.nodes.collectAsState()
+    val alprShowUnverified by alpr.showUnverified.collectAsState()
+    val nearestAlpr = remember(d.type, lat, lon, alprNodes, alprShowUnverified) {
+        if (d.type == DeviceType.FLOCK_CAMERA || d.type == DeviceType.FLOCK_RAVEN)
+            alpr.nearest(lat, lon) else null
+    }
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     val liveMap = remember { mutableStateOf<MapView?>(null) }
     val mapResumed = remember { booleanArrayOf(false) }
@@ -897,32 +970,31 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
         // community-mapped camera is strong confirmation, and names the mapped maker when known.
         // We NEVER show a "no mapped camera" line: OSM lags installs and cruiser ALPR is meant to
         // move, so absence is not evidence of a false positive (the confidence % chip is that tell).
-        if (d.type == DeviceType.FLOCK_CAMERA || d.type == DeviceType.FLOCK_RAVEN) {
-            AlprStore.getInstance(context).nearest(lat, lon)?.let { (meters, maker, tier) ->
-                if (meters <= 150) {
-                    val m = meters.roundToInt()
-                    // This line is the app using the mapped record as corroboration. Only tier 1
-                    // carries structured manufacturer attribution; tier 0 can support the mapped
-                    // location without naming a maker, while tier 2 stays explicitly a legacy
-                    // candidate. Mirrors iOS DetectionDetailView.
-                    Text(
-                        when {
-                            tier == 0 ->
-                                "\u2713 near a mapped ALPR camera · no structured manufacturer · $m m"
-                            tier == 2 -> "near a legacy ALPR candidate · $m m"
-                            tier == ALPR_TIER_LEGACY_FORMAT ->
-                                "\u2713 near a mapped ALPR camera · legacy dataset format · $m m"
-                            tier == 1 && maker.isEmpty() ->
-                                "\u2713 near a mapped ALPR camera · manufacturer attributed · $m m"
-                            tier == 1 -> "\u2713 matches a mapped $maker camera · $m m"
-                            else -> "near a mapped ALPR record · unknown attribution tier · $m m"
-                        },
-                        color = if (tier == 1 || tier == ALPR_TIER_LEGACY_FORMAT)
-                            Acab.flockTone else Acab.warn,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Medium, fontFamily = Acab.mono,
-                    )
-                }
+        // Null for anything that is not an ALPR-type hit: the memo above owns that gate.
+        nearestAlpr?.let { (meters, maker, tier) ->
+            if (meters <= 150) {
+                val m = meters.roundToInt()
+                // This line is the app using the mapped record as corroboration. Only tier 1
+                // carries structured manufacturer attribution; tier 0 can support the mapped
+                // location without naming a maker, while tier 2 stays explicitly a legacy
+                // candidate. Mirrors iOS DetectionDetailView.
+                Text(
+                    when {
+                        tier == 0 ->
+                            "\u2713 near a mapped ALPR camera · no structured manufacturer · $m m"
+                        tier == 2 -> "near a legacy ALPR candidate · $m m"
+                        tier == ALPR_TIER_LEGACY_FORMAT ->
+                            "\u2713 near a mapped ALPR camera · legacy dataset format · $m m"
+                        tier == 1 && maker.isEmpty() ->
+                            "\u2713 near a mapped ALPR camera · manufacturer attributed · $m m"
+                        tier == 1 -> "\u2713 matches a mapped $maker camera · $m m"
+                        else -> "near a mapped ALPR record · unknown attribution tier · $m m"
+                    },
+                    color = if (tier == 1 || tier == ALPR_TIER_LEGACY_FORMAT)
+                        Acab.flockTone else Acab.warn,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium, fontFamily = Acab.mono,
+                )
             }
         }
         // The whole thumbnail is one tap target: the inner MapView refuses every touch at
@@ -1212,27 +1284,167 @@ private fun CopyMacButton(mac: String) {
     }
 }
 
-/** Outlined button that mutes the device and pops back. */
+/** One explicit mute entry point. Once a rule exists, keep the dossier open and show its scope
+ *  plus immediate CHANGE / UNMUTE actions so success is visible and reversible. */
 @Composable
-private fun IgnoreButton(onIgnore: () -> Unit) {
+private fun MuteButton(
+    mutedScope: String?,
+    muteStatus: MuteRuleStatus?,
+    onUnmute: () -> Unit,
+    onOptions: () -> Unit,
+) {
     val shape = RoundedCornerShape(Acab.radiusSm)
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .minimumInteractiveComponentSize()
-            .background(Acab.bg2, shape)
-            .border(1.dp, Acab.line, shape)
-            .clickable(onClick = onIgnore)
-            .padding(vertical = 14.dp),
-        horizontalArrangement = Arrangement.Center,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(Icons.Filled.NotificationsOff, contentDescription = null,
-            tint = Acab.dim, modifier = Modifier.size(15.dp))
-        Spacer(Modifier.size(7.dp))
-        Text("IGNORE THIS DEVICE", color = Acab.dim,
-            fontSize = 12.sp, letterSpacing = 0.5.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+    if (mutedScope == null) {
+        Row(
+            Modifier.fillMaxWidth().minimumInteractiveComponentSize().background(Acab.bg2, shape)
+                .border(1.dp, Acab.line, shape).clickable(onClick = onOptions).padding(vertical = 14.dp),
+            horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Filled.NotificationsOff, contentDescription = null,
+                tint = Acab.dim, modifier = Modifier.size(15.dp))
+            Spacer(Modifier.size(7.dp))
+            Text("MUTE…", color = Acab.dim, fontSize = 12.sp, letterSpacing = 0.5.sp,
+                fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+        }
+        return
     }
+
+    Column(
+        Modifier.fillMaxWidth().background(Acab.bg2, shape).border(1.dp, Acab.line, shape)
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        val active = muteStatus == MuteRuleStatus.ACTIVE
+        val headline = when (muteStatus) {
+            MuteRuleStatus.ACTIVE -> "MUTED · ${mutedScope.uppercase()}"
+            MuteRuleStatus.CURRENT_LOCATION_REQUIRED -> "MUTE SET · ACCURATE LOCATION NEEDED"
+            MuteRuleStatus.OUTSIDE_RADIUS -> "MUTE SET · OUTSIDE SAVED AREA"
+            MuteRuleStatus.EXPIRED -> "MUTE ENDED"
+            MuteRuleStatus.INVALID_PLACE -> "MUTE SET · PLACE UNAVAILABLE"
+            null -> "MUTE SET · ${mutedScope.uppercase()}"
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.NotificationsOff, contentDescription = null,
+                tint = if (active) Acab.accent else Acab.warn, modifier = Modifier.size(15.dp))
+            Spacer(Modifier.size(7.dp))
+            Text(headline, color = if (active) Acab.accent else Acab.warn, fontSize = 10.sp,
+                letterSpacing = 0.5.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+        }
+        when (muteStatus) {
+            MuteRuleStatus.CURRENT_LOCATION_REQUIRED -> Text(
+                "This place mute is saved but inactive because a fresh location accurate to " +
+                    "50 meters is unavailable.",
+                color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+            )
+            MuteRuleStatus.OUTSIDE_RADIUS -> Text(
+                "This place mute is configured but inactive outside its saved radius.",
+                color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+            )
+            MuteRuleStatus.EXPIRED -> Text(
+                "This timed mute is no longer active.",
+                color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+            )
+            MuteRuleStatus.INVALID_PLACE -> Text(
+                "This saved place rule is incomplete and is not muting the device.",
+                color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono,
+            )
+            else -> Unit
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                "CHANGE",
+                color = Acab.dim,
+                fontSize = 11.sp,
+                letterSpacing = 0.5.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = Acab.mono,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.weight(1f).minimumInteractiveComponentSize()
+                    .border(1.dp, Acab.line, shape).clickable(onClick = onOptions).padding(12.dp),
+            )
+            Text(
+                "UNMUTE",
+                color = Acab.onAccent,
+                fontSize = 11.sp,
+                letterSpacing = 0.5.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = Acab.mono,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.weight(1f).minimumInteractiveComponentSize()
+                    .background(Acab.accent, shape).clickable(onClick = onUnmute).padding(12.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ScopedMuteDialog(
+    locationAvailable: Boolean,
+    locationPermissionGranted: Boolean,
+    locationCanRefresh: Boolean,
+    addressRotates: Boolean,
+    error: String?,
+    onRequestLocation: () -> Unit,
+    onDismiss: () -> Unit,
+    onChoose: (MuteScope) -> Unit,
+) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Acab.bg2,
+        title = { Text("Mute this device", color = Acab.text) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    "Existing log history is kept. Permanent mutes silence the app and beacon. Timed and place mutes are enforced by this phone, so the beacon can still sound.",
+                    color = Acab.dim, fontSize = 12.sp,
+                )
+                if (addressRotates) {
+                    Text(
+                        "This device uses a rotating address, so the mute may stop matching after the address changes.",
+                        color = Acab.warn, fontSize = 12.sp,
+                    )
+                }
+                error?.let { Text(it, color = Acab.warn, fontSize = 12.sp) }
+                listOf(
+                    "Permanently" to MuteScope.PERMANENT,
+                    "For 1 hour" to MuteScope.ONE_HOUR,
+                    "For 24 hours" to MuteScope.ONE_DAY,
+                )
+                    .forEach { (label, scope) ->
+                        Text(label, color = Acab.text, modifier = Modifier.fillMaxWidth()
+                            .clickable { onChoose(scope) }.padding(vertical = 12.dp))
+                    }
+                when {
+                    locationAvailable -> Text(
+                        "At this place (50 m)", color = Acab.text,
+                        modifier = Modifier.fillMaxWidth().clickable { onChoose(MuteScope.HERE) }
+                            .padding(vertical = 12.dp),
+                    )
+                    !locationPermissionGranted -> Text(
+                        "Enable location for a place mute", color = Acab.accent,
+                        modifier = Modifier.fillMaxWidth().clickable(onClick = onRequestLocation)
+                            .padding(vertical = 12.dp),
+                    )
+                    locationCanRefresh -> Text(
+                        "Waiting for a fresh location accurate to 50 m. Keep this screen open, " +
+                            "then try again.",
+                        color = Acab.faint,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                    )
+                    else -> Text(
+                        "Connect to your beacon to get a fresh location accurate to 50 m for a " +
+                            "place mute.",
+                        color = Acab.faint,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            Text("CANCEL", color = Acab.dim, modifier = Modifier.clickable(onClick = onDismiss).padding(8.dp))
+        },
+    )
 }
 
 /** Star toggle: add/remove this exact MAC from the watchlist. Filled + amber when active. */
@@ -1385,11 +1597,46 @@ private fun IdRow(label: String, value: String, last: Boolean = false, note: Str
     }
 }
 
-/** RSSI history as a line with a faint fill; dimmed when the node is stale. */
+/** RSSI history with quiet direction labels; dimmed when the node is stale. */
 @Composable
-private fun Sparkline(values: List<Int>, tone: Color, stale: Boolean, modifier: Modifier = Modifier) {
+private fun SignalHistoryGraph(
+    values: List<Int>,
+    currentRssi: Int,
+    tone: Color,
+    stale: Boolean,
+    modifier: Modifier = Modifier,
+) {
     val alpha = if (stale) 0.35f else 1f
-    Canvas(modifier) { drawSparkline(values, tone, alpha) }
+    val strongest = values.maxOrNull()
+    val weakest = values.minOrNull()
+    val historyDescription = when {
+        strongest == null || weakest == null ->
+            "Signal history. Strong is at the top and weak is at the bottom. Current signal $currentRssi dBm."
+        values.size < 2 ->
+            "Signal history. Strong is at the top and weak is at the bottom. Current signal $currentRssi dBm. More readings are needed to draw a trend."
+        else ->
+            "Signal history. Strong is at the top and weak is at the bottom. Strongest $strongest dBm, weakest $weakest dBm, current $currentRssi dBm."
+    }
+    val labelColor = Acab.faint.copy(alpha = Acab.faint.alpha * alpha)
+
+    Row(
+        modifier.clearAndSetSemantics { contentDescription = historyDescription },
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        // These stay at the chart's top and bottom, so the vertical direction is obvious without
+        // replacing the exact dBm reading above. Pinning their size preserves the slim plot at
+        // large font scales; TalkBack receives the full numeric summary on the row.
+        Column(
+            Modifier.fillMaxHeight(),
+            verticalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Kicker("STRONG", color = labelColor, pinned = true)
+            Kicker("WEAK", color = labelColor, pinned = true)
+        }
+        Canvas(Modifier.weight(1f).fillMaxHeight()) {
+            drawSparkline(values, tone, alpha)
+        }
+    }
 }
 
 private fun DrawScope.drawSparkline(values: List<Int>, tone: Color, alpha: Float) {

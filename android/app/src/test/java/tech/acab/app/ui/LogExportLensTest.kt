@@ -88,10 +88,12 @@ class LogExportLensTest {
         val vm = LogViewModel()
         vm.pause(frozen)
 
-        // Model the live store evicting both ids at its cap. The paused export lenses its own
-        // immutable snapshot and therefore keeps the original evidence metadata.
-        val liveRows = mutableListOf(kept, filteredOut)
-        liveRows.clear()
+        // No live store is modelled here, and none can be: exportSnapshot reads only the frozen
+        // field and the rows it is handed, so what the manager holds is irrelevant BY
+        // CONSTRUCTION. That is the property under test - the paused export lenses its own
+        // immutable snapshot and therefore keeps the original evidence metadata. (A local list
+        // built and cleared here used to stand in for the eviction; it was read by nothing, and
+        // reading like coverage is worse than having none.)
         val exported = vm.exportSnapshot(listOf(kept))!!
 
         assertEquals(listOf(kept), exported.rows.map { it.detection })
@@ -99,8 +101,10 @@ class LogExportLensTest {
         assertEquals(TimeBasis.Reconstructed(keptAt, 9), exported.rows.single().timeBasis)
         assertEquals(32.7 to -117.1, exported.rows.single().observerCoord)
 
-        // Once the live manager has evicted the id, NEW membership must still use frozen
-        // firstSeenMs. A missing live side-map entry used to turn every evicted row into NEW.
+        // NEW membership must come from the frozen firstSeenMs, which is what makes it survive an
+        // eviction: the live sibling (AcabBleManager.newIdSet) reads firstSeenAt, and a missing
+        // entry there turns an evicted row into NEW. frozenNewIdSet is called directly, with no
+        // manager involved, so what this pins is that the frozen path never consults one.
         assertEquals(emptySet<String>(), frozenNewIdSet(
             exported.rows, seenWatermark = keptAt + 10_000L,
             approxWatermark = AcabBleManager.HIST_PSEUDO_BASE))

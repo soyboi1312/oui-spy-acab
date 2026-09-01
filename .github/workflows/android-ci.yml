@@ -1,0 +1,97 @@
+name: Android CI
+
+# Android was the ONLY component whose tests ran solely at release time. android-release.yml fires
+# on an `android-v*` tag or a manual workflow_dispatch and nothing else, so the unit-test files
+# under android/app/src/test/ were unenforced on main: a regression in LocationOwnershipTest (who
+# may hold the GPS), ContributionCsvTest (the location-redaction lens) or OtaSafetyPolicyTest could
+# land and stay green indefinitely, surfacing only when someone cut a release tag - at which point
+# the RELEASE breaks instead of the offending commit. (No count here on purpose: the suite grows,
+# and a number in a comment is a claim that rots. The three named above all predate this file.)
+#
+# This is the push/pull_request half that firmware-ci.yml and ios-ci.yml already have. The
+# tag-time gate in android-release.yml stays exactly as it is: it is what stops a broken build
+# being signed and published, and it is correctly ordered ahead of the keystore decode. This
+# workflow only moves the moment of discovery earlier.
+#
+# Nothing here signs anything, so it needs no secrets and runs on a fork PR.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - '.github/workflows/android-ci.yml'
+  pull_request:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # UNIT TESTS FIRST: they are the reason this workflow exists, and a lint failure must not
+      # hide them.
+      #
+      # --rerun-tasks is MANDATORY, not tidiness, and for the same reason it is mandatory in
+      # android-release.yml: a bare `test` reports UP-TO-DATE off the Gradle cache and runs ZERO
+      # tests, which in a CI log is indistinguishable from a green suite.
+      - name: Unit tests
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:testDebugUnitTest --rerun-tasks --no-daemon
+
+      # Publish the XML even on failure, so a red run names the failing assertion in the run
+      # summary instead of making someone re-run it locally to find out.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: android-unit-test-results
+          path: android/app/build/test-results/testDebugUnitTest/*.xml
+          if-no-files-found: warn
+
+      # FULL lint, mirroring the release gate. assembleRelease only triggers lintVitalRelease,
+      # which runs the "fatal" subset and provably misses real defects (see the note in
+      # android-release.yml). Errors fail; the existing warnings stay non-fatal.
+      #
+      # RUN AFTER A FAILING TEST, but NOT after a cancel. The point is that a red test still gets
+      # its lint verdict in the same run rather than costing a second round trip, and
+      # `!cancelled()` delivers exactly that. `always()` also runs on a CANCELLED run, which fights
+      # the cancel-in-progress concurrency group above: a run superseded by a second push to the
+      # same ref would go on to spend a full cold-cache lintRelease - minutes of runner time,
+      # bounded only by timeout-minutes - on a commit nobody is waiting for any more.
+      #
+      # The two upload-artifact steps keep always() on purpose: publishing the reports from a
+      # cancelled run costs seconds and is occasionally what you want to look at.
+      - name: Lint (full)
+        if: ${{ !cancelled() }}
+        working-directory: android
+        run: ./gradlew :app:lintRelease --no-daemon
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: android-lint-report
+          path: android/app/build/reports/lint-results-release.*
+          if-no-files-found: warn

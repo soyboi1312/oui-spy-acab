@@ -100,6 +100,55 @@ internal class RestartableFetchGate {
     }
 }
 
+/** The one blocking HttpURLConnection currently owned by [AlprStore]'s fetch gate.
+ *
+ * HttpURLConnection reads are not coroutine suspension points, so retiring a generation prevents
+ * publication but does not stop bytes already crossing the network. The store removes this exact
+ * connection/stream pair and aborts it on Dispatchers.IO when the layer is disabled.
+ * Identity-aware [clear] matters for OFF -> ON: an old transfer's finally block must not clear a
+ * replacement that has already registered after the restart handoff. */
+internal class AbortableAlprTransfer {
+    internal data class Active(
+        val connection: HttpURLConnection,
+        val stream: java.io.InputStream?,
+    ) {
+        /** disconnect first: some HttpURLConnection streams try to drain on close for socket
+         * reuse, which is the opposite of a prompt user-requested abort. Closing afterwards still
+         * wakes a custom/provider stream whose disconnect implementation does not own it. */
+        fun abort() {
+            runCatching { connection.disconnect() }
+            runCatching { stream?.close() }
+        }
+    }
+
+    private var active: Active? = null
+
+    @Synchronized
+    fun register(connection: HttpURLConnection): Boolean {
+        if (active != null) return false
+        active = Active(connection, null)
+        return true
+    }
+
+    /** Attach the input stream after response headers arrive. False means disable already took
+     * the connection; the caller must close the just-created stream and do no reading. */
+    @Synchronized
+    fun attachStream(connection: HttpURLConnection, stream: java.io.InputStream): Boolean {
+        val current = active ?: return false
+        if (current.connection !== connection) return false
+        active = current.copy(stream = stream)
+        return true
+    }
+
+    @Synchronized
+    fun clear(connection: HttpURLConnection) {
+        if (active?.connection === connection) active = null
+    }
+
+    @Synchronized
+    fun takeForAbort(): Active? = active.also { active = null }
+}
+
 /** Optional manifest count, bounded to the parser's own row ceiling. */
 internal fun parseAlprManifestCount(raw: Any): Int? {
     val number = raw as? Number ?: return null
@@ -120,9 +169,10 @@ internal fun isValidAlprManifestData(url: String, lowercaseSha256: String, size:
  * OpenStreetMap (the registry the DeFlock project maintains), shown as a quiet reference layer.
  *
  * PRIVACY: the phone downloads ONE static file from soyboi.tech and renders it locally. It never
- * queries Overpass, the request contains no viewport or phone coordinate, and the fetch only
- * happens after the user opts in. This is scoped to the optional dataset; map-tile requests go
- * to their named provider separately.
+ * queries Overpass, and the request contains no viewport or phone coordinate. The layer is ON by
+ * default (most users would never find the toggle), and turning it off stops the fetch; a user's
+ * explicit choice, either way, is stored and always wins over the default. This is scoped to the
+ * optional dataset; map-tile requests go to their named provider separately.
  *
  * Wire format, little-endian. Four versions are accepted; the magic's last byte selects:
  *   "ALP1"  epochDay:u32 | count:u32 | count*(latE7:i32, lonE7:i32)
@@ -148,7 +198,10 @@ class AlprStore private constructor(context: Context) {
     private val cacheFile = File(appContext.filesDir, "alpr.bin")
     private val atomicCache = AtomicFile(cacheFile)
 
-    private val _enabled = MutableStateFlow(prefs.getBoolean(KEY_ENABLED, false))
+    /** ON by default. getBoolean's default only applies when no stored value exists, so a user
+     *  who ever flipped the toggle keeps their choice; only fresh installs (and users who never
+     *  touched it) pick up the new default. Mirrors iOS ALPRStore.enabled. */
+    private val _enabled = MutableStateFlow(prefs.getBoolean(KEY_ENABLED, true))
     val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
 
     /** Show non-tier-1 records, including tier 0, tier 2, and unknown legacy tier bytes. DEFAULT OFF.
@@ -226,23 +279,31 @@ class AlprStore private constructor(context: Context) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val fetchGate = RestartableFetchGate()
+    private val activeTransfer = AbortableAlprTransfer()
     private val enableLock = Any()
 
-    /** Bumped on every opt in/out. Work already in the air snapshots it and abandons itself if it
-     *  moved, so a download that started before an opt-out can't spend the bandwidth, publish the
+    /** Last HTTP status seen by httpGet, so the manifest fetch can tell a 404 ("not published
+     *  yet") from a dead network. Only read immediately after a failed manifest request; the
+     *  one-fetch gate makes this instance field single-writer. */
+    @Volatile private var lastStatus: Int = 0
+
+    /** Bumped on every enable/disable. Work already in the air snapshots it and abandons itself if
+     *  it moved, so a download that started before a disable can't spend the bandwidth, publish the
      *  points, or make a disabled layer visible again. Mirrors ALPRDataset.swift's enableGen. */
     @Volatile private var enableGen = 0
 
-    /** True when [gen]'s work no longer speaks for the current opt-in state. */
+    /** True when [gen]'s work no longer speaks for the current enabled state. */
     private fun stale(gen: Int) = gen != enableGen || !_enabled.value
 
     init {
         if (_enabled.value) loadThenRefresh()
     }
 
-    /** Opt in (loads cache + downloads/freshens) or opt out (drops the in-memory points; the
-     *  cache is kept so re-enabling is instant). */
+    /** Turn the layer on (loads cache + downloads/freshens) or off (drops the in-memory points;
+     *  the cache is kept so re-enabling is instant). Persists the choice, which from then on
+     *  wins over the default. */
     fun setEnabled(on: Boolean) {
+        var transferToAbort: AbortableAlprTransfer.Active? = null
         synchronized(enableLock) {
             if (on == _enabled.value) return
             _enabled.value = on
@@ -258,8 +319,15 @@ class AlprStore private constructor(context: Context) {
                 rawTier = IntArray(0)
                 loadedFormat = ""
                 _unverifiedCount.value = 0
+                // Remove the exact old connection while generation changes are still serialized.
+                // The abort runs on IO after the lock: stream close can block, and the fetch
+                // coroutine's finally path needs this lock to release the gate and honor a rapid
+                // re-enable. Capturing the pair here means that re-enable can never retarget the
+                // pending abort at its replacement connection.
+                transferToAbort = activeTransfer.takeForAbort()
             }
         }
+        transferToAbort?.let { transfer -> scope.launch { transfer.abort() } }
     }
 
     /** Toggle the unverified tier on the map. No refetch: the nodes are already loaded, this only
@@ -350,10 +418,10 @@ class AlprStore private constructor(context: Context) {
             // body they reject. During the publish seam, fall back on 404 only; a transport or
             // integrity failure must not be hidden by silently switching datasets.
             var expectedFormat = "ALP4"
-            var manifestRaw = httpGetText(MANIFEST_V4_URL)
+            var manifestRaw = httpGetText(MANIFEST_V4_URL, gen)
             if (manifestRaw == null && shouldFallbackToAlprV3(lastStatus)) {
                 expectedFormat = "ALP3"
-                manifestRaw = httpGetText(MANIFEST_V3_URL)
+                manifestRaw = httpGetText(MANIFEST_V3_URL, gen)
             }
             if (manifestRaw == null) {
                 // 404 means the dataset has not been published for this build's manifest yet,
@@ -392,24 +460,24 @@ class AlprStore private constructor(context: Context) {
                 outcome = RefreshOutcome.UP_TO_DATE
                 return
             }
-            // Opted out while the manifest was in the air: stop before the expensive part.
+            // Disabled while the manifest was in the air: stop before the expensive part.
             if (stale(gen)) return
             // Past here we are committed to a real download, so the legend may auto-open to
             // surface the data credit. Everything above was a freshness check.
             _downloading.value = true
             try {
-                val bytes = httpGetBytes(url, size) ?: return
+                val bytes = httpGetBytes(url, size, gen) ?: return
                 if (bytes.size.toLong() != size) return
                 if (sha256Hex(bytes) != sha) return
                 val parsed = parse(bytes) ?: return
                 if (!alprFormatMatches(expectedFormat, manifestFormat, parsed.wireFormat)) return
                 if (expectedCount != null && expectedCount != parsed.rawCount) return
-                // Catch an opt-out before the durable write. Publication gets another atomic
+                // Catch a disable before the durable write. Publication gets another atomic
                 // generation check below because the flush itself can take time.
                 if (stale(gen)) return
                 writeCacheAtomically(bytes)
                 // AtomicFile can still spend time flushing after the check above. The cache is
-                // intentionally retained across opt-out, but never republish it into a disabled
+                // intentionally retained across a disable, but never republish it into a disabled
                 // map if the user switched the layer off during that write.
                 synchronized(enableLock) {
                     if (stale(gen)) return
@@ -454,7 +522,7 @@ class AlprStore private constructor(context: Context) {
         }.getOrNull() ?: return
         val parsed = parse(bytes) ?: return
         // Re-check after the read: the load is async now, and a quick toggle-on/off must not
-        // leave ~1 MB of nodes resident while the layer is off ("opt out drops the points").
+        // leave ~1 MB of nodes resident while the layer is off (turning off drops the points).
         synchronized(enableLock) {
             if (stale(gen)) return
             makerIdx = parsed.makerIdx
@@ -477,6 +545,77 @@ class AlprStore private constructor(context: Context) {
         } catch (e: Exception) {
             atomicCache.failWrite(output)
             throw e
+        }
+    }
+
+    private fun httpGetText(url: String, gen: Int): String? = httpGet(url, gen) {
+        readBounded(it, MAX_MANIFEST_BYTES, "ALPR manifest").decodeToString()
+    }
+
+    /** Stream-read with a bounded loop (AND-SEC-2), aborting once the total exceeds the
+     * manifest-declared size (hard-capped at 8 MB), so a misconfigured/compromised server cannot
+     * OOM the app before the size + SHA gate runs. */
+    private fun httpGetBytes(url: String, declaredSize: Long, gen: Int): ByteArray? {
+        if (declaredSize !in 1..ALPR_MAX_DATASET_BYTES) return null
+        return httpGet(url, gen) { input ->
+            readBounded(input, declaredSize, "ALPR dataset")
+        }
+    }
+
+    /** One trusted, redirect-bounded HTTP read belonging to [gen]. Registration and disable are
+     * serialized by [enableLock], closing the race where a connection could be created just after
+     * setEnabled(false) looked for one to abort. The blocking input-stream read is deliberately
+     * outside the lock; disable takes this exact connection/stream pair out of [activeTransfer]
+     * and aborts it on IO, which wakes the read and lets the fetch gate perform its normal restart
+     * handoff. */
+    private fun <T> httpGet(url: String, gen: Int, read: (java.io.InputStream) -> T): T? {
+        if (!isTrustedAlprUrl(url)) return null
+        var current = url
+        var redirects = 0
+        while (true) {
+            var conn: HttpURLConnection? = null
+            try {
+                val connection = (URL(current).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 8_000
+                    readTimeout = 30_000
+                    instanceFollowRedirects = false
+                }
+                conn = connection
+                val registered = synchronized(enableLock) {
+                    !stale(gen) && activeTransfer.register(connection)
+                }
+                if (!registered) return null
+
+                val status = connection.responseCode
+                lastStatus = status
+                if (status in setOf(
+                        HttpURLConnection.HTTP_MOVED_PERM,
+                        HttpURLConnection.HTTP_MOVED_TEMP,
+                        HttpURLConnection.HTTP_SEE_OTHER,
+                        307, 308)) {
+                    if (redirects++ >= MAX_REDIRECTS) return null
+                    val location = connection.getHeaderField("Location") ?: return null
+                    current = trustedAlprRedirect(current, location) ?: return null
+                    continue
+                }
+                if (status != HttpURLConnection.HTTP_OK) return null
+                val input = connection.inputStream
+                if (!activeTransfer.attachStream(connection, input)) {
+                    // Disable won the race after inputStream was obtained but before attachment.
+                    runCatching { input.close() }
+                    return null
+                }
+                return input.use(read)
+            } catch (_: Exception) {
+                lastStatus = 0          // transport/validation failure, not an HTTP status
+                return null
+            } finally {
+                conn?.let {
+                    activeTransfer.clear(it)
+                    it.disconnect()
+                }
+            }
         }
     }
 
@@ -707,25 +846,6 @@ class AlprStore private constructor(context: Context) {
             return sb.toString()
         }
 
-        private fun httpGetText(url: String): String? = httpGet(url) {
-            readBounded(it, MAX_MANIFEST_BYTES, "ALPR manifest").decodeToString()
-        }
-
-        /** Last HTTP status seen by httpGet, so the manifest fetch can tell a 404 ("not published
-         *  yet") from a dead network. Only read immediately after a failed httpGetText on the
-         *  manifest; it is best-effort, not a general-purpose channel. */
-        @Volatile private var lastStatus: Int = 0
-
-        /** Stream-read with a bounded loop (AND-SEC-2), aborting once the total exceeds the
-         *  manifest-declared size (hard-capped at 8 MB), so a misconfigured/compromised server
-         *  can't OOM the app before the size + SHA gate runs. Mirrors the OTA download path. */
-        private fun httpGetBytes(url: String, declaredSize: Long): ByteArray? {
-            if (declaredSize !in 1..ALPR_MAX_DATASET_BYTES) return null
-            return httpGet(url) { input ->
-                readBounded(input, declaredSize, "ALPR dataset")
-            }
-        }
-
         private fun readBounded(input: java.io.InputStream, cap: Long, label: String): ByteArray {
             val out = java.io.ByteArrayOutputStream(minOf(cap, 64L * 1024L).toInt())
             val tmp = ByteArray(16 * 1024)
@@ -743,41 +863,5 @@ class AlprStore private constructor(context: Context) {
         private const val MAX_MANIFEST_BYTES = 64L * 1024L
         private const val MAX_REDIRECTS = 3
         private const val ALP4_METADATA_BYTES = 19L
-
-        private fun <T> httpGet(url: String, read: (java.io.InputStream) -> T): T? {
-            if (!isTrustedAlprUrl(url)) return null
-            var current = url
-            var redirects = 0
-            while (true) {
-                var conn: HttpURLConnection? = null
-                try {
-                    conn = (URL(current).openConnection() as HttpURLConnection).apply {
-                        requestMethod = "GET"
-                        connectTimeout = 8_000
-                        readTimeout = 30_000
-                        instanceFollowRedirects = false
-                    }
-                    val status = conn.responseCode
-                    lastStatus = status
-                    if (status in setOf(
-                            HttpURLConnection.HTTP_MOVED_PERM,
-                            HttpURLConnection.HTTP_MOVED_TEMP,
-                            HttpURLConnection.HTTP_SEE_OTHER,
-                            307, 308)) {
-                        if (redirects++ >= MAX_REDIRECTS) return null
-                        val location = conn.getHeaderField("Location") ?: return null
-                        current = trustedAlprRedirect(current, location) ?: return null
-                        continue
-                    }
-                    if (status != HttpURLConnection.HTTP_OK) return null
-                    return conn.inputStream.use(read)
-                } catch (_: Exception) {
-                    lastStatus = 0          // transport/validation failure, not an HTTP status
-                    return null
-                } finally {
-                    conn?.disconnect()
-                }
-            }
-        }
     }
 }

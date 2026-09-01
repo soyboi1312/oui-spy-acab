@@ -1,5 +1,6 @@
 package tech.acab.app.ui
 
+import android.content.Context
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -27,17 +28,22 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.HelpOutline
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -51,6 +57,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -63,8 +70,12 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.delay
 import tech.acab.app.ble.AcabBleManager
+import tech.acab.app.ble.DetectionNotifier
 import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceType
 import tech.acab.app.model.sourceLabel
@@ -75,6 +86,38 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 
+internal fun shouldShowFinishSetupCard(demo: Boolean, dismissed: Boolean): Boolean =
+    !demo && !dismissed
+
+internal enum class FinishSetupLiveState(val label: String) {
+    ACTIVE("ACTIVE"),
+    BLOCKED("BLOCKED"),
+    WAITING("WAITING"),
+    OFF("OFF"),
+}
+
+internal fun finishSetupLiveState(
+    wanted: Boolean,
+    active: Boolean,
+    notificationsAvailable: Boolean,
+): FinishSetupLiveState = when {
+    !wanted -> FinishSetupLiveState.OFF
+    !notificationsAvailable -> FinishSetupLiveState.BLOCKED
+    active -> FinishSetupLiveState.ACTIVE
+    else -> FinishSetupLiveState.WAITING
+}
+
+internal fun finishSetupPhoneAlertsLabel(
+    enabled: Boolean,
+    notificationsAvailable: Boolean,
+): String = when {
+    !enabled -> "OFF"
+    !notificationsAvailable -> "BLOCKED"
+    else -> "ON"
+}
+
+private const val FINISH_SETUP_DISMISSED = "finish_setup_dismissed"
+
 /** Status / home: the at-a-glance "how many eyes are on me" view.
  *  [onOpenLogCategory] jumps to the Log tab with the given category filter applied; the
  *  count tiles call it so a number here is one tap from its rows. */
@@ -83,15 +126,63 @@ fun StatusScreen(
     ble: AcabBleManager,
     onSelect: (Detection) -> Unit = {},
     onOpenLogCategory: (String) -> Unit = {},
+    onOpenDetectorSettings: () -> Unit = {},
+    onOpenHelp: () -> Unit = {},
+    locationGranted: Boolean = false,
+    notificationsAvailable: Boolean = false,
+    onOpenSetup: () -> Unit = {},
 ) {
     val detections by ble.detections.collectAsState()
     val status by ble.status.collectAsState()
     val demo by ble.demoMode.collectAsState()
+    val liveWanted by ble.driveModeWanted.collectAsState()
+    val liveRunning by ble.driveMode.collectAsState()
     val syncing by ble.syncingOfflineLog.collectAsState()
     val syncCount by ble.offlineSyncCount.collectAsState()
     val syncTotal by ble.offlineSyncTotal.collectAsState()
+    val context = LocalContext.current
+    val setupPrefs = remember { context.getSharedPreferences("acab_ui", Context.MODE_PRIVATE) }
+    var finishSetupDismissed by remember {
+        mutableStateOf(setupPrefs.getBoolean(FINISH_SETUP_DISMISSED, false))
+    }
+    val phoneAlertsOn = DetectionNotifier.anyEnabled(context)
+    val showFinishSetup = shouldShowFinishSetupCard(demo, finishSetupDismissed)
+    // mutedBySystem costs two Binder IPCs and its answer feeds only the finish-setup card,
+    // while this screen recomposes at ~1-3 Hz under the tick and detection flows - so it is
+    // asked only while the card can show, never per recomposition (zero IPCs once dismissed).
+    // ON_RESUME is the one moment the answer can have changed: system settings and the
+    // permission dialog both pause the activity (same pattern as DeviceScreen's notifGranted).
+    // Keying the effect on showFinishSetup makes addObserver's sync-up ON_RESUME re-ask the
+    // moment the card becomes showable again (e.g. sample mode ending), not just on a real
+    // return from background.
+    var phoneAlertsAvailable by remember {
+        mutableStateOf(!showFinishSetup || !DetectionNotifier.mutedBySystem(context))
+    }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, showFinishSetup) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME && showFinishSetup) {
+                phoneAlertsAvailable = !DetectionNotifier.mutedBySystem(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val finishLiveState = finishSetupLiveState(
+        wanted = liveWanted,
+        active = liveRunning && ble.driveServiceReady,
+        notificationsAvailable = notificationsAvailable,
+    )
+    val finishPhoneAlerts = finishSetupPhoneAlertsLabel(
+        enabled = phoneAlertsOn,
+        notificationsAvailable = phoneAlertsAvailable,
+    )
+    val dismissFinishSetup = {
+        finishSetupDismissed = true
+        setupPrefs.edit().putBoolean(FINISH_SETUP_DISMISSED, true).apply()
+    }
 
-    // isStale is a function of the clock, not of anything the UI observes, and eviction is
+    // Staleness is a function of the clock, not of anything the UI observes, and eviction is
     // cap-only, so nothing recomposes this screen when a device simply stops being heard.
     // Without this tick the radar freezes at its last-publish count and a Flock heard twenty
     // minutes ago keeps winning "STRONGEST SIGNAL · LIVE" for the rest of the session.
@@ -106,8 +197,17 @@ fun StatusScreen(
     // a live sighting, so they're out regardless of how fileHistory happened to stamp them.
     // Demo rows are exempt: they're a fixture stamped once at seed time, and ageing them out
     // would empty the tour's radar 45s in.
+    //
+    // freshIdSet, not isStale per row: this block re-runs on every ~3 Hz publish AND on the tick,
+    // over the whole active feed, so the per-row form took storeLock up to FEED_CAP times a pass
+    // on the main thread - the same monitor the BLE thread holds for every arriving advert. One
+    // locked pass instead, the way LogScreen already reads newIdSet. Same window, same one-sided
+    // comparison, so the radar counts exactly what it counted before.
     val nearby = remember(detections, tick, demo) {
-        if (demo) detections else detections.filter { !it.offline && !ble.isStale(it.id) }
+        if (demo) detections else {
+            val fresh = ble.freshIdSet(detections)
+            detections.filter { !it.offline && it.id in fresh }
+        }
     }
     val nearest = remember(nearby) { nearby.maxByOrNull { it.rssi } }
 
@@ -126,8 +226,9 @@ fun StatusScreen(
     // in the gap between connect and the first frame. Same handling as the Log's empty state.
     val s = status
     // No frame YET, not "no board": this screen only exists once the link is READY, and the
-    // status read is queued behind the ignore/watch pushes, so there is a real gap on every
-    // connect. Claiming "not scanning" across it is the same lie in the other direction, so a
+    // first status frame still has to cross the link (finishReady's queued read sits behind the
+    // handshake writes, and the board's connect-time notify is async), so there is a real gap on
+    // every connect. Claiming "not scanning" across it is the same lie in the other direction, so a
     // null frame reads as scanning until the board tells us otherwise. Same as iOS.
     // A nRF mid BLE DFU is silent on purpose (it reboots into its bootloader), which reads as
     // coAlive == false through no fault of the radio. nrfUpdating is the board saying so, so an
@@ -174,6 +275,10 @@ fun StatusScreen(
         Row(verticalAlignment = Alignment.CenterVertically) {
             BrandMark(size = 21)
             Spacer(Modifier.weight(1f))
+            IconButton(onClick = onOpenHelp) {
+                Icon(Icons.AutoMirrored.Outlined.HelpOutline, contentDescription = "help and support",
+                    tint = Acab.dim, modifier = Modifier.size(19.dp))
+            }
             LinkChip(version = status?.version, demo = demo)
         }
 
@@ -207,7 +312,7 @@ fun StatusScreen(
             Spacer(Modifier.size(8.dp))
             Kicker(scanLabel, color = if (bleFault) Acab.warn else Acab.dim)
             // Far-right recency note: everything on the radar / in the counts was heard within the
-            // ~45s "nearby" window (ble.isStale), so say so - only when there's actually something up.
+            // ~45s "nearby" window (ble.freshIdSet), so say so - only when there's actually something up.
             if (!demo && nearby.isNotEmpty()) {
                 Spacer(Modifier.weight(1f))
                 Kicker("SEEN < 45s", color = Acab.faint)
@@ -219,6 +324,20 @@ fun StatusScreen(
         // While the board replays its offline buffer on reconnect: a subtle, non-blocking pill.
         // determinate once the board's hist lead-in supplies a total; a live count until then.
         if (syncing) SyncingPill(count = syncCount, total = syncTotal)
+
+        if (showFinishSetup) {
+            FinishSetupCard(
+                liveState = finishLiveState,
+                locationOn = locationGranted,
+                phoneAlertsState = finishPhoneAlerts,
+                bufferOn = status?.bufOn,
+                onReview = {
+                    dismissFinishSetup()
+                    onOpenSetup()
+                },
+                onDismiss = dismissFinishSetup,
+            )
+        }
 
         // T2: keep the scope from stretching screen-wide on tablets; capped + centered.
         RadarScope(detections = nearby, scanning = scanning, reduceMotion = reduceMotion,
@@ -234,13 +353,13 @@ fun StatusScreen(
         // strip wraps to two rows of three.
         val strip = listOf(
             StripTile(DeviceType.FLOCK_CAMERA, "ALPR",
-                count(DeviceType.FLOCK_CAMERA) + count(DeviceType.FLOCK_RAVEN), "ALPR"),
-            StripTile(DeviceType.DRONE, "DRONE", count(DeviceType.DRONE), "DRONE"),
-            StripTile(DeviceType.BODY_CAM, "BODY", count(DeviceType.BODY_CAM), "BODY CAM"),
-            StripTile(DeviceType.TRACKER, "TRKR", count(DeviceType.TRACKER), "TRACKER"),
-            StripTile(DeviceType.GLASSES, "GLAS", count(DeviceType.GLASSES), "GLASSES"),
+                count(DeviceType.FLOCK_CAMERA) + count(DeviceType.FLOCK_RAVEN), "ALPR", status?.flock),
+            StripTile(DeviceType.DRONE, "DRONE", count(DeviceType.DRONE), "DRONE", status?.drone),
+            StripTile(DeviceType.BODY_CAM, "BODY", count(DeviceType.BODY_CAM), "BODY CAM", status?.bodyCam),
+            StripTile(DeviceType.TRACKER, "TRKR", count(DeviceType.TRACKER), "TRACKER", status?.tracker),
+            StripTile(DeviceType.GLASSES, "GLAS", count(DeviceType.GLASSES), "GLASSES", status?.glasses),
             StripTile(DeviceType.NETWORK_CAMERA, "NETCAM",
-                count(DeviceType.NETWORK_CAMERA), "CAMERA"),
+                count(DeviceType.NETWORK_CAMERA), "CAMERA", status?.ncam),
         )
         BoxWithConstraints(Modifier.fillMaxWidth()) {
             val perRow = if (maxWidth < 360.dp || LocalDensity.current.fontScale >= 1.5f) 3 else strip.size
@@ -248,8 +367,9 @@ fun StatusScreen(
                 strip.chunked(perRow).forEach { rowTiles ->
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         rowTiles.forEach { t ->
-                            CountTile(t.type, t.label, t.n, Modifier.weight(1f)) {
-                                onOpenLogCategory(t.filterKey)
+                            CountTile(t.type, t.label, t.n, t.enabled, Modifier.weight(1f)) {
+                                if (t.enabled == false) onOpenDetectorSettings()
+                                else onOpenLogCategory(t.filterKey)
                             }
                         }
                     }
@@ -267,7 +387,13 @@ private fun categoryTitle(cat: String): String = cat.lowercase()
 
 /** One tile of the category strip: glyph/tone source, short caption, live count, and the
  *  DeviceType.category key the Log filter matches on. */
-private data class StripTile(val type: DeviceType, val label: String, val n: Int, val filterKey: String)
+private data class StripTile(
+    val type: DeviceType,
+    val label: String,
+    val n: Int,
+    val filterKey: String,
+    val enabled: Boolean?,
+)
 
 /** The "Beacons" wordmark. */
 @Composable
@@ -275,6 +401,68 @@ private fun BrandMark(size: Int) {
     Row(verticalAlignment = Alignment.Bottom) {
         Text("beacons", color = Acab.text, fontSize = size.sp, fontWeight = FontWeight.Bold,
             fontFamily = Acab.display)
+    }
+}
+
+/** Optional setup review kept out of the one-time tour. Every choice remains usable as-is. */
+@Composable
+private fun FinishSetupCard(
+    liveState: FinishSetupLiveState,
+    locationOn: Boolean,
+    phoneAlertsState: String,
+    bufferOn: Boolean?,
+    onReview: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val shape = RoundedCornerShape(Acab.radiusSm)
+    Column(
+        Modifier.fillMaxWidth().background(Acab.bg2, shape)
+            .border(1.dp, Acab.lineStrong, shape).padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("finish setup", color = Acab.text, fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold)
+                Text("optional choices you can review anytime in Beacon", color = Acab.faint,
+                    fontSize = 10.sp, fontFamily = Acab.mono)
+            }
+            Icon(
+                Icons.Filled.Close,
+                contentDescription = "dismiss finish setup",
+                tint = Acab.dim,
+                modifier = Modifier.minimumInteractiveComponentSize().size(20.dp)
+                    .clickable(role = Role.Button, onClick = onDismiss),
+            )
+        }
+        SetupStateRow("Live Mode", liveState.label)
+        SetupStateRow("Location", if (locationOn) "ALLOWED" else "OPTIONAL")
+        SetupStateRow("Phone alerts", phoneAlertsState)
+        SetupStateRow("Offline buffer", when (bufferOn) { true -> "ON"; false -> "OFF"; null -> "CHECK" })
+        Row(
+            Modifier.fillMaxWidth().minimumInteractiveComponentSize()
+                .clip(RoundedCornerShape(50))
+                .border(1.dp, Acab.lineStrong, RoundedCornerShape(50))
+                .clickable(onClickLabel = "review setup in Beacon", role = Role.Button, onClick = onReview)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+        ) {
+            Text("REVIEW IN BEACON", color = Acab.accent, fontSize = 10.sp,
+                fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+            Spacer(Modifier.size(6.dp))
+            Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = Acab.accent,
+                modifier = Modifier.size(14.dp))
+        }
+    }
+}
+
+@Composable
+private fun SetupStateRow(label: String, value: String) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = Acab.dim, fontSize = 11.sp, modifier = Modifier.weight(1f))
+        Text(value, color = Acab.faint, fontSize = 9.5.sp, fontWeight = FontWeight.Bold,
+            fontFamily = Acab.mono, letterSpacing = 0.7.sp)
     }
 }
 
@@ -510,8 +698,16 @@ private fun SyncingPill(count: Int, total: Int) {
 /** One compact count tile in the category strip. Tapping deep-links to the Log filtered to
  *  this category; the click label tells a screen reader that is what the tap does. */
 @Composable
-private fun CountTile(type: DeviceType, label: String, n: Int, modifier: Modifier = Modifier, onClick: () -> Unit = {}) {
+private fun CountTile(
+    type: DeviceType,
+    label: String,
+    n: Int,
+    enabled: Boolean?,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit = {},
+) {
     val shape = RoundedCornerShape(Acab.radiusSm)
+    val off = enabled == false
     val spokenLabel = when (label) {
         "ALPR" -> "License plate reader"
         "DRONE" -> "Drone"
@@ -527,10 +723,11 @@ private fun CountTile(type: DeviceType, label: String, n: Int, modifier: Modifie
             .clip(shape)
             .background(Acab.bg2, shape)
             .border(1.dp, Acab.line, shape)
-            .clickable(onClickLabel = "show in log", role = Role.Button, onClick = onClick)
+            .clickable(onClickLabel = if (off) "open detector settings" else "show in log",
+                role = Role.Button, onClick = onClick)
             .semantics(mergeDescendants = true) {
-                contentDescription =
-                    "$spokenLabel, $n detection${if (n == 1) "" else "s"}"
+                contentDescription = if (off) "$spokenLabel, detector off"
+                else "$spokenLabel, $n detection${if (n == 1) "" else "s"}"
             }
             .padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(5.dp),
@@ -538,10 +735,10 @@ private fun CountTile(type: DeviceType, label: String, n: Int, modifier: Modifie
         // null: the tile is ONE merged clickable node and the label Text below already names
         // it; a contentDescription here made TalkBack read the category twice per tile.
         Icon(type.icon(), contentDescription = null,
-            tint = if (n == 0) Acab.faint else type.tone(), modifier = Modifier.size(14.dp))
-        Text("$n", color = if (n == 0) Acab.faint else Acab.text,
+            tint = if (off || n == 0) Acab.faint else type.tone(), modifier = Modifier.size(14.dp))
+        Text(if (off) "off" else "$n", color = if (off || n == 0) Acab.faint else Acab.text,
             fontSize = 18.sp, fontWeight = FontWeight.Bold)
-        Text(label, color = if (n == 0) Acab.faint else type.tone(),
+        Text(label, color = if (off || n == 0) Acab.faint else type.tone(),
             fontSize = 8.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Medium,
             fontFamily = Acab.mono, maxLines = 1)
     }

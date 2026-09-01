@@ -39,7 +39,7 @@ let detectionCategories: [DetectionCategory] = [
 
 /// Logbook: detection history, with category tiles that double as filters over the
 /// list below. New/All filtering, a "mark all seen" baseline, and a select mode for
-/// bulk-ignoring rows.
+/// bulk-muting rows.
 struct DetectionsView: View {
     @EnvironmentObject var ble: BLEManager
     @State private var filter: String?     // category key: ALPR / DRONE / BODY CAM / TRACKER
@@ -55,6 +55,13 @@ struct DetectionsView: View {
     // so the visible row and any file made from it cannot drift apart.
     @State private var paused = false
     @State private var frozenExport: BLEManager.DetectionExportSnapshot?
+    // The two things body reads out of that snapshot, taken ONCE at the freeze. Both are computed
+    // properties on DetectionExportSnapshot (a full map, and a full Set build), and the store
+    // keeps filling while paused - that is the point of pause - so body re-read them on every
+    // ~3 Hz publish, over the whole capped store, in the one state the user entered to make the
+    // screen hold still. The live path pays neither.
+    @State private var frozenRows: [Detection] = []
+    @State private var frozenIDs: Set<String> = []
     // T3: on regular width the log is a two-pane master/detail; this drives the right pane.
     // Never set at compact width, so the phone-portrait path is untouched.
     @State private var selectedDetail: Detection?
@@ -74,27 +81,24 @@ struct DetectionsView: View {
 
     private var shown: [Detection] {
         // Paused: read from the frozen snapshot so the list holds still. Live otherwise.
-        let base = paused ? (frozenExport?.detections ?? []) : ble.detections
+        let base = paused ? frozenRows : ble.logDetections
         return base.filter { d in
             (filter == nil || d.type.category == filter) && matchesScope(d)
         }
     }
 
-    /// While paused, how many detections have landed in the live store since the freeze -
-    /// the "N new" hint. The store never stops filling; only the display is frozen.
-    private var pausedNewCount: Int {
-        guard paused else { return 0 }
-        let frozenIDs = frozenExport?.ids ?? []
-        return ble.detections.reduce(0) { $0 + (frozenIDs.contains($1.id) ? 0 : 1) }
-    }
-
     private func pauseFeed() {
-        frozenExport = ble.detectionExportSnapshot()
+        let snap = ble.detectionExportSnapshot()
+        frozenExport = snap
+        frozenRows = snap.detections
+        frozenIDs = snap.ids
         paused = true
     }
     private func resumeFeed() {
         paused = false
         frozenExport = nil
+        frozenRows = []
+        frozenIDs = []
     }
     private func matchesScope(_ d: Detection) -> Bool {
         switch scope {
@@ -112,33 +116,41 @@ struct DetectionsView: View {
         let counts: [String: Int]   // per category key, unfiltered (feeds the tiles)
         let newCount: Int
         let offlineCount: Int
+        /// While paused, how many detections have landed in the live store since the freeze -
+        /// the "N new" hint. The store never stops filling; only the display is frozen. Counted
+        /// in the pass below rather than by its own property: the header read it twice per eval
+        /// (once for the test, once for the number), so it was two extra store walks on the one
+        /// screen state that exists to be calm.
+        let pausedNewCount: Int
     }
 
     private func makeSnapshot() -> LogSnapshot {
         var counts: [String: Int] = [:]
-        var newN = 0, offN = 0
-        for d in ble.detections {
+        var newN = 0, offN = 0, pausedNewN = 0
+        for d in ble.logDetections {
             counts[d.type.category, default: 0] += 1
             if ble.isUnseen(d) { newN += 1 }
             if d.offline { offN += 1 }
+            if paused && !frozenIDs.contains(d.id) { pausedNewN += 1 }
         }
-        return LogSnapshot(shown: shown, counts: counts, newCount: newN, offlineCount: offN)
+        return LogSnapshot(shown: shown, counts: counts, newCount: newN, offlineCount: offN,
+                           pausedNewCount: pausedNewN)
     }
 
     var body: some View {
         let snap = makeSnapshot()   // ONE store pass per body eval; everything below reads this
         NavigationStack {
             layout(snap)
-                // R8: if the selected detection disappears (clear log / bulk-ignore) while its
+                // R8: if the selected detection disappears (clear log / capped-store eviction) while its
                 // dossier is open in the two-pane, drop the selection so the pane returns to the
                 // placeholder instead of showing a detection that no longer exists.
-                .onChange(of: ble.detections) {
-                    if let d = selectedDetail, !ble.detections.contains(where: { $0.id == d.id }) {
+                .onChange(of: ble.logDetections) {
+                    if let d = selectedDetail, !ble.logDetections.contains(where: { $0.id == d.id }) {
                         selectedDetail = nil
                     }
                     // Log cleared out from under a paused view: drop the frozen snapshot so we
                     // don't keep showing rows that no longer exist and can't be resumed away from.
-                    if paused && ble.detections.isEmpty { resumeFeed() }
+                    if paused && ble.logDetections.isEmpty { resumeFeed() }
                 }
         }
     }
@@ -197,10 +209,15 @@ struct DetectionsView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         header(snap)
-                        if !selecting && !ble.detections.isEmpty { actionChips }
+                        // Persistent board-side loss/censoring flags belong beside the evidence,
+                        // not behind a settings disclosure. The Offline Buffer card repeats them.
+                        ForEach(ble.status?.bufferHealthNotices ?? [], id: \.self) {
+                            BufferHealthBanner(notice: $0)
+                        }
+                        if !selecting && !ble.logDetections.isEmpty { actionChips }
                         summaryTiles(snap)
-                        if !ble.detections.isEmpty { statusFilter(snap) }
-                        if ble.detections.isEmpty { emptyState }
+                        if !ble.logDetections.isEmpty { statusFilter(snap) }
+                        if ble.logDetections.isEmpty { emptyState }
                         else if snap.shown.isEmpty { noMatchState }
                         else { logCard(snap) }
                         Spacer(minLength: selecting ? 72 : 8)
@@ -252,15 +269,23 @@ struct DetectionsView: View {
                 Alert(title: Text(problem.title), message: Text(problem.message),
                       dismissButton: .default(Text("OK")))
             }
-            .confirmationDialog("Clear \(ble.detections.count) detection\(ble.detections.count == 1 ? "" : "s")?",
+            .confirmationDialog("Clear \(ble.demoMode ? "sample" : "log") \(ble.logDetections.count) detection\(ble.logDetections.count == 1 ? "" : "s")?",
                                 isPresented: $confirmClear, titleVisibility: .visible) {
                 Button("Export CSV first") {
                     export(.csv, snapshot: ble.detectionExportSnapshot(), qualifier: nil)
                 }
-                Button("Clear log", role: .destructive) { ble.clearDetections() }
+                Button(ble.demoMode ? "Clear sample" : "Clear log", role: .destructive) {
+                    if !ble.clearDetections() {
+                        exportProblem = ExportProblem(
+                            title: "Couldn't clear log",
+                            message: "The saved log could not be secured for deletion. Nothing was cleared. Try again while the phone is unlocked.")
+                    }
+                }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("This deletes the log on this phone and can't be undone. If this is evidence, export it first.")
+                Text(ble.demoMode
+                     ? "This clears only the sample rows. Your saved detection log stays unchanged."
+                     : "This deletes the log on this phone and can't be undone. If this is evidence, export it first.")
             }
     }
 
@@ -269,7 +294,7 @@ struct DetectionsView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Logbook").font(ACABTheme.display(26, weight: .semibold)).foregroundStyle(ACABTheme.text)
                 Kicker(selecting ? "\(selection.count) SELECTED"
-                                 : "\(ble.detections.count) DETECTED · \(snap.newCount) NEW")
+                                 : "\(ble.logDetections.count) DETECTED · \(snap.newCount) NEW")
             }
             Spacer()
             if selecting {
@@ -295,7 +320,7 @@ struct DetectionsView: View {
         // same treatment; without it the last chip is clipped with no way to reach it.
         ScrollView(.horizontal, showsIndicators: false) {
         HStack(spacing: 8) {
-            actionChip("checkmark.circle", "SELECT") { resumeFeed(); selecting = true }   // bulk-ignore acts on live rows
+            actionChip("checkmark.circle", "SELECT") { resumeFeed(); selecting = true }   // bulk-mute acts on retained Log rows
             // CSV and GPX used to be two chips. That was two of the four slots in a row that must
             // scroll on a phone, spent on two variants of one action, so they fold into a single
             // EXPORT chip with a menu. Both formats still carry the CURRENT category filter, and
@@ -404,9 +429,14 @@ struct DetectionsView: View {
     }
 
     private func spokenCategory(_ label: String) -> String {
+        // Tiles pass tileLabel ("BODY", "NETCAM", "TRKR"...), chips pass chipLabel ("BODY CAM",
+        // "NETWORK CAM"...). Match BOTH spellings of each category, or the expansion silently
+        // stops firing for one caller - which is exactly how "BODY" spent weeks announced as
+        // "body" instead of "body cameras".
         switch label {
         case "ALPR": return "automatic license plate readers"
-        case "BODY CAM": return "body cameras"
+        case "BODY", "BODY CAM": return "body cameras"
+        case "DRONE": return "drones"
         case "CAMERA", "NETCAM", "NETWORK CAM": return "network cameras"
         case "TRKR", "TRACKER": return "item trackers"
         case "GLAS", "GLASSES": return "recording glasses"
@@ -417,13 +447,13 @@ struct DetectionsView: View {
     /// All / New / Offline segmented chips ("mark all seen" lives in the header chips now).
     private func statusFilter(_ snap: LogSnapshot) -> some View {
         HStack(spacing: 8) {
-            segChip("ALL", ble.detections.count, active: scope == .all) { scope = .all }
+            segChip("ALL", ble.logDetections.count, active: scope == .all) { scope = .all }
             segChip("NEW", snap.newCount, active: scope == .new, tint: ACABTheme.accent) { scope = .new }
             segChip("OFFLINE", snap.offlineCount, active: scope == .offline) { scope = .offline }
             Spacer(minLength: 0)
             // Quick clear at the top: reaching the bottom "clear log..." row is a long scroll
             // once the log is big. Goes through the same confirmation, quiet so it's not a mis-tap
-            // magnet. Hidden in select mode (that's for bulk-ignore, not clearing).
+            // magnet. Hidden in select mode (that's for bulk-muting, not clearing).
             if !selecting {
                 // Icon-only (trash reads on its own): a worded chip crowds this row on
                 // narrower screens - Android's equivalent wrapped "CLEAR" mid-word.
@@ -438,7 +468,7 @@ struct DetectionsView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Clear log")
+                .accessibilityLabel(ble.demoMode ? "Clear sample" : "Clear log")
             }
         }
     }
@@ -470,7 +500,7 @@ struct DetectionsView: View {
     private func logCard(_ snap: LogSnapshot) -> some View {
         let rows = snap.shown   // filtered once per body eval, in the snapshot
         return LazyVStack(alignment: .leading, spacing: 0) {
-            logCardHeader.padding(.bottom, 8)
+            logCardHeader(snap).padding(.bottom, 8)
             ForEach(rows) { d in
                 row(d)
                 if d.id != rows.last?.id { Divider().overlay(ACABTheme.line) }
@@ -481,12 +511,12 @@ struct DetectionsView: View {
 
     /// Log heading plus the pause/resume control. Pausing shows a "PAUSED · N NEW" pill so it's
     /// obvious the feed is still filling behind the frozen list. Hidden in select mode (that's
-    /// bulk-ignore, which acts on the live rows).
-    private var logCardHeader: some View {
+    /// bulk-muting, which acts on the retained Log rows).
+    private func logCardHeader(_ snap: LogSnapshot) -> some View {
         HStack(spacing: 8) {
             Kicker(logHeading)
             if paused {
-                Text(pausedNewCount > 0 ? "PAUSED \u{00B7} \(pausedNewCount) NEW" : "PAUSED")
+                Text(snap.pausedNewCount > 0 ? "PAUSED \u{00B7} \(snap.pausedNewCount) NEW" : "PAUSED")
                     .font(ACABTheme.mono(9, weight: .bold)).tracking(0.5)
                     .foregroundStyle(ACABTheme.accent)
                     .padding(.horizontal, 7).padding(.vertical, 3)
@@ -538,7 +568,7 @@ struct DetectionsView: View {
                     Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                         .font(.system(size: 18))
                         .foregroundStyle(selected ? ACABTheme.accent : ACABTheme.faint)
-                    DetectionRow(detection: d, timeBasis: basis)
+                    DetectionRow(detection: d, timeBasis: basis, isMuted: ble.isIgnored(d.mac))
                 }
             }
             .buttonStyle(.plain)
@@ -547,7 +577,7 @@ struct DetectionsView: View {
             // Two-pane: rows select the right dossier instead of pushing; the active
             // row carries a subtle highlight.
             Button { selectedDetail = d } label: {
-                DetectionRow(detection: d, timeBasis: basis)
+                DetectionRow(detection: d, timeBasis: basis, isMuted: ble.isIgnored(d.mac))
                     .background(
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .fill(selectedDetail?.id == d.id ? ACABTheme.lineStrong : Color.clear)
@@ -561,7 +591,7 @@ struct DetectionsView: View {
             // DetectionDetailView for every row in the LazyVStack, so fast-scrolling thousands of
             // rows spiked memory/CPU and crashed the app.
             NavigationLink(value: d) {
-                DetectionRow(detection: d, timeBasis: basis)
+                DetectionRow(detection: d, timeBasis: basis, isMuted: ble.isIgnored(d.mac))
             }
             .buttonStyle(.plain)
         }
@@ -605,7 +635,7 @@ struct DetectionsView: View {
         return parts.isEmpty ? nil : parts.joined(separator: "-")
     }
 
-    /// Bottom action bar shown in select mode: bulk-ignore the selected rows.
+    /// Bottom action bar shown in select mode: bulk-mute the selected rows.
     private var selectBar: some View {
         HStack(spacing: 10) {
             Button { selection = Set(shown.map { $0.id }) } label: {
@@ -621,7 +651,7 @@ struct DetectionsView: View {
             Button(action: ignoreSelected) {
                 HStack(spacing: 7) {
                     Image(systemName: "bell.slash").font(.system(size: 13, weight: .bold))
-                    Text("IGNORE \(selection.count)").font(ACABTheme.mono(12, weight: .bold)).tracking(0.5)
+                    Text("MUTE \(selection.count)").font(ACABTheme.mono(12, weight: .bold)).tracking(0.5)
                 }
                 .foregroundStyle(selection.isEmpty ? ACABTheme.faint : ACABTheme.onAccent)
                 .frame(maxWidth: .infinity).frame(height: 44)
@@ -654,8 +684,16 @@ struct DetectionsView: View {
     }
 
     private func ignoreSelected() {
-        let picks = ble.detections.filter { selection.contains($0.id) }
-        ble.ignoreDevices(picks)
+        let picks = ble.logDetections.filter { selection.contains($0.id) }
+        let refused = ble.ignoreDevices(picks)
+        let requested = Set(picks.map { $0.mac.lowercased() }).count
+        let muted = max(0, requested - refused)
+        exportProblem = ExportProblem(
+            title: refused == 0 ? "Devices muted" : "Some devices weren't muted",
+            message: refused == 0
+                ? "\(muted) device\(muted == 1 ? "" : "s") muted. Existing history was kept."
+                : "\(muted) muted; \(refused) couldn't be added because the muted-device list is full."
+        )
         exitSelect()
     }
 

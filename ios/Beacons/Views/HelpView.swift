@@ -1,5 +1,13 @@
 import SwiftUI
 
+func improveDetectionAvailable(isSessionReady: Bool, isDemoMode: Bool) -> Bool {
+    isSessionReady && !isDemoMode
+}
+
+func helpSupportActionIsVisible(_ action: String?, canImproveDetection: Bool) -> Bool {
+    action != "improveDetection" || canImproveDetection
+}
+
 /// Help + support: the bundled FAQ, a search over it, and the routes to a human.
 ///
 /// This screen exists because the answers were all on the website and none of them were in the
@@ -13,6 +21,9 @@ import SwiftUI
 /// scrolls to the top, so the tap lands on the answer rather than somewhere near it.
 struct HelpView: View {
     var scrollToId: String? = nil
+    /// Improve detection starts a live capture and therefore needs a usable real beacon. Setup
+    /// Help stays safe by default; connected callers opt in only while encrypted readiness is live.
+    var canImproveDetection = false
 
     @State private var query = ""
     /// One open question at a time, globally, matching the config drawer's fold behaviour. Global
@@ -26,6 +37,12 @@ struct HelpView: View {
 
     private var results: [(section: String, question: FAQContent.Question)] { faq.search(query) }
     private var searching: Bool { !query.trimmingCharacters(in: .whitespaces).isEmpty }
+    private var visibleSupport: [FAQContent.SupportRow] {
+        faq.support.filter {
+            helpSupportActionIsVisible($0.action,
+                                       canImproveDetection: canImproveDetection)
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -194,9 +211,9 @@ struct HelpView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 16).padding(.bottom, 12)
             hairline
-            ForEach(Array(faq.support.enumerated()), id: \.element.id) { idx, row in
+            ForEach(Array(visibleSupport.enumerated()), id: \.element.id) { idx, row in
                 supportRow(row)
-                if idx < faq.support.count - 1 { hairline }
+                if idx < visibleSupport.count - 1 { hairline }
             }
         }
         .cardChrome()

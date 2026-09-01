@@ -57,6 +57,30 @@ data class CombinedUpdateProgress(
         }
 }
 
+internal enum class CombinedHoldLossAction {
+    IGNORE_CRITICAL,
+    FAIL_BEFORE_MUTATION,
+    CANCEL_S3_AND_FAIL,
+    CANCEL_NRF_AND_FAIL,
+}
+
+/** Losing the foreground keep-alive may stop work only while its sub-engine is cancellable. */
+internal fun combinedHoldLossAction(
+    phase: CombinedUpdatePhase,
+    s3Planned: Boolean,
+    s3CanCancel: Boolean,
+    nrfPhase: NrfDfuPhase,
+): CombinedHoldLossAction = when {
+    phase == CombinedUpdatePhase.CHECKING -> CombinedHoldLossAction.FAIL_BEFORE_MUTATION
+    phase == CombinedUpdatePhase.UPDATING_S3 && s3CanCancel ->
+        CombinedHoldLossAction.CANCEL_S3_AND_FAIL
+    phase == CombinedUpdatePhase.RECONNECTING && !s3Planned ->
+        CombinedHoldLossAction.FAIL_BEFORE_MUTATION
+    phase == CombinedUpdatePhase.UPDATING_COPROC && nrfUserCancellationAllowed(nrfPhase) ->
+        CombinedHoldLossAction.CANCEL_NRF_AND_FAIL
+    else -> CombinedHoldLossAction.IGNORE_CRITICAL
+}
+
 /**
  * One-click combined update: a single "Update" flow that brings a beacon fully current. It updates
  * the nRF co-processor first while the physical-start authorization is live, then the S3
@@ -79,12 +103,13 @@ class CombinedUpdateCoordinator(
     private val cancelS3: () -> Unit,                 // AcabBleManager.cancelOta
     private val canCancelS3: () -> Boolean,
     private val dismissS3: () -> Unit,                // AcabBleManager.clearOtaResult
-    private val startNrf: (FirmwareBuild) -> Unit,    // AcabBleManager.startNrfUpdate
-    private val cancelNrf: () -> Unit,                // AcabBleManager.cancelNrfUpdate
-    private val dismissNrf: () -> Unit,               // AcabBleManager.dismissNrfUpdate
+    private val startNrf: (FirmwareBuild) -> Unit,    // NrfDfuCoordinator.startUpdate
+    private val cancelNrf: () -> Unit,                // NrfDfuCoordinator.cancel
+    private val dismissNrf: () -> Unit,               // NrfDfuCoordinator.dismiss
     private val nrfUpdateAvailable: (FirmwareBuild) -> Boolean,
     private val rereadStatus: () -> Unit,             // AcabBleManager.refreshStatus (== iOS otaRereadStatus)
-    private val acquireHold: () -> Unit,              // AcabLinkService FGS hold, spanning BOTH legs
+    private val acquireHold: () -> Boolean,           // accepted FGS request spanning BOTH legs
+    private val holdReady: () -> Boolean,             // startForeground promotion confirmed
     private val releaseHold: () -> Unit,
 ) {
     private val _progress = MutableStateFlow(CombinedUpdateProgress())
@@ -122,6 +147,7 @@ class CombinedUpdateCoordinator(
     // late callback from the first. On failure we only request one fresh status read and decide
     // whether the first attempt actually took; a real retry is a new user action after reconnect.
     private var nrfFailureRecheckAt = 0L
+    private var holdRequestAccepted = false
 
     private var runJob: Job? = null
 
@@ -137,7 +163,7 @@ class CombinedUpdateCoordinator(
         if (build.manifestLabel.isBlank() || build.manifestLabel != live.firmwareLabel) return false
         val installed = live.version
         if (!isNumericFirmwareVersion(installed) || !isNumericFirmwareVersion(build.version)) return false
-        return isOlderThan(installed, build.version)
+        return isFirmwareVersionOlder(installed, build.version)
     }
 
     /** Either radio is behind: the OR of the two existing checks. Drives whether the single
@@ -182,9 +208,19 @@ class CombinedUpdateCoordinator(
         startedAt = SystemClock.elapsedRealtime()
         phase = CombinedUpdatePhase.CHECKING
         label = "Checking for updates"
-        acquireHold()                 // FGS hold spans BOTH legs (S3 releases its own on DONE)
+        // Request while the tap is still foreground, but do not touch either radio until the
+        // service reports that startForeground itself succeeded. Intent acceptance alone is not
+        // a keep-alive guarantee on Android 12+.
+        holdRequestAccepted = acquireHold()
+        if (!holdRequestAccepted) {
+            phase = CombinedUpdatePhase.FAILED
+            reason = HOLD_FAILURE_MESSAGE
+            label = "Update failed"
+            this.build = null
+            publish()
+            return
+        }
         publish()
-        beginFirstLeg()
         startDrivers()
     }
 
@@ -198,7 +234,7 @@ class CombinedUpdateCoordinator(
         stopDrivers()
         if (canCancelS3()) cancelS3()
         if (nrfProgress.value.isRunning) cancelNrf()
-        releaseHold()
+        releaseAcquiredHold()
         phase = CombinedUpdatePhase.FAILED
         reason = "Update cancelled."
         label = "Update cancelled"
@@ -216,6 +252,28 @@ class CombinedUpdateCoordinator(
         phase = CombinedUpdatePhase.IDLE
         progressF = 0f; elapsed = 0; notice = null; reason = null; label = ""
         publish()
+    }
+
+    /** Service teardown callback (Main). Never abort a destructive nRF flash or committed S3. */
+    fun onProtectedHoldLost() {
+        if (!_progress.value.isRunning) return
+        when (combinedHoldLossAction(
+            phase = phase,
+            s3Planned = s3Planned,
+            s3CanCancel = canCancelS3(),
+            nrfPhase = nrfProgress.value.phase,
+        )) {
+            CombinedHoldLossAction.FAIL_BEFORE_MUTATION -> fail(HOLD_FAILURE_MESSAGE)
+            CombinedHoldLossAction.CANCEL_S3_AND_FAIL -> {
+                cancelS3()
+                fail(HOLD_FAILURE_MESSAGE)
+            }
+            CombinedHoldLossAction.CANCEL_NRF_AND_FAIL -> {
+                cancelNrf()
+                fail(HOLD_FAILURE_MESSAGE)
+            }
+            CombinedHoldLossAction.IGNORE_CRITICAL -> Unit
+        }
     }
 
     // ---- drivers ----
@@ -282,7 +340,16 @@ class CombinedUpdateCoordinator(
             CombinedUpdatePhase.UPDATING_S3 -> driveS3()
             CombinedUpdatePhase.RECONNECTING -> driveReconnect()
             CombinedUpdatePhase.UPDATING_COPROC, CombinedUpdatePhase.VERIFYING -> driveNrf()
-            CombinedUpdatePhase.CHECKING -> {}   // start() advances immediately; nothing to poll
+            CombinedUpdatePhase.CHECKING -> when (foregroundServiceHoldDecision(
+                requestAccepted = holdRequestAccepted,
+                serviceActive = holdReady(),
+                elapsedMs = SystemClock.elapsedRealtime() - startedAt,
+                timeoutMs = OTA_HOLD_PROMOTION_TIMEOUT_MS,
+            )) {
+                ForegroundServiceHoldDecision.READY -> beginFirstLeg()
+                ForegroundServiceHoldDecision.WAIT -> Unit
+                ForegroundServiceHoldDecision.FAILED -> fail(HOLD_FAILURE_MESSAGE)
+            }
             else -> {}
         }
         if (phase.isRunningPhase()) label = labelFor()
@@ -501,19 +568,25 @@ class CombinedUpdateCoordinator(
             else -> return
         }
         stopDrivers()
-        releaseHold()
+        releaseAcquiredHold()
         build = null
         publish()
     }
 
     private fun fail(reason: String) {
         stopDrivers()
-        releaseHold()
+        releaseAcquiredHold()
         this.reason = reason
         label = "Update failed"
         phase = CombinedUpdatePhase.FAILED
         build = null
         publish()
+    }
+
+    private fun releaseAcquiredHold() {
+        if (!holdRequestAccepted) return
+        holdRequestAccepted = false
+        releaseHold()
     }
 
     /** Monotonic, clamped progress setter (never goes backward within a run). */
@@ -546,6 +619,8 @@ class CombinedUpdateCoordinator(
         !phase.isRunningPhase() -> false
         phase == CombinedUpdatePhase.UPDATING_S3 -> canCancelS3()
         phase == CombinedUpdatePhase.RECONNECTING && s3Planned -> false
+        phase == CombinedUpdatePhase.UPDATING_COPROC || phase == CombinedUpdatePhase.VERIFYING ->
+            nrfUserCancellationAllowed(nrfProgress.value.phase)
         else -> true
     }
 
@@ -571,19 +646,6 @@ class CombinedUpdateCoordinator(
 
     private fun pctFrac(pct: Int): Float = pct.coerceIn(0, 100) / 100f
 
-    /** Strictly older, compared numerically dotted-field by dotted-field (so "1.10" > "1.7", and a
-     *  newer board is never flagged). Same comparator the S3 OTA + DeviceScreen use. */
-    private fun isOlderThan(installed: String, latest: String): Boolean {
-        val a = installed.split(".").map { it.toIntOrNull() ?: 0 }
-        val b = latest.split(".").map { it.toIntOrNull() ?: 0 }
-        for (i in 0 until maxOf(a.size, b.size)) {
-            val x = a.getOrElse(i) { 0 }
-            val y = b.getOrElse(i) { 0 }
-            if (x != y) return x < y
-        }
-        return false
-    }
-
     companion object {
         private const val TICK_MS = 400L
         // Timing for the indeterminate creeps and the post-S3 version-repopulate wait (iOS parity).
@@ -592,5 +654,7 @@ class CombinedUpdateCoordinator(
         private const val CONFIRM_CREEP_MS = 30_000L     // nRF confirm band
         private const val NRFV_WAIT_MS = 15_000L         // wait for nrfv to come back
         private const val NRF_FAILURE_RECHECK_MS = 5_000L
+        private const val HOLD_FAILURE_MESSAGE =
+            "Android could not start the protected update session. Nothing was sent to the board; keep the app open and try again."
     }
 }

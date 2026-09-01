@@ -6,10 +6,8 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
-import android.content.Intent
 import android.os.Handler
 import android.os.Looper
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -19,7 +17,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import no.nordicsemi.android.dfu.DfuBaseService
 import no.nordicsemi.android.dfu.DfuProgressListenerAdapter
 import no.nordicsemi.android.dfu.DfuServiceInitiator
 import no.nordicsemi.android.dfu.DfuServiceListenerHelper
@@ -37,6 +34,33 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 
 enum class NrfDfuPhase { IDLE, PREPARING, TRIGGERING, SCANNING, FLASHING, CONFIRMING, DONE, FAILED }
+
+/** Start DFU may erase the application before upload progress appears. Once FLASHING is entered,
+ * neither a user cancel nor loss of the separate S3 control link may abort the selected AdaDFU
+ * transfer; doing so can strand the radio in its bootloader and require physical USB recovery. */
+internal fun nrfUserCancellationAllowed(phase: NrfDfuPhase): Boolean = when (phase) {
+    NrfDfuPhase.PREPARING, NrfDfuPhase.TRIGGERING, NrfDfuPhase.SCANNING -> true
+    NrfDfuPhase.IDLE, NrfDfuPhase.FLASHING, NrfDfuPhase.CONFIRMING,
+    NrfDfuPhase.DONE, NrfDfuPhase.FAILED -> false
+}
+
+internal fun nrfArmMutationAllowed(
+    ownsLiveSession: Boolean,
+    phase: NrfDfuPhase,
+    protectedHoldReady: Boolean,
+): Boolean = ownsLiveSession && phase == NrfDfuPhase.PREPARING && protectedHoldReady
+
+internal enum class NrfStartStallAction { KEEP_WAITING, IGNORE }
+
+/** Once the Nordic service starts, a silent START/erase window is never safe to abort. */
+internal fun nrfStartStallAction(
+    phase: NrfDfuPhase,
+    uploadProgressSeen: Boolean,
+): NrfStartStallAction = if (phase == NrfDfuPhase.FLASHING && !uploadProgressSeen) {
+    NrfStartStallAction.KEEP_WAITING
+} else {
+    NrfStartStallAction.IGNORE
+}
 
 data class NrfDfuProgress(
     val phase: NrfDfuPhase = NrfDfuPhase.IDLE,
@@ -68,6 +92,8 @@ class NrfDfuCoordinator(
     private val linkReady: () -> Boolean,
     /** Increments for every status frame, including identical values. */
     private val statusRevisionProvider: () -> Long,
+    /** Confirmed foreground-service promotion, rechecked on Main at the trigger write. */
+    private val protectedHoldReady: () -> Boolean,
 ) {
     private val _progress = MutableStateFlow(NrfDfuProgress())
     val progress: StateFlow<NrfDfuProgress> = _progress.asStateFlow()
@@ -83,15 +109,11 @@ class NrfDfuCoordinator(
     private var quarantinedSession: Long? = null
     private val main = Handler(Looper.getMainLooper())
 
-    // START-phase stall watchdog, mirroring the iOS NrfDfuFlasher stack (proven on
-    // hardware 2026-07-23). Two field-confirmed failure modes wedge the legacy START handshake
-    // indefinitely: the image-size write dropped under radio congestion, and the Adafruit
-    // bootloader stalling in its erase-before-response window. We watchdog the window between
-    // start() and the first upload progress and fail the whole attempt on expiry. Nordic callbacks
-    // have no attempt identity, so an automatic overlapping retry is unsafe.
-    private var dfuController: no.nordicsemi.android.dfu.DfuServiceController? = null
+    // START-phase notice watchdog. The Adafruit bootloader can erase the application before the
+    // first upload-progress callback. A timeout in that silent window may update the copy, but it
+    // must never abort the Nordic service: interruption can leave a bootloader-only radio that
+    // requires USB recovery. Nordic's own terminal callback remains authoritative.
     private var pendingZip: File? = null
-    private var intentionalAbort = false   // our own stall-recovery abort must not read as failure
     private var pastStart = false          // true once upload progress begins (watchdog disarm)
     private var listenerRegistered = false
     private var settleRunnable: Runnable? = null
@@ -190,7 +212,9 @@ class NrfDfuCoordinator(
             return
         }
         // Never overlap an S3 OTA: both flows drive the same radio, and a co-processor DFU started
-        // mid-OTA would fight the S3 image stream. Parity with iOS BLEManager+NrfDFU.swift:39.
+        // mid-OTA would fight the S3 image stream. Parity with the otaState.isRunning guard at the
+        // top of BLEManager.startNrfUpdate (BLEManager+NrfDFU.swift), which fails with this same
+        // string. Named, not line-cited: that file has already shifted this guard once.
         if (otaInProgress()) {
             set(NrfDfuPhase.FAILED, 0, "Finish the board update first, then update the co-processor.")
             return
@@ -246,7 +270,6 @@ class NrfDfuCoordinator(
         ownerSession = session
         triggerStatusRevision = 0L
         triggerSent = false
-        intentionalAbort = false
         pastStart = false
         DfuServiceInitiator.createDfuNotificationChannel(context)
 
@@ -292,9 +315,20 @@ class NrfDfuCoordinator(
     }
 
     private fun armDfuHandoff(zipFile: File) {
-        if (!ownsLiveSession() || _progress.value.phase != NrfDfuPhase.PREPARING) {
+        val ownsSession = ownsLiveSession()
+        val holdReady = protectedHoldReady()
+        if (!nrfArmMutationAllowed(
+                ownsLiveSession = ownsSession,
+                phase = _progress.value.phase,
+                protectedHoldReady = holdReady,
+            )) {
+            val message = if (!holdReady) {
+                "Android could not keep the protected update session active. Nothing was sent to the co-processor; keep the app open and try again."
+            } else {
+                "The board changed before the co-processor update could start. Reconnect and try again."
+            }
             set(NrfDfuPhase.FAILED, 0,
-                "The board changed before the co-processor update could start. Reconnect and try again.")
+                message)
             return
         }
         // Protocol v2 explicitly accepts or denies the physical-start gate. Do not scan until this
@@ -362,29 +396,27 @@ class NrfDfuCoordinator(
     }
 
     fun cancel() {
+        if (!nrfUserCancellationAllowed(_progress.value.phase)) return
         job?.cancel(); job = null
         stopScan()
         clearPendingCallbacks()
-        if (_progress.value.phase == NrfDfuPhase.FLASHING) {
-            intentionalAbort = true   // swallow the async onDfuAborted so it can't clobber our copy
-            sendAbortBroadcast()
-        }
         unregisterDfuListener()
         if (_progress.value.isRunning) set(NrfDfuPhase.FAILED, 0, "Co-processor update cancelled.")
     }
 
-    /** The generic AdaDFU link has no board identity of its own. If its owning S3 link ends, abort
-     *  immediately instead of letting a nearby bootloader continue under a different session. */
+    /** Before transfer, the generic AdaDFU link still depends on its owning S3 identity and a link
+     * loss ends the attempt. Once FLASHING, the uniquely selected target must finish safely. */
     fun onLinkTeardown(endedSession: Long) {
         main.post {
             if (ownerSession != endedSession || !_progress.value.isRunning) return@post
+            // The AdaDFU address was uniquely selected before FLASHING. Its transfer no longer
+            // depends on the S3 control link, and aborting after Start DFU can strand an erased
+            // radio. Keep listeners/controller alive; startConfirm will report that the finished
+            // transfer could not be confirmed if the S3 has not reconnected.
+            if (_progress.value.phase == NrfDfuPhase.FLASHING) return@post
             job?.cancel(); job = null
             stopScan()
             clearPendingCallbacks()
-            if (_progress.value.phase == NrfDfuPhase.FLASHING) {
-                intentionalAbort = true
-                sendAbortBroadcast()
-            }
             unregisterDfuListener()
             set(NrfDfuPhase.FAILED, 0,
                 "The beacon connection ended during the co-processor update. Reconnect and try again.")
@@ -650,7 +682,7 @@ class NrfDfuCoordinator(
         registerDfuListener()
         pastStart = false
         set(NrfDfuPhase.FLASHING, 0, "Sending to co-processor…")
-        dfuController = DfuServiceInitiator(address)
+        DfuServiceInitiator(address)
             .setDeviceName("AdaDFU")
             .setKeepBond(false)
             .setForceDfu(false)
@@ -690,7 +722,7 @@ class NrfDfuCoordinator(
         armStartWatchdog()
     }
 
-    // ---- START-phase stall recovery (iOS NrfDfuFlasher parity) ----
+    // ---- START-phase slow-start notice ----
 
     private fun armStartWatchdog() {
         watchdogRunnable?.let { main.removeCallbacks(it) }
@@ -700,24 +732,13 @@ class NrfDfuCoordinator(
     }
 
     private fun startStalled() {
-        // Only fires if upload never began (pastStart disarms it). A terminal phase means we lost
-        // the race with a real callback; nothing to do.
-        if (pastStart || _progress.value.phase != NrfDfuPhase.FLASHING) return
-        intentionalAbort = true
-        sendAbortBroadcast()
-        unregisterDfuListener()
-        clearPendingCallbacks()
-        set(NrfDfuPhase.FAILED, 0,
-            "The co-processor didn't acknowledge the update. Reconnect and try again.")
-    }
-
-    private fun sendAbortBroadcast() {
-        // The running DfuBaseService is aborted through its documented local-broadcast channel.
-        val i = Intent(DfuBaseService.BROADCAST_ACTION)
-            .putExtra(DfuBaseService.EXTRA_ACTION, DfuBaseService.ACTION_ABORT)
-        LocalBroadcastManager.getInstance(context).sendBroadcast(i)
-        runCatching { dfuController?.abort() }
-        dfuController = null
+        watchdogRunnable = null
+        if (nrfStartStallAction(_progress.value.phase, pastStart) !=
+            NrfStartStallAction.KEEP_WAITING) return
+        // Do not fail, unregister, or send ACTION_ABORT here. Start DFU may already have erased the
+        // application even though no progress callback arrived; only Nordic may finish/error now.
+        set(NrfDfuPhase.FLASHING, 0,
+            "The co-processor is still preparing. Keep the beacon powered and nearby…")
     }
 
     private fun registerDfuListener() {
@@ -762,22 +783,16 @@ class NrfDfuCoordinator(
             if (_progress.value.phase != NrfDfuPhase.FLASHING) return
             unregisterDfuListener()
             clearPendingCallbacks()
-            dfuController = null
             startConfirm()
         }
         override fun onDfuAborted(deviceAddress: String) {
             if (_progress.value.phase != NrfDfuPhase.FLASHING) return
-            // Our own stall-recovery abort lands here; the rescan/retry (or the terminal fail) owns
-            // the flow, so don't clobber it.
-            if (intentionalAbort) { intentionalAbort = false; return }
             unregisterDfuListener()
             clearPendingCallbacks()
             set(NrfDfuPhase.FAILED, 0, "The co-processor update was stopped.")
         }
         override fun onError(deviceAddress: String, error: Int, errorType: Int, message: String?) {
             if (_progress.value.phase != NrfDfuPhase.FLASHING) return
-            // An error surfaced by our own abort isn't a failure; the retry owns the flow.
-            if (intentionalAbort) { intentionalAbort = false; return }
             unregisterDfuListener()
             clearPendingCallbacks()
             set(NrfDfuPhase.FAILED, 0, "The co-processor update failed: ${message ?: "error $error"}. Reconnect and try again.")

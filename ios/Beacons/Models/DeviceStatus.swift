@@ -1,5 +1,54 @@
 import Foundation
 
+/// One firmware-version policy for offer, install and post-reboot confirmation. The board packs
+/// only the numeric core, so suffixes never make an otherwise-equal image newer.
+enum FirmwareVersionPolicy {
+    static func isValid(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 31 else { return false }
+        let pieces = value.split(separator: "-", maxSplits: 1,
+                                 omittingEmptySubsequences: false)
+        guard let core = pieces.first, !core.isEmpty else { return false }
+
+        if pieces.count == 2 {
+            let suffix = pieces[1]
+            guard let first = suffix.utf8.first, isASCIIAlphaNumeric(first),
+                  suffix.utf8.allSatisfy({ isASCIIAlphaNumeric($0) || $0 == 0x2D || $0 == 0x2E })
+            else { return false }
+        }
+
+        let fields = core.split(separator: ".", omittingEmptySubsequences: false)
+        guard (1...3).contains(fields.count) else { return false }
+        var anyNonzero = false
+        for field in fields {
+            guard !field.isEmpty, field.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }),
+                  let number = UInt64(field), number <= 1023 else { return false }
+            anyNonzero = anyNonzero || number != 0
+        }
+        return anyNonzero
+    }
+
+    static func isAtLeast(_ have: String, _ want: String) -> Bool {
+        guard isValid(have), isValid(want) else { return false }
+        func fields(_ value: String) -> [UInt64] {
+            let core = value.split(separator: "-", maxSplits: 1).first ?? Substring(value)
+            return core.split(separator: ".").compactMap { UInt64(String($0)) }
+        }
+        let current = fields(have)
+        let target = fields(want)
+        for index in 0..<max(current.count, target.count) {
+            let lhs = index < current.count ? current[index] : 0
+            let rhs = index < target.count ? target[index] : 0
+            if lhs != rhs { return lhs > rhs }
+        }
+        return true
+    }
+
+    private static func isASCIIAlphaNumeric(_ byte: UInt8) -> Bool {
+        (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5A)
+            || (byte >= 0x61 && byte <= 0x7A)
+    }
+}
+
 /// Device status from the Status characteristic (read + notify).
 /// JSON keys live in docs/ble-protocol.md.
 struct DeviceStatus: Equatable {
@@ -21,12 +70,24 @@ struct DeviceStatus: Equatable {
     let ncam: Bool           // network-camera (branded IP-camera OUI on WiFi) detector enabled ("ncam").
                              // OFF by default, exactly like the drone-OUI opt-in: catching it needs the
                              // 802.11 DATA-frame source-MAC path, which stays disabled unless opted in.
-    let buzzer: Bool         // master audio on/off
+    let buzzer: Bool         // detection/session alert audio on/off; physical power cues are independent
     let volume: Int          // buzzer loudness, 0...100
     let ledEnabled: Bool     // onboard LED / idle heartbeat on ("ledon"; absent = on, the default)
     let gps: Bool
     let bufCount: Int        // detections currently buffered on the board ("buf")
     let bufferingOn: Bool    // offline buffering enabled ("bufon")
+    /// Stationary/record-all capture reached the raw-ring capacity. Sent only while true and
+    /// retained until a successful clear; absence on each fresh frame therefore means false.
+    let bufferSaturated: Bool
+    /// Latched offline-buffer fault mask ("buferr"). Bits 0x01...0x10 are raw-ring failures,
+    /// 0x20 is an offline-buffer metadata load/save failure (generation, anchors, privacy lifecycle,
+    /// and diagnostic state), and 0x40 is a cryptography failure. Firmware retries eligible work,
+    /// but these historical bits remain set until a successful physical clear.
+    let bufferFaults: Int
+    /// The authenticated phone offered a durable buffer key that does not match the key protecting
+    /// this nonempty history generation. Replay is denied and history is preserved. The firmware
+    /// emits `keymis:true` only for that authenticated session; absence means false.
+    let bufferKeyMismatch: Bool
     let desertMode: Bool     // Desert mode enabled ("desert")
     let ignoreCount: Int     // entries on the board's ignore list ("ign")
     let watchCount: Int      // entries on the board's watch list ("wat")
@@ -75,7 +136,7 @@ extension DeviceStatus: Decodable {
         case ncam        // network-camera detector enabled; absent = off (the default)
         case vol         // firmware sends "vol"; we call it `volume`
         case ledon       // onboard LED master; the board omits it when on, so absent = on
-        case buf, bufon  // offline buffer: stored count + enabled flag
+        case buf, bufon, bufsat, buferr, keymis  // offline buffer state, faults and key mismatch
         case desert      // Desert mode (report every device)
         case ign         // board ignore-list count
         case wat         // board watch-list count
@@ -114,6 +175,9 @@ extension DeviceStatus: Decodable {
         gps      = (try? k.decode(Bool.self, forKey: .gps)) ?? false
         bufCount    = (try? k.decode(Int.self, forKey: .buf)) ?? 0
         bufferingOn = (try? k.decode(Bool.self, forKey: .bufon)) ?? false
+        bufferSaturated = (try? k.decode(Bool.self, forKey: .bufsat)) ?? false
+        bufferFaults = max(0, (try? k.decode(Int.self, forKey: .buferr)) ?? 0)
+        bufferKeyMismatch = (try? k.decode(Bool.self, forKey: .keymis)) ?? false
         desertMode  = (try? k.decode(Bool.self, forKey: .desert)) ?? false
         ignoreCount = (try? k.decode(Int.self, forKey: .ign)) ?? 0
         watchCount  = (try? k.decode(Int.self, forKey: .wat)) ?? 0
@@ -129,18 +193,64 @@ extension DeviceStatus: Decodable {
     }
 }
 
+/// A user-visible consequence of the board's offline-buffer health fields. Keeping this policy
+/// beside the decoded status makes the Logbook and board control show the same ordered warnings.
+enum BufferHealthNotice: Hashable {
+    case keyNotAccepted
+    case storageFailed
+    case capacityReached
+    case persistenceErrorRecorded
+
+    var title: String {
+        switch self {
+        case .keyNotAccepted: return "BUFFER KEY NOT ACCEPTED"
+        case .storageFailed: return "OFFLINE LOG INCOMPLETE"
+        case .capacityReached: return "CAPTURE REACHED CAPACITY"
+        case .persistenceErrorRecorded: return "BUFFER METADATA ERROR RECORDED"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .keyNotAccepted:
+            return "This phone’s buffer key was not accepted. Existing history was preserved and was not replayed. Sync with the originating phone, or explicitly clear the board buffer to transfer."
+        case .storageFailed:
+            return "Offline logging encountered a storage or encryption failure. Some offline detections may be missing or unavailable. Clear the offline buffer after reviewing or exporting it to reset this warning."
+        case .capacityReached:
+            return "Stationary capture filled the board. Later nearby detections may be missing. Export what synced, then clear the board buffer before another deployment."
+        case .persistenceErrorRecorded:
+            return "The board recorded an offline-buffer metadata save/load error. Current status may already reflect a successful retry; confirm buffer state and replay timestamps before relying on them. Clear the board buffer to reset this warning."
+        }
+    }
+
+    var critical: Bool { self == .storageFailed || self == .keyNotAccepted }
+}
+
+extension DeviceStatus {
+    /// Most severe first. Unknown future non-NVS bits surface as a storage failure instead of
+    /// disappearing; a newer board can independently raise the protocol-version warning.
+    var bufferHealthNotices: [BufferHealthNotice] {
+        var result: [BufferHealthNotice] = []
+        if bufferKeyMismatch { result.append(.keyNotAccepted) }
+        if bufferFaults & ~0x20 != 0 { result.append(.storageFailed) }
+        if bufferSaturated { result.append(.capacityReached) }
+        if bufferFaults & 0x20 != 0 { result.append(.persistenceErrorRecorded) }
+        return result
+    }
+}
+
 extension DeviceStatus {
     /// Latest BEACON-BOARD firmware this app ships against: the OFFLINE FALLBACK when we have no
     /// manifest, and the default compare target. The live "update available" nudge comes from the
     /// firmware manifest (see FirmwareManifestStore); bump this on a beacon-board release so the
     /// offline path still matches. The Colonel Panic single-board builds (oui-spy / mesh-detect)
     /// track a separate line now that the beacon board has moved ahead - see colonelLatestVersion.
-    static let latestVersion = "2.0.5"
+    static let latestVersion = "2.0.6"
 
     /// Latest firmware for the Colonel Panic single-board builds, which stayed on the shared
     /// acab_version.h default when the beacon board diverged. Offline fallback only; bump on a
     /// Colonel Panic release.
-    static let colonelLatestVersion = "2.0.5"
+    static let colonelLatestVersion = "2.0.6"
 
     /// Just the version number out of `fw` ("ACAB-ouispy 0.1.0" -> "0.1.0").
     var version: String { firmware.split(separator: " ").last.map(String.init) ?? firmware }
@@ -154,12 +264,12 @@ extension DeviceStatus {
     /// True for a Mesh-Detect board (no buzzer; its fw label starts "mesh-detect").
     var isMeshDetect: Bool { firmware.hasPrefix("mesh-detect") }
 
-    /// Installed firmware strictly older than `latest`, compared numerically field-wise
-    /// ("1.7" < "1.10" < "2.0.0"). Pass the manifest's version for this board so the nudge
-    /// tracks the live manifest; the argument defaults to the offline fallback constant so
-    /// existing call sites keep working.
+    /// Installed firmware strictly older than `latest`, using the exact validated numeric core
+    /// the board packs. A suffix does not make an equal core newer, and malformed input fails
+    /// closed instead of presenting an update that the board can only reject.
     func updateAvailable(latest: String = DeviceStatus.latestVersion) -> Bool {
-        version.compare(latest, options: .numeric) == .orderedAscending
+        FirmwareVersionPolicy.isValid(version) && FirmwareVersionPolicy.isValid(latest)
+            && !FirmwareVersionPolicy.isAtLeast(version, latest)
     }
 
     /// Offline-fallback update check (manifest not consulted). Kept as a convenience for any

@@ -2,6 +2,66 @@ import XCTest
 import CoreLocation
 @testable import Beacons
 
+/// A request that delivers response headers and a small prefix, then stays open until URLSession
+/// cancels it. That exercises cancellation while AsyncBytes is waiting for the rest of the body,
+/// rather than a request that happened to finish before the layer switch could act.
+private final class HangingALPRURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    private static var onStart: (() -> Void)?
+    private static var onStop: (() -> Void)?
+
+    static func arm(onStart: @escaping () -> Void, onStop: @escaping () -> Void) {
+        lock.lock()
+        self.onStart = onStart
+        self.onStop = onStop
+        lock.unlock()
+    }
+
+    static func reset() {
+        lock.lock()
+        onStart = nil
+        onStop = nil
+        lock.unlock()
+    }
+
+    private static func fireStart() {
+        lock.lock()
+        let callback = onStart
+        onStart = nil
+        lock.unlock()
+        callback?()
+    }
+
+    private static func fireStop() {
+        lock.lock()
+        let callback = onStop
+        onStop = nil
+        lock.unlock()
+        callback?()
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.fireStart()
+        guard let url = request.url,
+              let response = HTTPURLResponse(
+                url: url,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Length": "4096"]
+              ) else { return }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(repeating: 0x41, count: 1024))
+        // Deliberately no didFinishLoading: cancellation must call stopLoading().
+    }
+
+    override func stopLoading() {
+        Self.fireStop()
+    }
+}
+
 /// Wire-format fixtures for the ALPR dataset parser.
 ///
 /// This parser produced the project's only cross-platform incident. A manifest schema mismatch made
@@ -20,8 +80,14 @@ import CoreLocation
 ///   - Every fixture uses the SAME VECTORS on both sides: same magics, same maker table, same
 ///     coordinates, same maker indices, same tier bytes, same byte surgery at the same offsets, and
 ///     the same expected coords / makers / confirmed.
-///   - Both suites assert the same nil-vs-parsed verdict for every malformation. A guard that
-///     exists on one platform only is precisely the shape of the original incident.
+///   - Both suites assert the same nil-vs-parsed verdict for every malformation they BOTH cover. A
+///     guard that exists on one platform only is precisely the shape of the original incident.
+///     ONE KNOWN EXCEPTION, still open: an invalid UTF-8 byte inside the maker table. Android
+///     rejects the whole file - AlprStore.parse decodes maker names with throwOnInvalidSequence and
+///     returns null - and pins that in testInvalidUtf8MakerIsRejected. This parser's
+///     `String(decoding:as: UTF8.self)` is lossy, so the same bytes parse with U+FFFD in the maker
+///     name, and there is deliberately NO twin fixture here yet: writing one would only freeze the
+///     divergence. Settle one verdict for both parsers first, then add the fixture on both sides.
 ///
 /// COORDINATE RANGE, resolved 2026-08-05 and the reason this suite exists: both parsers DROP an out-of-range coordinate together with its maker and tier. They used to
 /// disagree: iOS dropped, this side kept every node the length check accounted for, so the same
@@ -184,6 +250,102 @@ final class ALPRDatasetTests: XCTestCase {
         XCTAssertFalse(ALPRStore.channelFormatMatches(
             declaredFormat: nil, expectedFormat: "ALP3",
             allowsMissingDeclaredFormat: true, loadedFormat: "ALP2"))
+    }
+
+    /// The layer ships ON: a fresh install (no stored value) resolves to enabled, while a user
+    /// who ever explicitly flipped the toggle keeps that stored choice, in either direction.
+    /// Android's prefs.getBoolean(key, true) carries the same semantics.
+    func testLayerShipsEnabledButAnExplicitStoredChoiceAlwaysWins() {
+        XCTAssertTrue(ALPRStore.resolveStoredEnabled(nil),
+                      "a fresh install must default the mapped-camera layer ON")
+        XCTAssertFalse(ALPRStore.resolveStoredEnabled(false),
+                       "an explicit OFF choice must survive the default change")
+        XCTAssertTrue(ALPRStore.resolveStoredEnabled(true))
+        // UserDefaults bridges Bools through NSNumber; the cast must still read them.
+        XCTAssertFalse(ALPRStore.resolveStoredEnabled(NSNumber(value: false)))
+        // A value of an unexpected type is not an explicit choice; the default applies.
+        XCTAssertTrue(ALPRStore.resolveStoredEnabled("off"))
+    }
+
+    /// setEnabled(false) calls this slot's cancel() before clearing the layer. The retired task's
+    /// completion must not fire after an immediate re-enable, or it can clear/restart the new fetch.
+    func testFetchSlotCancelStopsActiveWorkAndAllowsImmediateReplacement() async {
+        let slot = ALPRFetchSlot()
+        let firstStarted = expectation(description: "first fetch started")
+        let firstCancelled = expectation(description: "first fetch observed cancellation")
+        var retiredCompletionRan = false
+
+        guard let first = slot.start(operation: {
+            firstStarted.fulfill()
+            do {
+                try await Task.sleep(nanoseconds: 30_000_000_000)
+            } catch {
+                XCTAssertTrue(Task.isCancelled)
+                firstCancelled.fulfill()
+            }
+        }, onFinish: {
+            retiredCompletionRan = true
+        }) else { return XCTFail("first fetch did not start") }
+
+        await fulfillment(of: [firstStarted], timeout: 1)
+        XCTAssertTrue(slot.isRunning)
+        slot.cancel()
+        XCTAssertFalse(slot.isRunning)
+
+        var replacementFinished = false
+        guard let replacement = slot.start(operation: {}, onFinish: {
+            replacementFinished = true
+        }) else { return XCTFail("cancelled slot did not accept a replacement") }
+        await replacement.value
+        await fulfillment(of: [firstCancelled], timeout: 1)
+        await first.value
+
+        XCTAssertTrue(replacementFinished)
+        XCTAssertFalse(retiredCompletionRan,
+                       "the cancelled generation must not finish the replacement generation")
+        XCTAssertFalse(slot.isRunning)
+    }
+
+    /// Cancelling the owned fetch task must reach URLSession itself for both request sizes used by
+    /// ALPRStore: the manifest and the up-to-8 MB dataset body. Suppressing publication alone would
+    /// leave this protocol open until its 15/30 second request timeout instead of calling stopLoading.
+    func testBoundedTransfersAbortTheirURLLoadingTaskOnCancellation() async {
+        for (name, limit) in [
+            ("manifest", ALPRStore.maxManifestBytes),
+            ("dataset", ALPRStore.maxDatasetBytes),
+        ] {
+            let started = expectation(description: "\(name) transfer started")
+            let stopped = expectation(description: "\(name) transfer stopped")
+            HangingALPRURLProtocol.arm(
+                onStart: { started.fulfill() },
+                onStop: { stopped.fulfill() }
+            )
+            defer { HangingALPRURLProtocol.reset() }
+
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [HangingALPRURLProtocol.self]
+            var request = URLRequest(url: URL(string: "https://soyboi.tech/data/cancel-test")!)
+            request.timeoutInterval = 30
+            let transfer = Task {
+                try await ALPRStore.boundedData(
+                    for: request,
+                    limit: limit,
+                    configuration: configuration
+                )
+            }
+
+            await fulfillment(of: [started], timeout: 1)
+            transfer.cancel()
+            await fulfillment(of: [stopped], timeout: 1)
+            do {
+                _ = try await transfer.value
+                XCTFail("\(name) transfer completed after cancellation")
+            } catch {
+                XCTAssertTrue(Task.isCancelled || error is CancellationError
+                              || (error as? URLError)?.code == .cancelled)
+            }
+            HangingALPRURLProtocol.reset()
+        }
     }
 
     func testAttributionCopyDistinguishesCanonicalAndLegacyMakerStates() {

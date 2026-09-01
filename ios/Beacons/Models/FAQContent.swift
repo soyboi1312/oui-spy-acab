@@ -4,7 +4,7 @@ import Foundation
 /// binary. No webview, no fetch, no analytics on any help surface, which is the same no-cloud
 /// stance as the rest of the product: opening Help must not tell anyone that you opened Help.
 ///
-/// WHY THIS PARSES JSON INSTEAD OF BEING A SWIFT LITERAL. The content is 20 answers that have to
+/// WHY THIS PARSES JSON INSTEAD OF BEING A SWIFT LITERAL. The answers have to
 /// read identically on iOS and Android. Transcribing them into a Swift enum and a Kotlin object is
 /// two hand-maintained copies of the same prose, and cross-platform copy drift is the single most
 /// recurring defect class in this repo. So one file, `faq-content.json`, is copied verbatim into
@@ -70,7 +70,7 @@ struct FAQContent: Decodable {
     }
 
     /// Case-insensitive substring over question AND answer. Deliberately not fuzzy and not ranked:
-    /// 20 answers is small enough that a plain contains() never surprises anyone, and a clever
+    /// This set is small enough that a plain contains() never surprises anyone, and a clever
     /// matcher that silently drops a result is worse than a dumb one that does not.
     func search(_ query: String) -> [(section: String, question: Question)] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -80,9 +80,12 @@ struct FAQContent: Decodable {
         }
     }
 
-    /// Question ids worth surfacing on a dossier for this device type, or [] for the categories
-    /// the handoff deliberately leaves alone (glasses / body cam already carry an experimental
-    /// note, and stacking a second hedge under it reads as doubt about the detection itself).
+    /// Question ids worth surfacing on a dossier for this device type. Every REAL faqKey now has a
+    /// relatedHelp entry - GLASSES and BODY_CAM got theirs in the v2.0.5 apps release (3347a04),
+    /// ending the earlier reserved-on-purpose state - and check-signature-drift.py derives the key
+    /// list from both DeviceType enums and FAILS CI if a key loses its entry, so a new category's
+    /// JSON row lands in the same commit as its enum case. [] comes back only for nearbyDevice
+    /// and unknown, whose faqKey is "": neither is a category a user has a question about.
     func related(for type: DeviceType) -> [Question] {
         (relatedHelp[type.faqKey] ?? []).compactMap { question(id: $0) }
     }

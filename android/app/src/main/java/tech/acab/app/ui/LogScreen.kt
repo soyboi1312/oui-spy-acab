@@ -99,6 +99,7 @@ import tech.acab.app.model.TimeBasis
 import tech.acab.app.model.displayName
 import tech.acab.app.model.methodLabel
 import tech.acab.app.model.sourceLabel
+import tech.acab.app.model.bufferHealthNotices
 import tech.acab.app.ui.theme.Acab
 import tech.acab.app.ui.theme.tone
 import java.io.File
@@ -180,7 +181,12 @@ fun LogScreen(
     selectedId: String? = null,
     pauseStateKey: String = "main",
 ) {
-    val detections by ble.detections.collectAsState()
+    // Evidence history keeps prior sightings even while an active mute suppresses Status/Map.
+    val detections by ble.logDetections.collectAsState()
+    val ignoredRules by ble.ignored.collectAsState()
+    // A HERE mute can cross its boundary without changing the persisted rule. The active
+    // projection is therefore an invalidation input for the row's current MUTED state.
+    val activeProjection by ble.detections.collectAsState()
     val watermark by ble.seenWatermark.collectAsState()   // recomposes "New only" when it moves
     val status by ble.status.collectAsState()
     val demo by ble.demoMode.collectAsState()
@@ -283,6 +289,10 @@ fun LogScreen(
     val shown = remember(feed, catFilter, scope, rowNewIds) {
         filterLogRows(feed, catFilter, scope, rowNewIds)
     }
+    // O(1) invalidation token; only visible lazy rows evaluate isIgnored. Building a 5,000-row
+    // muted set at the ~3 Hz feed cadence would turn a UI badge into an avoidable hot-path scan.
+    val muteRevision = 31 * System.identityHashCode(ignoredRules) +
+        System.identityHashCode(activeProjection)
 
     fun exitSelect() { selectMode = false; selected = emptySet() }
 
@@ -399,6 +409,9 @@ fun LogScreen(
                     Text("Logbook", color = Acab.text, fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
                     Kicker("${detections.size} DETECTED · $newCount NEW")
                 }
+                // Board-side loss/censoring flags belong beside the evidence, not buried in
+                // settings. They are persistent and intentionally cannot be dismissed locally.
+                status?.bufferHealthNotices?.forEach { BufferHealthBanner(it) }
                 // Labeled action chips, like the iOS header; hidden until there's data and
                 // during select mode (a stray SELECT re-tap would wipe the checks, and MARK
                 // SEEN would clear the new-dots mid-triage).
@@ -434,9 +447,13 @@ fun LogScreen(
                                     onClick = { exportMenuOpen = false; exportLog(true) })
                             }
                         }
-                        // scope resets to ALL so the user is never stranded on an empty NEW lens
-                        ActionChip(Icons.Filled.DoneAll, "MARK SEEN") {
-                            ble.markAllSeen(); scope = LogScope.All
+                        // Demo rows are disposable and must never advance the real persisted New
+                        // watermark that is restored when sample mode exits.
+                        if (!demo) {
+                            // scope resets to ALL so the user is never stranded on an empty NEW lens
+                            ActionChip(Icons.Filled.DoneAll, "MARK SEEN") {
+                                ble.markAllSeen(); scope = LogScope.All
+                            }
                         }
                     }
                 }
@@ -465,17 +482,22 @@ fun LogScreen(
                     // same confirmation, quiet styling so it isn't a mis-tap magnet. Icon-only
                     // (trash reads on its own): with the three counted seg chips to the left, a
                     // worded chip is what made "CLEAR" wrap mid-word on a 411dp-wide screen.
-                    Row(
-                        Modifier
-                            .minimumInteractiveComponentSize()
-                            .clip(RoundedCornerShape(50))
-                            .border(1.dp, Acab.line, RoundedCornerShape(50))
-                            .clickable { confirmClear = true }
-                            .padding(horizontal = 10.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(Icons.Filled.DeleteOutline, contentDescription = "Clear log",
-                            tint = Acab.dim, modifier = Modifier.size(15.dp))
+                    // Sample mode covers the real in-memory store with disposable rows. Hide the
+                    // destructive affordance so its copy never implies the retained disk log will
+                    // be erased; the manager also guards the persistence boundary defensively.
+                    if (!demo) {
+                        Row(
+                            Modifier
+                                .minimumInteractiveComponentSize()
+                                .clip(RoundedCornerShape(50))
+                                .border(1.dp, Acab.line, RoundedCornerShape(50))
+                                .clickable { confirmClear = true }
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(Icons.Filled.DeleteOutline, contentDescription = "Clear log",
+                                tint = Acab.dim, modifier = Modifier.size(15.dp))
+                        }
                     }
                 }
             }
@@ -566,6 +588,7 @@ fun LogScreen(
                     DetectionRow(
                         d = d,
                         timeBasis = timeBases[d.id],
+                        muted = remember(d.mac, muteRevision) { ble.isMutedForProjection(d.mac) },
                         selectMode = selectMode,
                         checked = d.id in selected,
                         onClick = {
@@ -591,7 +614,15 @@ fun LogScreen(
             onSelectAll = { selected = shown.mapTo(HashSet(shown.size)) { it.id } },
             onIgnore = {
                 val toIgnore = detections.filter { it.id in selected }
-                ble.ignoreDevices(toIgnore)
+                val refused = ble.ignoreDevices(toIgnore)
+                val requested = toIgnore.map { it.mac.lowercase() }.distinct().size
+                val muted = (requested - refused).coerceAtLeast(0)
+                val message = if (refused == 0) {
+                    "$muted device${if (muted == 1) "" else "s"} muted. Existing history was kept."
+                } else {
+                    "$muted muted; $refused couldn't be added because the muted-device list is full."
+                }
+                Toast.makeText(context.applicationContext, message, Toast.LENGTH_LONG).show()
                 exitSelect()
             },
         )
@@ -599,7 +630,7 @@ fun LogScreen(
 
     // Destructive log wipe needs a confirmation, with an export-first escape hatch. R6: a bottom
     // sheet with FULL-WIDTH STACKED buttons, so the three wide mono labels never crowd one row.
-    if (confirmClear) {
+    if (confirmClear && !demo) {
         ModalBottomSheet(
             onDismissRequest = { confirmClear = false },
             containerColor = Acab.bg3,
@@ -632,7 +663,19 @@ fun LogScreen(
                 Button(
                     // Drop the frozen snapshot too, or a paused screen would keep showing rows
                     // the user just cleared from the store.
-                    onClick = { ble.clearLog(); pauseVm.resume(); confirmClear = false },
+                    onClick = {
+                        val cleared = ble.clearLog()
+                        if (cleared) {
+                            pauseVm.resume()
+                            confirmClear = false
+                        } else {
+                            Toast.makeText(
+                                context.applicationContext,
+                                "Couldn't finish clearing the log yet. The app will retry safely; don't assume the history is gone.",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                    },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Acab.accent, contentColor = Acab.onAccent),
@@ -824,12 +867,15 @@ private fun CategoryTile(
 private fun DetectionRow(
     d: Detection,
     timeBasis: TimeBasis?,
+    muted: Boolean,
     selectMode: Boolean,
     checked: Boolean,
     onClick: () -> Unit,
 ) {
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 11.dp),
+        Modifier.fillMaxWidth().clickable(onClick = onClick)
+            .semantics { if (muted) stateDescription = "Muted, history retained" }
+            .padding(vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (selectMode) {
@@ -867,6 +913,7 @@ private fun DetectionRow(
                 // + last-4 label" that had never existed.
                 Text("NODE ${d.mac.replace(":", "").takeLast(4).uppercase()}",
                     color = Acab.dim, fontSize = 11.sp, fontFamily = Acab.mono)
+                if (muted) MutedTag()
                 if (d.type.isExperimental) ExpTag()
                 if (d.offline) OfflineTag()
                 // A dense row has no space to explain itself, so it flags that this record's
@@ -958,6 +1005,25 @@ private fun OfflineTag() {
     )
 }
 
+/** A current mute suppresses active alerts/surfaces, but this retained evidence row remains
+ * inspectable. The badge and row state make that distinction visible and spoken. */
+@Composable
+private fun MutedTag() {
+    Text(
+        "MUTED",
+        color = Acab.dim,
+        fontSize = 9.sp,
+        letterSpacing = 1.sp,
+        fontWeight = FontWeight.Bold,
+        fontFamily = Acab.mono,
+        modifier = Modifier
+            .semantics { contentDescription = "Muted device" }
+            .background(Acab.bg3, RoundedCornerShape(4.dp))
+            .border(1.dp, Acab.lineStrong, RoundedCornerShape(4.dp))
+            .padding(horizontal = 5.dp, vertical = 2.dp),
+    )
+}
+
 /** Amber clock pill for an offline-stamped location, with the fix age. */
 @Composable
 private fun GpsAgeBadge(age: String) {
@@ -996,7 +1062,7 @@ private fun ConfidenceBadge(pct: Int) {
     }
 }
 
-/** Floating action bar shown in select mode: cancel, count, select-all, and ignore-selected. */
+/** Floating action bar shown in select mode: cancel, count, select-all, and mute-selected. */
 @Composable
 private fun SelectBar(count: Int, onCancel: () -> Unit, onSelectAll: () -> Unit, onIgnore: () -> Unit) {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
@@ -1045,7 +1111,7 @@ private fun SelectBar(count: Int, onCancel: () -> Unit, onSelectAll: () -> Unit,
             ) {
                 Icon(Icons.Filled.NotificationsOff, contentDescription = null,
                     tint = if (enabled) Acab.onAccent else Acab.faint, modifier = Modifier.size(14.dp))
-                Text("IGNORE", color = if (enabled) Acab.onAccent else Acab.faint,
+                Text("MUTE", color = if (enabled) Acab.onAccent else Acab.faint,
                     fontSize = 11.sp, letterSpacing = 0.5.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
             }
         }

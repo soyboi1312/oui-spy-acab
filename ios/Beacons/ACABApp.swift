@@ -20,11 +20,14 @@ struct ACABApp: App {
                     // Non-blocking: refresh the firmware manifest in the background so the
                     // Device screen can show the live "latest" and offer OTA when eligible.
                     manifest.refreshIfNeeded()
-                    // Freshen the known-ALPR map layer only if the user opted in (no-op otherwise).
+                    // Freshen the known-ALPR map layer while it is enabled (the default;
+                    // a no-op for users who explicitly turned the layer off).
                     alpr.refresh()
                     #if DEBUG
                     // Launch with `-demo` in the scheme to load canned detections.
-                    if ProcessInfo.processInfo.arguments.contains("-demo") { ble.seedDemoData() }
+                    if ProcessInfo.processInfo.arguments.contains("-demo") {
+                        ble.seedDemoData(showTour: false)
+                    }
                     #endif
                     // Cold launch: reconcile here too, not only from the scenePhase change below.
                     // This is the launch that has to RESUME Drive mode after a force-quit, and

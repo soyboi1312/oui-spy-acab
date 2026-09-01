@@ -33,8 +33,8 @@ android {
         // Device and Detail, orientation changes, the Drive foreground service, and large-screen
         // layout all need eyes on a real 16 device.
         targetSdk = 36
-        versionCode = 25
-        versionName = "2.0.5.1"
+        versionCode = 26
+        versionName = "2.0.6"
     }
 
     signingConfigs {
@@ -116,16 +116,27 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+    // Home-screen launcher widget surface. widgetCategory is deliberately home_screen ONLY -
+    // keyguard hosting was reverted as a privacy regression; see res/xml/widget_beacons_info.xml.
+    implementation("androidx.glance:glance-appwidget:1.1.1")
 
     // OpenStreetMap, no Google dependency. Wired in when the map screen lands.
     implementation("org.osmdroid:osmdroid-android:6.1.20")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 
-    // Local JVM unit tests. The only suite here is the follow-evidence parity fixture set, which is
-    // the ACTUAL guarantee that the Android and iOS scorers band the same journey the same way: the
-    // scorer is deliberately pure Kotlin with no Android types, so it runs on a plain JVM against
-    // the same vectors the Swift side asserts. Run with `./gradlew :app:testDebugUnitTest`.
+    // Local JVM unit tests: the policy, parser and parity fixtures under
+    // src/test/java/tech/acab/app/{ble,model,net,ui}, written against logic that is kept free of
+    // Android framework calls so it runs on a plain JVM. They cover, among others, the OTA
+    // URL-trust and bounded-read gates, the status-JSON contract rules, the ALPR dataset wire
+    // format, the contribution CSV and log-export lenses, and the map-pin rules. SEVERAL of those
+    // are cross-platform parity contracts, run against the same vectors the Swift side asserts, so
+    // a change to any of them is a change on both phones: follow-evidence, map-pin, the ALPR peek
+    // radius and the ALPR dataset wire format. Follow-evidence is the clearest worked example - it
+    // is the ACTUAL guarantee that the Android and iOS scorers band the same journey the same way -
+    // but calling it THE cross-platform one is how the other three drift.
+    // `./gradlew :app:testDebugUnitTest` runs the whole source set, which is what
+    // the release workflow gates on before anything is signed.
     testImplementation("junit:junit:4.13.2")
     // Real org.json on the unit-test classpath. Android's bundled org.json is a STUB in local unit
     // tests: every method throws "not mocked", so any test that parses a status or detection JSON

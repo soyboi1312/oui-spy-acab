@@ -1,14 +1,16 @@
 # All Cameras Are Beacons, Android
 
-Native Kotlin + Jetpack Compose companion for the OUI-Spy ACAB board, the Android
-counterpart to the iOS app in `../ios`. It talks to the same firmware over the
-same encrypted BLE GATT service (`../docs/ble-protocol.md`).
+Native Kotlin + Jetpack Compose companion for the beacon, OUI-Spy, and Mesh-Detect
+boards, and the Android counterpart to the iOS app in `../ios`. It talks to the
+same firmware over the same encrypted BLE GATT service (`../docs/ble-protocol.md`).
 
-The app is the free, open-source companion to the beacon (the sold hardware), and
-still works with DIY XIAO builds. It surfaces what the beacon detects: body cams
+The app is the free, open-source companion to the beacon (the planned retail hardware),
+and still works with DIY XIAO builds. It surfaces what the beacon detects: body cams
 on by default, mapped ALPR awareness, drones, recording glasses, opt-in BLE item
 trackers and network cameras, and encrypted offline-buffer replay of hits logged
 while your phone was away.
+
+Install the published app from [Google Play](https://play.google.com/store/apps/details?id=tech.soyboi.beacons).
 
 ## Status
 
@@ -33,7 +35,7 @@ Working end to end. Done:
   browser flasher. Proven on real hardware.
 
 Still TODO:
-- Getting onto the Play Store / F-Droid (see below).
+- F-Droid packaging.
 
 ## Build & run
 
@@ -76,10 +78,8 @@ but not for sharing widely or for the Play Store. For a real release:
    - `./gradlew :app:assembleRelease` for a signed **APK** to sideload or hand out.
    - `./gradlew :app:bundleRelease` for an **AAB**, the format the Play Store wants.
 
-Getting it onto the **Play Store** also needs a one-time **$25** Google Play
-developer account, a store listing (a real icon, screenshots, description, privacy
-policy), and a data-safety form. The listen-only, BLE-only design keeps that form
-short, but the **ACAB** name may draw review scrutiny, same as on iOS.
+The public [Google Play listing](https://play.google.com/store/apps/details?id=tech.soyboi.beacons)
+is live. Store updates use the signed AAB from the protected release workflow.
 
 ## Notes
 

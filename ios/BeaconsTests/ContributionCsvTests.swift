@@ -193,13 +193,34 @@ final class ContributionCsvTests: XCTestCase {
     }
 
     func testProductionHeader_containsAllSevenPolicyColumns() {
+        // Pinned against the EMITTER's own list, not just against this file's copy of it: a rename
+        // in the exporter used to leave the whole suite green while the real export shifted, and a
+        // rename is precisely the change that would leave a coordinate unblanked. Android twin:
+        // productionHeader_isTheFixture_andCarriesAllSevenPolicyColumns.
         let productionHeader = BLEManager.buildCSV([]).components(separatedBy: "\n")[0]
         let policyColumns = ContributionCsv.observerLocationCols
             .union(ContributionCsv.droneLocationCols)
             .union(ContributionCsv.operatorLocationCols)
+        XCTAssertEqual(ContributionCsv.detectionColumns, cols)
         XCTAssertEqual(productionHeader, header)
         XCTAssertEqual(policyColumns.count, 7)
         XCTAssertTrue(Set(productionHeader.components(separatedBy: ",")).isSuperset(of: policyColumns))
+    }
+
+    func testRenamedPolicyColumn_failsClosed_ratherThanSharingTheOriginal() {
+        // Belt to the braces above: if the emitter and the policy sets ever do drift, a requested
+        // column the header does not carry falls back to the header, exactly like malformed input.
+        // Returning the ORIGINAL csv there shipped approx_lat under its new name, in a file whose
+        // disclosure says the observer position was removed. Android twin:
+        // renamedPolicyColumn_failsClosed_ratherThanSharingTheOriginal.
+        let renamed = header.replacingOccurrences(of: "approx_lat", with: "observer_lat")
+        let csv = renamed + "\n" + sample().components(separatedBy: "\n")[1]
+        let redacted = ContributionCsv.redact(csv, blankColumns:
+            ContributionCsv.blankColumns(includeObserverLocation: false, includeDroneLocation: true,
+                                         includeOperatorLocation: true))
+        XCTAssertEqual(redacted, renamed)
+        // A partly-matching policy fails closed too: half a policy applied is not the policy.
+        XCTAssertEqual(ContributionCsv.redact(csv, blankColumns: ["approx_lat", "approx_lon"]), renamed)
     }
 
     func testCaptureWindowOverlapSemantics() {

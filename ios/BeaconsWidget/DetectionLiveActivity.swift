@@ -61,6 +61,16 @@ private enum DetCat: String, CaseIterable {
         case .camera:  return "CAM"
         }
     }
+    var spokenLabel: String {
+        switch self {
+        case .alpr: return "automatic license plate readers"
+        case .drone: return "drones"
+        case .bodyCam: return "body cameras"
+        case .tracker: return "item trackers"
+        case .glasses: return "recording glasses"
+        case .camera: return "network cameras"
+        }
+    }
     func count(_ s: DetectionActivityAttributes.DetectionState) -> Int {
         switch self {
         case .alpr:    return s.alpr
@@ -77,8 +87,10 @@ private enum DetCat: String, CaseIterable {
 ///
 /// A zero under an enabled detector means "watching, nothing found" and is worth showing. A zero
 /// under a disabled one implies coverage that is not running, which is why this is driven off the
-/// board's toggles rather than off the counts. Falls back to the historical five when the enabled
-/// set is empty (older app build, or status not yet received), so the widget is never blank.
+/// board's toggles rather than off the counts. Falls back to the historical five only when
+/// `enabled` is nil (no status yet, or an activity started by a build that predates the field);
+/// an EMPTY set means every detector is genuinely off and draws no columns - the call sites
+/// render "all detectors off" instead.
 private func visibleCats(_ s: DetectionActivityAttributes.DetectionState) -> [DetCat] {
     // nil = no status yet -> fall back to the historical five rather than render nothing.
     // [] = every detector genuinely OFF -> draw NOTHING. Those two cases used to collapse into the
@@ -91,7 +103,7 @@ private func visibleCats(_ s: DetectionActivityAttributes.DetectionState) -> [De
 
 /// Dynamic Island slots go to whichever buckets are actually firing: leading and
 /// trailing get the top two by live count, expanded bottom-left gets the third.
-/// Zero-count buckets never claim a slot, so all five (including glasses) are
+/// Zero-count buckets never claim a slot, so all six (glasses and cameras included) are
 /// reachable; when everything is zero the first three fall back in fixed order.
 private func rankedCats(_ s: DetectionActivityAttributes.DetectionState) -> [DetCat] {
     // Imperative on purpose: the chained tuple map/sort was too much for the type-checker.
@@ -108,7 +120,13 @@ private func rankedCats(_ s: DetectionActivityAttributes.DetectionState) -> [Det
     return live.map { $0.cat }
 }
 
-/// Tapping any Drive Mode surface deep-links into the app's Log tab with the NEW
+/// VoiceOver should never announce "1 detections" on a glanceable count surface.
+private func detectionCountPhrase(_ count: Int, nearby: Bool = false) -> String {
+    let noun = count == 1 ? "detection" : "detections"
+    return nearby ? "\(count) nearby \(noun)" : "\(count) \(noun)"
+}
+
+/// Tapping any Live Mode surface deep-links into the app's Log tab with the NEW
 /// filter armed (RootView routes the URL, DetectionsView reads the pending flag).
 private let driveModeDeepLink = URL(string: "beacons://log/new")
 
@@ -120,7 +138,7 @@ private let driveModeDeepLink = URL(string: "beacons://log/new")
 //     panel edge-to-edge in StandBy (charging + landscape dock).
 // Landscape Dynamic Island rendering itself is automatic on iOS 27, no code needed.
 
-/// The Drive-mode detection counter, presented on the Lock Screen and in the
+/// The Live Mode detection counter, presented on the Lock Screen and in the
 /// Dynamic Island. One ActivityConfiguration drives both surfaces.
 struct DetectionLiveActivity: Widget {
     var body: some WidgetConfiguration {
@@ -144,7 +162,7 @@ struct DetectionLiveActivity: Widget {
                 }
                 DynamicIslandExpandedRegion(.center) {
                     VStack(spacing: 1) {
-                        Text(s.connected ? "DRIVE MODE" : "RECONNECTING")
+                        Text(s.connected ? "LIVE MODE" : "RECONNECTING")
                             .font(WidgetTheme.mono(9)).tracking(1.6)
                             .foregroundStyle(s.connected ? Color.white.opacity(0.6) : WidgetTheme.amber)
                         Text("\(s.total)")
@@ -152,6 +170,8 @@ struct DetectionLiveActivity: Widget {
                             .monospacedDigit()
                     }
                     .widgetURL(driveModeDeepLink)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Live Mode, \(detectionCountPhrase(s.total, nearby: true))")
                 }
                 DynamicIslandExpandedRegion(.bottom) {
                     HStack(spacing: 12) {
@@ -180,12 +200,15 @@ struct DetectionLiveActivity: Widget {
                 Image(systemName: s.connected ? "shield.lefthalf.filled" : "arrow.triangle.2.circlepath")
                     .foregroundStyle(s.total > 0 ? WidgetTheme.crimson : Color.white.opacity(0.6))
                     .widgetURL(driveModeDeepLink)
+                    .accessibilityLabel(s.connected ? "Live Mode active" : "Live Mode reconnecting")
             } compactTrailing: {
                 Text("\(s.total)").font(WidgetTheme.digits(15)).monospacedDigit()
+                    .accessibilityLabel(detectionCountPhrase(s.total, nearby: true))
             } minimal: {
                 Text("\(s.total)").font(WidgetTheme.digits(15)).monospacedDigit()
                     .foregroundStyle(s.total > 0 ? WidgetTheme.crimson : Color.white)
                     .widgetURL(driveModeDeepLink)
+                    .accessibilityLabel("Live Mode, \(detectionCountPhrase(s.total, nearby: true))")
             }
             .keylineTint(WidgetTheme.crimson)
         }
@@ -230,6 +253,9 @@ private struct SmallCell: View {
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Live Mode. \(detectionCountPhrase(state.total, nearby: true)). \(stateLabel).")
+        .accessibilityHint("Opens the new detections log")
     }
 
     private var stateLabel: String {
@@ -256,7 +282,7 @@ private struct LockScreenView: View {
             HStack(spacing: 6) {
                 Image(systemName: "shield.lefthalf.filled")
                     .font(.system(size: 13, weight: .semibold)).foregroundStyle(WidgetTheme.crimson)
-                Text("BEACONS · DRIVE MODE")
+                Text("BEACONS · LIVE MODE")
                     .font(WidgetTheme.mono(10)).tracking(1.6)
                     .foregroundStyle(.white.opacity(0.6))
                 Spacer()
@@ -270,14 +296,17 @@ private struct LockScreenView: View {
                         .font(.system(size: 15)).foregroundStyle(.white.opacity(0.45))
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("End Live Mode")
+                .accessibilityHint("Removes Live Mode from supported system surfaces")
             }
             if state.redact {
-                // Lock-Screen privacy (user setting, default on): no counts or per-category
-                // breakdown on a locked phone, so a glance reveals nothing about what's being
-                // detected. Full counts still show in the Dynamic Island and in the app.
+                // Lock-Screen privacy (user setting, ships OFF so counts are visible unless the
+                // user hides them): when ON, no counts or per-category breakdown on a locked
+                // phone, so a glance reveals nothing about what's being detected. Full counts
+                // still show in the Dynamic Island and in the app.
                 HStack(spacing: 7) {
                     Image(systemName: "lock.fill").font(.system(size: 11)).foregroundStyle(.white.opacity(0.55))
-                    Text(state.connected ? "Drive mode active · counts hidden" : "Reconnecting…")
+                    Text(state.connected ? "Live Mode active · counts hidden" : "Reconnecting…")
                         .font(.system(size: 12, weight: .medium)).foregroundStyle(.white.opacity(0.7))
                     Spacer(minLength: 0)
                 }
@@ -331,6 +360,8 @@ private struct StatTile: View {
                 .foregroundStyle(n > 0 ? cat.tint : .white.opacity(0.35))
         }
         .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(cat.spokenLabel), \(detectionCountPhrase(n))")
     }
 }
 
@@ -346,5 +377,7 @@ private struct StatBadge: View {
                 .foregroundStyle(n > 0 ? cat.tint : Color.white.opacity(0.6))
             Text("\(n)").font(WidgetTheme.digits(15)).monospacedDigit()
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(cat.spokenLabel), \(detectionCountPhrase(n))")
     }
 }

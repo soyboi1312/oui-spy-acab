@@ -25,6 +25,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Inventory2
+import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Memory
@@ -59,6 +60,7 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -109,8 +111,12 @@ fun MainScreen(
     initialTab: Int = 0,
     initialLogFilter: LogFilter? = null,
     reconnecting: Boolean = false,
+    locationGranted: Boolean = false,
+    notificationsAvailable: Boolean = false,
+    onRequestLocation: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
+    val demoMode by ble.demoMode.collectAsState()
     // Saveable: no configChanges are declared, so a dark-theme flip or multi-window resize
     // recreates the activity; without this the shell would snap back to the Status tab
     // (iOS SwiftUI state survives the equivalent).
@@ -140,6 +146,9 @@ fun MainScreen(
     // rotation right after a deep link must restore the same lens, not silently reset it.
     var logFilterSeed by rememberSaveable(stateSaver = LogFilterSeedSaver) { mutableStateOf(initialLogFilter) }
     var logScreenKey by rememberSaveable { mutableIntStateOf(0) }
+    var openDetectorsToken by rememberSaveable { mutableIntStateOf(0) }
+    var openHelpToken by rememberSaveable { mutableIntStateOf(0) }
+    var openReadinessToken by rememberSaveable { mutableIntStateOf(0) }
 
     // The paused-Log feed lives in an activity-scoped ViewModel keyed by a FIXED string (see
     // LogScreen pauseStateKey = "main"), so it survives tab switches but is NOT reset by the
@@ -163,6 +172,21 @@ fun MainScreen(
         setSelected(null)
         tab = Tab.LOG.ordinal
     }
+    val openDetectorSettings: () -> Unit = {
+        openDetectorsToken++
+        setSelected(null)
+        tab = Tab.DEVICE.ordinal
+    }
+    val openHelp: () -> Unit = {
+        openHelpToken++
+        setSelected(null)
+        tab = Tab.DEVICE.ordinal
+    }
+    val openSetup: () -> Unit = {
+        openReadinessToken++
+        setSelected(null)
+        tab = Tab.DEVICE.ordinal
+    }
 
     // "Open in map" jump from a dossier's location thumbnail. The coordinate is stashed here
     // so the request survives the Map tab not being composed yet; MapScreen consumes it
@@ -184,8 +208,8 @@ fun MainScreen(
     // tabs so it's seen on reconnect regardless of the active tab; cleared only by its own
     // view/dismiss buttons, so a tab switch can't silently discard the one-shot count (iOS parity).
     val offlineBanner by ble.offlineSyncBanner.collectAsState()
-    // Board-side replay shortfall (begin.n promised vs end.n sent): rides the same banner as a
-    // disclosure, because the skipped records are gone from the ring and no retry can refill them.
+    // Board-side replay shortfall (begin.n promised vs end.n sent): rides the same banner as an
+    // attempt-level disclosure. The blocked row remains uncommitted in the ring for a later sync.
     val offlineUnreplayed by ble.offlineSyncUnreplayed.collectAsState()
 
     // Drive-mode notification tap (F27): land on the Log tab with the NEW filter active.
@@ -205,7 +229,9 @@ fun MainScreen(
 
     // R8: if a dossier is open in the two-pane and its detection vanishes (clear log / bulk-ignore),
     // drop the selection so the pane returns to the placeholder instead of a stale dossier.
-    val detections by ble.detections.collectAsState()
+    // Selection belongs to the evidence log, not the active nearby projection. Muting a device
+    // removes it from Status/Map but must not make an open dossier vanish or break rotation restore.
+    val detections by ble.logDetections.collectAsState()
     LaunchedEffect(detections) {
         // Restore leg first: re-resolve a rotation-restored dossier id once, against the first
         // log pass after recreation. A missing row restores to "no dossier", never an error.
@@ -215,8 +241,10 @@ fun MainScreen(
             // stale id would zombie-restore on the next rotation.
             setSelected(detections.firstOrNull { it.id == id })
         }
-        // sid hoisted: Detection.id is a computed getter, and rebuilding it per compared row
-        // doubled this ~3 Hz scan's string churn while a dossier is open
+        // sid hoisted out of the closure so this ~3 Hz membership scan compares against a local
+        // rather than re-reading through the optional on every compared row. Detection.id is a
+        // plain stored val (see the id initializer in Models.kt), so nothing is allocated either
+        // way: the hoist saves a field load, not string churn.
         selected?.let { s ->
             val sid = s.id
             if (detections.none { it.id == sid }) setSelected(null)
@@ -248,6 +276,16 @@ fun MainScreen(
                 onMapFocusConsumed = { mapFocus = null },
                 onOpenInMap = openInMap,
                 onOpenLogCategory = openLogCategory,
+                onOpenDetectorSettings = openDetectorSettings,
+                onOpenHelp = openHelp,
+                onOpenSetup = openSetup,
+                openDetectorsToken = openDetectorsToken,
+                openHelpToken = openHelpToken,
+                openReadinessToken = openReadinessToken,
+                demoMode = demoMode,
+                locationGranted = locationGranted,
+                notificationsAvailable = notificationsAvailable,
+                onRequestLocation = onRequestLocation,
                 onSelect = { setSelected(it) },
                 modifier = modifier,
             )
@@ -301,12 +339,24 @@ fun MainScreen(
                         )
                     }
                 }
-                tabBody(wide, detailWidth, Modifier.weight(1f).fillMaxSize())
+                Column(Modifier.weight(1f).fillMaxSize()) {
+                    // Reserve real layout space for the sample escape hatch. The former overlay
+                    // sat directly on top of every screen's title and first controls.
+                    if (demoMode && !fullScreenDetailOpen) {
+                        SampleDataBanner(onExit = { ble.exitDemo() }, includeStatusInset = false)
+                    }
+                    tabBody(wide, detailWidth, Modifier.weight(1f).fillMaxSize())
+                }
             }
         } else {
             Scaffold(
                 modifier = baseSemanticsModifier,
                 containerColor = Acab.bg,
+                topBar = {
+                    if (demoMode && !fullScreenDetailOpen) {
+                        SampleDataBanner(onExit = { ble.exitDemo() })
+                    }
+                },
                 bottomBar = {
                     NavigationBar(containerColor = Acab.bg2) {
                         Tab.entries.forEachIndexed { i, t ->
@@ -337,13 +387,20 @@ fun MainScreen(
         BackHandler(enabled = selected != null) { setSelected(null) }
         if (fullScreenDetailOpen) {
             selected?.let { d ->
-                DetailScreen(d, ble, onBack = { setSelected(null) }, onOpenInMap = openInMap)
+                DetailScreen(
+                    detection = d,
+                    ble = ble,
+                    onBack = { setSelected(null) },
+                    onOpenInMap = openInMap,
+                    locationGranted = locationGranted,
+                    onRequestLocation = onRequestLocation,
+                )
             }
         }
 
         // Reconnect count banner, pinned near the top over whatever tab is showing. "view"
         // reuses the Live-Activity deep-link path (openLogNew) to land on the Log/NEW lens.
-        if (!fullScreenDetailOpen) offlineBanner?.let { n ->
+        if (!fullScreenDetailOpen && !demoMode) offlineBanner?.let { n ->
             OfflineSyncBanner(
                 n = n,
                 unreplayed = offlineUnreplayed,
@@ -359,6 +416,48 @@ fun MainScreen(
 
         if (reconnecting) {
             ReconnectingBanner(Modifier.align(Alignment.TopCenter))
+        }
+    }
+}
+
+/** Always-visible escape hatch while the synthetic store is active. */
+@Composable
+private fun SampleDataBanner(
+    onExit: () -> Unit,
+    modifier: Modifier = Modifier,
+    includeStatusInset: Boolean = true,
+) {
+    Box(
+        modifier.fillMaxWidth()
+            .then(if (includeStatusInset) Modifier.statusBarsPadding() else Modifier)
+            .padding(Acab.pad),
+        contentAlignment = Alignment.TopCenter,
+    ) {
+        Row(
+            Modifier.widthIn(max = 640.dp).fillMaxWidth()
+                .background(Acab.bg2, RoundedCornerShape(Acab.radiusSm))
+                .border(1.dp, Acab.accent.copy(alpha = 0.55f), RoundedCornerShape(Acab.radiusSm))
+                .padding(start = 14.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "sample data, not nearby devices",
+                color = Acab.text,
+                fontSize = 11.sp,
+                fontFamily = Acab.mono,
+                modifier = Modifier.weight(1f),
+            )
+            Box(
+                Modifier.minimumInteractiveComponentSize()
+                    .clip(RoundedCornerShape(50))
+                    .border(1.dp, Acab.lineStrong, RoundedCornerShape(50))
+                    .clickable(onClick = onExit)
+                    .padding(horizontal = 12.dp, vertical = 7.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("EXIT SAMPLE DATA", color = Acab.accent, fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+            }
         }
     }
 }
@@ -420,9 +519,9 @@ private fun OfflineSyncBanner(n: Int, unreplayed: Int = 0, onView: () -> Unit, o
                 tint = Acab.accent, modifier = Modifier.size(16.dp))
             Spacer(Modifier.width(10.dp))
             Text(
-                // The unreplayed clause is a DISCLOSURE, not a retry prompt: those records were
-                // consumed from the board's ring and skipped (over-MTU), so no retry can refill
-                // them. Kept byte-identical to iOS OfflineSyncBannerView.message.
+                // The unreplayed clause describes THIS attempt, not permanent evidence loss: an
+                // over-MTU row remains uncommitted in the board's ring and a later sync can retry
+                // it. Kept byte-identical to iOS OfflineSyncBannerView.message.
                 when {
                     n == 0 && unreplayed > 0 ->
                         (if (unreplayed == 1) "1 buffered detection couldn't be replayed from the beacon"
@@ -480,6 +579,16 @@ private fun TabBody(
     onMapFocusConsumed: () -> Unit,
     onOpenInMap: (Double, Double) -> Unit,
     onOpenLogCategory: (String) -> Unit,
+    onOpenDetectorSettings: () -> Unit,
+    onOpenHelp: () -> Unit,
+    onOpenSetup: () -> Unit,
+    openDetectorsToken: Int,
+    openHelpToken: Int,
+    openReadinessToken: Int,
+    demoMode: Boolean,
+    locationGranted: Boolean,
+    notificationsAvailable: Boolean,
+    onRequestLocation: () -> Unit,
     onSelect: (Detection?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -490,7 +599,12 @@ private fun TabBody(
         stateHolder.SaveableStateProvider(Tab.entries[tab].name) {
         when (Tab.entries[tab]) {
             Tab.STATUS -> StatusScreen(ble, onSelect = { onSelect(it) },
-                onOpenLogCategory = onOpenLogCategory)
+                onOpenLogCategory = onOpenLogCategory,
+                onOpenDetectorSettings = onOpenDetectorSettings,
+                onOpenHelp = onOpenHelp,
+                locationGranted = locationGranted,
+                notificationsAvailable = notificationsAvailable,
+                onOpenSetup = onOpenSetup)
             Tab.MAP -> {
                 // T5: keep the pin visible by parking the dossier in a right rail; the map
                 // stays full-width until something is selected. ONE MapScreen call site
@@ -504,11 +618,19 @@ private fun TabBody(
                     Box(Modifier.weight(1f).fillMaxSize()) {
                         MapScreen(ble, onSelect = { onSelect(it) },
                             focus = mapFocus, onFocusConsumed = onMapFocusConsumed)
+                        if (!locationGranted && !demoMode) {
+                            LocationContextBanner(
+                                onAllow = onRequestLocation,
+                                modifier = Modifier.align(Alignment.TopCenter),
+                            )
+                        }
                     }
                     if (wide && selected != null) {
                         Box(Modifier.width(detailWidth).fillMaxSize()) {
                             DetailScreen(selected, ble, onBack = { onSelect(null) },
-                                onOpenInMap = onOpenInMap)
+                                onOpenInMap = onOpenInMap,
+                                locationGranted = locationGranted,
+                                onRequestLocation = onRequestLocation)
                         }
                     }
                 }
@@ -526,7 +648,14 @@ private fun TabBody(
                 // re-key (openLogNew) does not dispose it and empty the NEW lens; and opening a
                 // dossier keeps tab == LOG, so drilling into a row never counts as leaving.
                 // Mirrors iOS MainTabView.onChange(of: tab). markAllSeen is a cheap locked read.
-                DisposableEffect(Unit) { onDispose { ble.markAllSeen() } }
+                // Capture the mode when this Log composition is created. exitDemo flips the
+                // manager's demo flag before Compose disposes this branch; checking only inside
+                // markAllSeen at disposal time would therefore let sample navigation advance the
+                // genuine persisted watermark during the exit edge.
+                val openedInDemo = demoMode
+                DisposableEffect(Unit) {
+                    onDispose { if (!openedInDemo) ble.markAllSeen() }
+                }
                 Row(Modifier.fillMaxSize()) {
                     val listWidth = if (wide) Modifier.width(380.dp) else Modifier.weight(1f)
                     Box(listWidth.fillMaxSize()) {
@@ -546,14 +675,59 @@ private fun TabBody(
                         Box(Modifier.weight(1f).fillMaxSize()) {
                             selected?.let {
                                 DetailScreen(it, ble, onBack = { onSelect(null) },
-                                    onOpenInMap = onOpenInMap)
+                                    onOpenInMap = onOpenInMap,
+                                    locationGranted = locationGranted,
+                                    onRequestLocation = onRequestLocation)
                             } ?: EmptyDetailPlaceholder()
                         }
                     }
                 }
             }
-            Tab.DEVICE -> DeviceScreen(ble)
+            Tab.DEVICE -> DeviceScreen(
+                ble = ble,
+                openDetectorsToken = openDetectorsToken,
+                openHelpToken = openHelpToken,
+                openReadinessToken = openReadinessToken,
+                locationGranted = locationGranted,
+                onRequestLocation = onRequestLocation,
+            )
         }
+        }
+    }
+}
+
+/** Optional permission request lives at the feature boundary instead of the pairing prompt. The
+ * map remains usable for already-geotagged detections while this non-blocking banner is present. */
+@Composable
+private fun LocationContextBanner(onAllow: () -> Unit, modifier: Modifier = Modifier) {
+    Box(modifier.fillMaxWidth().padding(Acab.pad), contentAlignment = Alignment.TopCenter) {
+        Row(
+            Modifier.widthIn(max = 520.dp).fillMaxWidth()
+                .background(Acab.bg2, RoundedCornerShape(Acab.radiusSm))
+                .border(1.dp, Acab.lineStrong, RoundedCornerShape(Acab.radiusSm))
+                .padding(start = 12.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Filled.LocationOn, contentDescription = null, tint = Acab.accent,
+                modifier = Modifier.size(17.dp))
+            Spacer(Modifier.width(9.dp))
+            Text(
+                "optional: adds your position and future hit pins. detection works without it. location stays on your devices and is never uploaded automatically.",
+                color = Acab.text,
+                fontSize = 10.5.sp,
+                fontFamily = Acab.mono,
+                lineHeight = 15.sp,
+                modifier = Modifier.weight(1f),
+            )
+            Box(
+                Modifier.minimumInteractiveComponentSize().clip(RoundedCornerShape(50))
+                    .background(Acab.accent).clickable(onClick = onAllow)
+                    .padding(horizontal = 11.dp, vertical = 7.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("ALLOW", color = Acab.onAccent, fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
+            }
         }
     }
 }

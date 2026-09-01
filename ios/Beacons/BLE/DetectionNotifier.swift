@@ -146,7 +146,11 @@ final class DetectionNotifier: NSObject, UNUserNotificationCenterDelegate {
     /// Re-read the real system state. Called on launch AND on every foreground: a user who grants
     /// permission in iOS Settings mid-session would otherwise stay silently unauthorized for the
     /// whole process lifetime, since `authorized` is only ever set by our own request.
-    func refreshAuthorization() {
+    ///
+    /// `completion` runs on the main queue AFTER the cached state is written, so a caller that
+    /// re-renders off `mutedBySystem` can bump its own invalidation token there and be guaranteed
+    /// to repaint against the fresh answer, not the stale cache.
+    func refreshAuthorization(completion: (() -> Void)? = nil) {
         UNUserNotificationCenter.current().getNotificationSettings { [weak self] s in
             DispatchQueue.main.async {
                 self?.authorized = (s.authorizationStatus == .authorized ||
@@ -157,6 +161,7 @@ final class DetectionNotifier: NSObject, UNUserNotificationCenterDelegate {
                 // never appear again: green toggles over a permanently dead feature, which is the
                 // exact outcome that warning exists to prevent.
                 if s.authorizationStatus != .notDetermined { self?.authRequested = true }
+                completion?()
             }
         }
     }

@@ -42,6 +42,7 @@ struct DetectionDetailView: View {
     @EnvironmentObject var ble: BLEManager
     @Environment(\.dismiss) private var dismiss
     @Environment(\.mapHandoffAvailable) private var mapHandoffAvailable
+    @ScaledMetric(relativeTo: .caption) private var signalGraphHeight: CGFloat = 46
     @State private var copied = false
 
     // "Confirm it" checklist, per-visit UI state only, nothing persists.
@@ -49,6 +50,8 @@ struct DetectionDetailView: View {
     @State private var secondPass = false
     @State private var confirmRandomWatch = false   // R7: confirm dialog before starring a randomized MAC
     @State private var showRssiInfo = false          // tap the info dot next to SIGNAL to explain the RSSI graph
+    @State private var showMuteOptions = false
+    @State private var muteError: String?
 
     // Follow evidence (trackers only). Cached in @State and refreshed on a slow tick rather than
     // derived inside `body`, because this dossier re-renders at the coalesced publish cadence (a
@@ -61,6 +64,23 @@ struct DetectionDetailView: View {
     /// time, so under a fast feed the timer would never live long enough to fire once.
     @State private var followTick = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
 
+    /// Mapped-camera corroboration for the LOCATION panel, cached for the same reason followState
+    /// is. `ALPRStore.nearest(to:)` walks the node array end to end, and its inputs (this
+    /// sighting's coordinate, the loaded dataset, the unverified-nodes setting) all move far more
+    /// slowly than the render cadence, so reading it inside `body` hung a full-dataset pass off
+    /// every incoming detection for as long as an ALPR dossier stayed open. Refreshed on the same
+    /// 5 s tick, which also picks up a dataset that finishes loading while the screen is up.
+    @State private var alprMatch: ALPRMatch?
+
+    /// What the panel needs from the nearest mapped node. Equatable so a refresh that finds the
+    /// same answer (the usual case) doesn't invalidate the view.
+    private struct ALPRMatch: Equatable {
+        let meters: Double
+        let maker: String
+        let tier: UInt8
+        let confirmed: Bool
+    }
+
     /// Always re-read the live row: the captured `detection` is a value type with let fields,
     /// so it can never update, and this screen sits next to id-keyed lookups that do (the
     /// LIVE/STALE kicker, the sparkline). A frozen copy means the dBm readout never moves
@@ -69,6 +89,12 @@ struct DetectionDetailView: View {
     /// the captured copy once the row is evicted, so the dossier doesn't blank out.
     private var d: Detection { ble.detection(for: detection.id) ?? detection }
     private var trend: [Int] { ble.rssiTrend(for: d.id) }
+    private var muteRule: IgnoredDevice? {
+        ble.ignored.first { $0.mac == d.mac.lowercased() }
+    }
+    private var canAcquireFreshLocation: Bool {
+        ble.connectionState == .connected || ble.demoMode
+    }
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -112,12 +138,21 @@ struct DetectionDetailView: View {
         .toolbar(embedded ? .visible : .hidden, for: .tabBar)
         // Evaluate on appear, then at most once per 5 s while the screen is up, and never from
         // the ingest or publish paths. Crumbs need 60 s and 25 m to move at all, so a 5 s refresh
-        // is already far faster than the underlying data can change.
-        .onAppear { refreshFollow() }
+        // is already far faster than the underlying data can change. The mapped-camera
+        // corroboration rides the same three hooks, but do NOT read ITS input as equally still.
+        // The panel resolves `d.coordinate ?? capturedLocation(for:)` and both halves move: on a
+        // non-drone row `lat`/`lon` is the DETECTOR's GPS as of the newest frame, and where that is
+        // absent, ingestDetection migrates the captured observer fix at closest approach (>= 4 dB
+        // over the row's best RSSI, with none of the 60 s / 25 m floors the crumb gate has). So the
+        // distance in the corroboration line can trail the coordinate printed at the top of the
+        // same panel by up to one tick. Bounded and accepted: nearest(to:) walks the whole node
+        // array, so hanging it off every coordinate change would put that walk back on the render
+        // path this cache exists to clear.
+        .onAppear { refreshFollow(); refreshALPRMatch() }
         // The iPad two-pane keeps ONE detail view mounted and swaps the row into it, so without
         // this the panel would keep showing the previously selected tag's score.
-        .onChange(of: d.id) { refreshFollow() }
-        .onReceive(followTick) { _ in refreshFollow() }
+        .onChange(of: d.id) { refreshFollow(); refreshALPRMatch() }
+        .onReceive(followTick) { _ in refreshFollow(); refreshALPRMatch() }
         // A star refused at the firmware's 256-entry cap sets this on the manager; surface it here
         // instead of the WATCH tap silently doing nothing.
         .alert("Watchlist full", isPresented: $ble.watchlistFull) {
@@ -233,7 +268,13 @@ struct DetectionDetailView: View {
                 Kicker("RELATED HELP")
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(qs.enumerated()), id: \.element.id) { idx, q in
-                        NavigationLink { HelpView(scrollToId: q.id) } label: {
+                        NavigationLink {
+                            HelpView(
+                                scrollToId: q.id,
+                                canImproveDetection: improveDetectionAvailable(
+                                    isSessionReady: ble.sessionReady,
+                                    isDemoMode: ble.demoMode))
+                        } label: {
                             HStack(spacing: 10) {
                                 Text(q.q)
                                     .font(ACABTheme.display(13.5, weight: .medium))
@@ -455,6 +496,12 @@ struct DetectionDetailView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        // The tick lives only in the SF Symbol swap, so without this VoiceOver reads the same
+        // sentence plus "button" whether the row is ticked or not - no state, and no feedback
+        // that the tap landed - on the one panel that exists to be worked through step by step.
+        // Same trait every other selectable control here carries; Android's twin is a
+        // Role.Checkbox toggleable.
+        .accessibilityAddTraits(isOn.wrappedValue ? .isSelected : [])
     }
 
     private var secondPassText: String {
@@ -548,8 +595,20 @@ struct DetectionDetailView: View {
                     Kicker("BAND")
                 }
             }
-            Sparkline(values: trend, tint: d.type.tint).frame(height: 46)
-                .opacity(stale ? 0.35 : 1)
+            HStack(spacing: 8) {
+                VStack(alignment: .trailing, spacing: 0) {
+                    Kicker("STRONG", color: d.type.tint)
+                    Spacer(minLength: 4)
+                    Kicker("WEAK", color: ACABTheme.dim)
+                }
+                .frame(height: min(signalGraphHeight, 100))
+                Sparkline(values: trend, tint: d.type.tint)
+                    .frame(height: min(signalGraphHeight, 100))
+            }
+            .opacity(stale ? 0.35 : 1)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Signal history")
+            .accessibilityValue("Strong at the top, weak at the bottom")
             if showRssiInfo {
                 Text("RSSI is signal strength, moment to moment. closer to 0 is stronger, so the line climbs as you get nearer the source and drops as you move away, use it to home in on a hit.")
                     .font(ACABTheme.mono(11.5)).foregroundStyle(ACABTheme.dim)
@@ -753,8 +812,9 @@ struct DetectionDetailView: View {
             // We NEVER show a "no mapped camera" line: OSM lags new installs and mobile cruiser
             // ALPR is meant to move, so absence is not evidence of a false positive (the confidence
             // % chip is the false-positive tell). Only shows when the ALPR layer is loaded.
+            // Read from the cache, never from the store: see alprMatch.
             if (d.type == .flockCamera || d.type == .flockRaven),
-               let hit = ALPRStore.shared.nearest(to: coord), hit.meters <= 150 {
+               let hit = alprMatch, hit.meters <= 150 {
                 HStack(spacing: 7) {
                     Image(systemName: "checkmark.seal.fill")
                         .font(.system(size: 11)).foregroundStyle(hit.confirmed ? ACABTheme.flockTone : ACABTheme.warn)
@@ -886,6 +946,23 @@ struct DetectionDetailView: View {
         // explicit "we did not look". Collapsing them is what let the panel report a comparison it
         // had declined to run.
         followState = (s.band == .notMeasured) ? .notMeasured : .scored(s)
+    }
+
+    /// Re-read the nearest mapped ALPR node for this sighting. Only the two types whose panel can
+    /// show the corroboration line pay the scan at all; everything else clears the cache, so a
+    /// swapped-in row on the iPad two-pane can never inherit the previous row's answer. Assigned
+    /// only when the answer actually changed, so a tick that finds the same node (the usual case)
+    /// costs nothing downstream.
+    private func refreshALPRMatch() {
+        guard d.type == .flockCamera || d.type == .flockRaven,
+              let coord = d.coordinate ?? ble.capturedLocation(for: d.id) else {
+            if alprMatch != nil { alprMatch = nil }
+            return
+        }
+        let next = ALPRStore.shared.nearest(to: coord).map {
+            ALPRMatch(meters: $0.meters, maker: $0.maker, tier: $0.tier, confirmed: $0.confirmed)
+        }
+        if next != alprMatch { alprMatch = next }
     }
 
     @ViewBuilder private var followPanel: some View {
@@ -1037,20 +1114,139 @@ struct DetectionDetailView: View {
     }
 
     private var ignoreButton: some View {
-        Button {
-            ble.ignoreDevice(d)
-            dismiss()
-        } label: {
-            HStack(spacing: 7) {
-                Image(systemName: "bell.slash").font(.system(size: 13, weight: .bold))
-                Text("IGNORE THIS DEVICE").font(ACABTheme.mono(12, weight: .bold)).tracking(0.5)
+        Group {
+            if let rule = muteRule {
+                // Evaluated fresh at render time, never via the 60 s-cached isIgnored set, so
+                // the headline and the detail line always describe the same instant - matching
+                // Android's DetailScreen, which feeds MuteButton from ble.muteRuleStatus.
+                let status = ble.muteRuleStatus(for: rule)
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 7) {
+                        Image(systemName: "bell.slash.fill").font(.system(size: 13, weight: .bold))
+                        Text(muteHeadline(for: rule, status: status))
+                            .font(ACABTheme.mono(10, weight: .bold)).tracking(0.5)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .foregroundStyle(status == .active ? ACABTheme.accent : ACABTheme.warn)
+                    if let detail = muteStatusDetail(for: status) {
+                        Text(detail)
+                            .font(ACABTheme.mono(10)).foregroundStyle(ACABTheme.faint)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    HStack(spacing: 8) {
+                        Button("CHANGE") { showMuteOptions = true }
+                            .font(ACABTheme.mono(11, weight: .bold)).tracking(0.5)
+                            .foregroundStyle(ACABTheme.dim)
+                            .frame(maxWidth: .infinity).frame(minHeight: 44)
+                            .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
+                                .strokeBorder(ACABTheme.line, lineWidth: 1))
+                        Button("UNMUTE") { ble.unignore(d.mac) }
+                            .font(ACABTheme.mono(11, weight: .bold)).tracking(0.5)
+                            .foregroundStyle(ACABTheme.onAccent)
+                            .frame(maxWidth: .infinity).frame(minHeight: 44)
+                            .background(ACABTheme.accent,
+                                        in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm))
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(14)
+                .background(ACABTheme.bg2,
+                            in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
+                    .strokeBorder(ACABTheme.line, lineWidth: 1))
+            } else {
+                Button { showMuteOptions = true } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "bell.slash").font(.system(size: 13, weight: .bold))
+                        Text("MUTE…").font(ACABTheme.mono(12, weight: .bold)).tracking(0.5)
+                    }
+                    .foregroundStyle(ACABTheme.dim)
+                    .frame(maxWidth: .infinity).padding(.vertical, 14)
+                    .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
+                        .strokeBorder(ACABTheme.line, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
             }
-            .foregroundStyle(ACABTheme.dim)
-            .frame(maxWidth: .infinity).padding(.vertical, 14)
-            .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous)
-                .strokeBorder(ACABTheme.line, lineWidth: 1))
         }
-        .buttonStyle(.plain)
+        .confirmationDialog("Mute this device", isPresented: $showMuteOptions,
+                            titleVisibility: .visible) {
+            Button("Permanently") { applyMute(.permanent) }
+            Button("For 1 hour") { applyMute(.oneHour) }
+            Button("For 24 hours") { applyMute(.oneDay) }
+            if ble.currentLocationCoord != nil {
+                Button("At this place (50 m)") { applyMute(.here) }
+            } else if !canAcquireFreshLocation {
+                Button("Connect your beacon for a current location") {}
+                    .disabled(true)
+            } else if ble.locationRestricted {
+                Button("Location restricted by device policy") {}
+                    .disabled(true)
+            } else if ble.locationDenied {
+                Button("Open Settings for a place mute", action: openAppSettings)
+            } else if !ble.locationAuthorized && !ble.locationDenied {
+                Button("Enable location for a place mute") {
+                    ble.requestLocationForPlaceMute()
+                }
+            } else {
+                Button("Get a more accurate location") {
+                    ble.requestLocationForPlaceMute()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(muteExplanation)
+        }
+        .alert("Couldn't mute device", isPresented: Binding(
+            get: { muteError != nil }, set: { if !$0 { muteError = nil } }
+        )) {
+            Button("OK", role: .cancel) { muteError = nil }
+        } message: {
+            Text(muteError ?? "No mute was added.")
+        }
+    }
+
+    /// Android-parity headline (MuteButton in DetailScreen.kt): only an ACTIVE rule may say
+    /// MUTED; every other status presents the rule as set-but-not-suppressing.
+    private func muteHeadline(for rule: IgnoredDevice, status: MuteRuleStatus) -> String {
+        switch status {
+        case .active: return "MUTED · \(rule.scopeLabel.uppercased())"
+        case .currentLocationRequired: return "MUTE SET · ACCURATE LOCATION NEEDED"
+        case .outsideRadius: return "MUTE SET · OUTSIDE SAVED AREA"
+        case .expired: return "MUTE ENDED"
+        case .invalidPlace: return "MUTE SET · PLACE UNAVAILABLE"
+        }
+    }
+
+    private func muteStatusDetail(for status: MuteRuleStatus) -> String? {
+        switch status {
+        case .active:
+            return nil
+        case .currentLocationRequired:
+            return "This place mute is saved but inactive because a fresh location accurate to 50 meters is unavailable."
+        case .outsideRadius:
+            return "This place mute is configured but inactive outside its saved radius."
+        case .expired:
+            return "This timed mute is no longer active."
+        case .invalidPlace:
+            return "This saved place rule is incomplete and is not muting the device."
+        }
+    }
+
+    private var muteExplanation: String {
+        let base = "Existing log history is kept. Permanent mutes silence the app and beacon. Timed and place mutes are enforced by this phone, so the beacon can still sound."
+        guard d.addressIsRandomized else { return base }
+        return base + " This device uses a rotating address, so the mute may stop matching after the address changes."
+    }
+
+    private func applyMute(_ scope: MuteScope) {
+        if ble.ignoreDevice(d, scope: scope) {
+            muteError = nil
+            showMuteOptions = false
+        } else if scope == .here && ble.currentLocationCoord == nil {
+            muteError = "A fresh location fix accurate to 50 meters is required for a place mute. Keep the beacon connected and try again."
+        } else {
+            muteError = "The muted-device list is full. Unmute another device and try again."
+        }
     }
 }

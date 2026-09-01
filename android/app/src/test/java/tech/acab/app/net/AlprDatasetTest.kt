@@ -6,6 +6,12 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 
 /**
@@ -47,6 +53,30 @@ import kotlin.math.roundToInt
  * method: when one fails, the guard that moved is named by the fixture, not guessed at.
  */
 class AlprDatasetTest {
+
+    private class FakeHttpConnection : HttpURLConnection(URL("https://soyboi.tech/test")) {
+        var disconnectCount = 0
+        override fun connect() = Unit
+        override fun disconnect() { disconnectCount++ }
+        override fun usingProxy(): Boolean = false
+    }
+
+    private class BlockingInputStream : InputStream() {
+        val readStarted = CountDownLatch(1)
+        private val closed = CountDownLatch(1)
+        @Volatile var closeCount = 0
+
+        override fun read(): Int {
+            readStarted.countDown()
+            if (!closed.await(5, TimeUnit.SECONDS)) error("blocking transfer was not aborted")
+            return -1
+        }
+
+        override fun close() {
+            closeCount++
+            closed.countDown()
+        }
+    }
 
     @Test
     fun testDatasetUrlTrust_isExactHostHttpsAndDefaultPortOnly() {
@@ -121,6 +151,57 @@ class AlprDatasetTest {
         assertTrue(gate.finish(restartAllowed = true))
         assertTrue(!gate.finish(restartAllowed = false))
         assertTrue(gate.tryStart(rememberRestartIfBusy = false))
+        assertTrue(!gate.finish(restartAllowed = false))
+    }
+
+    @Test
+    fun testDisableAbortsActiveTransferWithoutLosingReenableRestart() {
+        val gate = RestartableFetchGate()
+        val transfer = AbortableAlprTransfer()
+        val old = FakeHttpConnection()
+        val oldStream = BlockingInputStream()
+
+        assertTrue(gate.tryStart(rememberRestartIfBusy = true))
+        assertTrue(transfer.register(old))
+        assertTrue(transfer.attachStream(old, oldStream))
+        val readFailure = AtomicReference<Throwable?>(null)
+        val readFinished = CountDownLatch(1)
+        val reader = Thread {
+            try {
+                oldStream.read()
+            } catch (t: Throwable) {
+                readFailure.set(t)
+            } finally {
+                readFinished.countDown()
+            }
+        }.also { it.start() }
+        assertTrue("fixture never entered its blocking read", oldStream.readStarted.await(5, TimeUnit.SECONDS))
+
+        // OFF takes the exact blocking connection/stream pair out before aborting both. Closing
+        // the stream as well covers providers whose disconnect() does not own an obtained stream.
+        val aborted = transfer.takeForAbort()
+        assertTrue(aborted?.connection === old)
+        assertTrue(aborted?.stream === oldStream)
+
+        // ON arrives immediately, while the old read is still blocked and its IO abort is only
+        // queued. The request must remain a restart rather than disappearing at gate handoff.
+        assertTrue(!gate.tryStart(rememberRestartIfBusy = true))
+        val aborter = Thread { aborted!!.abort() }.also { it.start() }
+        assertTrue("closing the active stream did not wake its read", readFinished.await(5, TimeUnit.SECONDS))
+        aborter.join(5_000)
+        reader.join(5_000)
+        assertNull(readFailure.get())
+        assertEquals(1, old.disconnectCount)
+        assertEquals(1, oldStream.closeCount)
+
+        // The old run's finally releases directly into the remembered replacement.
+        assertTrue(gate.finish(restartAllowed = true))
+
+        val replacement = FakeHttpConnection()
+        assertTrue(transfer.register(replacement))
+        // A delayed finally from the old request cannot clear the replacement (identity/ABA guard).
+        transfer.clear(old)
+        assertTrue(transfer.takeForAbort()?.connection === replacement)
         assertTrue(!gate.finish(restartAllowed = false))
     }
 
@@ -441,6 +522,12 @@ class AlprDatasetTest {
         val invalid = alp("ALP4", nodes = threeNodes)
         // First byte of "Flock Safety" becomes a two-byte prefix, followed by ASCII "l" rather
         // than a continuation byte. Length and every other field remain valid.
+        //
+        // NO iOS TWIN, and the divergence is real rather than a coverage gap: iOS decodes maker
+        // names with `String(decoding:as: UTF8.self)`, which is lossy, so the same bytes parse
+        // there with U+FFFD in the name while this side rejects the whole file. Do not add the
+        // twin fixture until one verdict is settled for both parsers - see the header of
+        // ios/BeaconsTests/ALPRDatasetTests.swift, which names this as the one open exception.
         invalid[15] = 0xC3.toByte()
         assertNull(AlprStore.parse(invalid))
     }

@@ -1,5 +1,5 @@
 {
-  "source": "https://soyboi.tech/faq.html",
+  "source": "https://soyboi.tech/faq",
   "voice": "lowercase-plain, honest about limits; proper nouns keep their casing",
   "relatedHelp": {
     "TRACKER": [
@@ -35,37 +35,57 @@
   },
   "sections": [
     {
-      "kicker": "USING IT DAY TO DAY",
+      "kicker": "THE BASICS",
       "questions": [
         {
-          "id": "q-ignore",
-          "q": "how do i ignore a device i already know about?",
-          "a": "open the detection and hit ignore. it goes quiet right away, no pins, no log spam, no buzzer. the list lives on the beacon itself, so it holds even when your phone isn't around. ignored devices sit under managed devices, tap to unignore. holds up to 256 devices."
-        },
-        {
-          "id": "q-watch",
-          "q": "can i flag one device to keep an eye on?",
-          "a": "yes, hit watch (the star) on any detection. it becomes its own category and the beacon calls it out when it's near, even if it would otherwise be ignored. to star something the beacon does not already recognize, switch desert mode on so it shows up at all, star it, then switch desert mode back off: the star keeps working either way. rename it under managed devices so the log reads like your log. holds up to 256. one caveat: watching matches the exact hardware address, and phones rotate theirs every few minutes, so the app warns you when a star probably won't stick."
+          "id": "q-capabilities",
+          "q": "what can it detect, and what can it not?",
+          "a": "it detects known wifi and bluetooth signatures from some ALPR gear, remote ID drones, body cams, separated trackers, and experimental recording-glasses signatures. switch on network cameras to flag nearby broadcasts from supported camera vendors. you can also star any exact device and watch for it as a custom category.\n\nit cannot see wired, passive, cellular-only, or 5 GHz-only gear. wifi scanning is 2.4 GHz and moves between channels, so brief broadcasts can be missed. bluetooth gets a dedicated radio and listens continuously. a quiet screen means nothing recognizable announced itself in range, not that nothing is there."
         },
         {
           "id": "q-detectors",
           "q": "can i turn individual detectors on or off?",
-          "a": "yes, all of them, on the Beacon tab under detectors. flip any category and the beacon obeys straight away, no reflash: flock/ALPR, drones, body cams, glasses, trackers, network cameras. scan radios above it turns a whole radio off if you only want bluetooth or only wifi.\n\nout of the box flock/ALPR, drones, body cams and glasses are on, and trackers and network cameras are off, because both are noisy in ordinary places and are worth switching on deliberately. the settings live on the beacon, so they survive a power cycle and keep working with your phone away.\n\nif a category is quieter than you expect, check here first, it may simply be switched off."
+          "a": "yes. open Beacon, then detectors. each category changes what the beacon reports right away and stays set across restarts. flock/ALPR, drones, body cams, and glasses start on. trackers and network cameras start off because they can be noisy in ordinary places. scan radios is broader: it turns bluetooth or wifi listening off entirely."
+        }
+      ]
+    },
+    {
+      "kicker": "USING IT DAY TO DAY",
+      "questions": [
+        {
+          "id": "q-ignore",
+          "q": "how do i mute a device i already know about?",
+          "a": "open the detection from the Log or map and tap mute. choose permanent, 1 hour, 24 hours, or at this place within 50 meters. earlier rows stay in the Log with a muted label; while the rule is active, app alerts and live views stay quiet. use select mode in the Log to mute several permanently. muted devices sit under managed devices on Beacon, where you can rename or unmute them.\n\npermanent mutes are copied to the beacon, silence its hardware alerts, and still work with the phone away. timed and place mutes stay on the phone because the beacon has no clock or GPS to enforce their scope safely; they need the phone connected, and the beacon can still sound according to your alert setting. a mute follows the exact hardware address, so phones, tags, glasses, and other gear that rotate addresses may appear again under a new one. the list holds up to 256 devices."
+        },
+        {
+          "id": "q-sounds",
+          "q": "what does muting the beacon actually silence?",
+          "a": "alerts under Beacon has three modes. buzzer lets the board beep for each new hit. vibrate and silent both mute the board itself; vibrate buzzes this phone instead. this is the board's own voice, separate from muting one device you already know about.\n\nmuting is not total, and the gaps are deliberate. a muted board also skips its startup jingle, because on an always-on unit a power cut and restore looks exactly like someone switching it on, and a muted board should not announce itself at 3am. two cues still play while muted: the shutdown motif, so you can hear it turn off instead of guessing, and the press-and-hold start beep on the battery model, which only ever follows your own thumb. master volume at 0 is the one setting that silences all of it, which is why the volume slider stays live in all three modes. the LED keeps flashing at 0 unless you also switch on lights out.\n\nthe mute lives on the board, so a lost write could leave the two out of step. the app compares your mode against what the board reports on every status frame. if you asked for quiet and the board says it is audible, the app says it again straight away, then keeps saying it about every 30 seconds for as long as the two disagree. the other direction gives up on purpose: if you asked for sound and the board stays muted, the app stops claiming otherwise and shows silent for the rest of the session, without touching your saved setting.\n\ntrackers never beep on the board in any mode, and desert mode drops the board to silent while it runs, then puts your mode back when you switch it off, unless you picked one by hand while it was running."
+        },
+        {
+          "id": "q-live-mode",
+          "q": "what is Live Mode, and how do i put it on my lock screen?",
+          "a": "Live Mode is the glanceable nearby counter. it shows detections heard in roughly the last 45 seconds, matching the Status screen, and keeps the phone connected to the beacon in the background. it starts on by default after your first real connection, but you can turn it off under Beacon. counts show on the lock screen by default; a switch under Beacon hides them, so the locked surface only says Live Mode is active. counts stay visible inside the app either way.\n\nthat switch reaches three surfaces on android: the locked Live Mode card drops to 'Live Mode active', a detection alert stops naming its category on the lock screen, and the android 16 status-bar chip drops its running count whether the phone is locked or not. on iphone it covers the lock screen card only, so the Dynamic Island and the Watch and CarPlay cells keep showing counts, and whether a detection alert shows its text on a locked screen is your own Show Previews setting.\n\non iphone it appears as a Live Activity on the lock screen and Dynamic Island, with compact system surfaces on supported Watch and CarPlay setups. on android it appears as an ongoing notification or Live Update. home-screen and compatible car widgets are separate: add the beacons widget from your system's widget picker (on android, Live Mode setup under Beacon can also add it for you). the widget counts a different thing on purpose: everything first heard today, resetting at local midnight, rather than the last 45 seconds. the icon row under that number only covers the categories that have an icon, so it can add up to less than the number above it, and offline-buffer replays count only when the beacon could date them to today; a replay whose time could not be reconstructed sits out of both. ios and android ultimately control whether these surfaces are allowed, so use the readiness checks under Beacon if one is missing.\n\nafter the first walkthrough, the app may ask for the phone permission Live Mode needs. choosing not now keeps detection and the Log working, but the lock-screen surface stays off until you finish setup under Beacon."
+        },
+        {
+          "id": "q-watch",
+          "q": "can i flag one specific device to keep an eye on?",
+          "a": "yes. open any detection and tap the star. it becomes a watched device, and the beacon calls it out whenever it is near, even without a known signature. to star something the beacon does not recognize, turn on desert mode, find it, star it, then turn desert mode off again. rename it under managed devices so the Log reads like your Log.\n\nthe watchlist lives on the beacon, survives reboots, and holds up to 256 devices. watching matches the exact hardware address, so it may not stick to phones, separated trackers, and other gear that rotate theirs. the app warns you when that is likely."
         },
         {
           "id": "q-desert",
           "q": "what is desert mode, and when would i use it?",
-          "a": "normally the beacon only calls out surveillance gear it recognizes. desert mode flips that: it reports every device broadcasting nearby, phones, watches, earbuds. it's for proof of life, sparse areas, and capturing an unknown device so a new signature can be built, or so you can star it. anything you star while it's on stays starred after you switch it off. a busy street turns it into a firehose, so switch it back off when you're done."
+          "a": "normally the beacon only calls out surveillance gear it recognizes. desert mode flips that: it reports every device broadcasting nearby, phones, watches, earbuds, TVs, not just the surveillance categories. it exists for three things: proof of life, sparse areas where little is around to detect, and capturing an unknown device so you can star it or build a new signature. it is off by default and meant to be temporary. a busy street turns it into a firehose, so switch it back off when you are done."
         },
         {
           "id": "q-desertcap",
           "q": "does desert mode cap how much it logs?",
-          "a": "it keeps logging, far more than a normal session will hit. the app holds a large rolling window of recent detections, a window that moves with you, not a bucket that fills up and freezes."
+          "a": "it keeps logging, far more than a normal session will hit. desert mode reports every device around you, so a busy block is a firehose. the app holds a rolling window of up to 5,000 detections. once that fills, older rows roll out so the phone stays fast; export anything you need to keep before a long desert-mode session. it is a window that moves with you, not a bucket that fills up and freezes. the offline buffer does not catch the overflow either: it skips desert mode's uncategorized rows, so nothing you scrolled past in a desert session is waiting there to be replayed."
         },
         {
           "id": "q-buffer",
           "q": "can i leave it recording without my phone?",
-          "a": "yes, that's the offline buffer: turn it on once and the beacon keeps logging while your phone is away, encrypted, replayed when you reconnect. one honest limit: the beacon has no GPS, so offline hits are pinned to the last position your phone shared. it's built for a stationary, deploy-and-leave spot."
+          "a": "yes, that is the offline buffer. it is off until you turn it on. once it is on, the beacon keeps logging detections while your phone is away, encrypted in its own flash and replayed when you reconnect. the Log's all/new/offline filter pulls up those buffered hits.\n\nbe clear about what that encryption buys. your phone hands the beacon the key, and while the buffer is switched on the beacon keeps a copy of that key in flash so it can carry on recording across a reboot. anyone holding the board can therefore read what it stored: the buffer is not sealed against a seized beacon. switching the offline buffer off erases the key, and a buffer that sits through about six restarts without your phone ever connecting to collect it is erased on its own.\n\nthe other honest limit is location. the beacon has no GPS of its own, so offline hits carry the last fix your phone shared before it left, and the beacon stops using that fix once it is about 18 hours old. hits it records after that still say what went by, with no position at all: no pin on the map, and empty location columns in an export. the fix lives in memory only, so a beacon that restarts while you are away has nothing to stamp until your phone comes back. and read those pins as where your phone last was, not where the beacon is. they are right while the beacon stays put; carry it around without your phone and they all sit at that one spot. a replayed hit either carries that fix together with how old it was, or reaches you with no position at all; the two never come apart."
         }
       ]
     },
@@ -73,39 +93,44 @@
       "kicker": "WHEN SOMETHING LOOKS WRONG",
       "questions": [
         {
+          "id": "q-setup",
+          "q": "i can't find or pair my beacon. what should i try?",
+          "a": "start with the simple checks. power the beacon with a known-good USB cable or switch it on, keep it within a few feet of your phone, make sure Bluetooth is on, and allow Nearby devices on android or Bluetooth on iphone. on older android phones, allow Location when asked because the operating system requires it for scanning. tap Scan for beacons, choose yours, then approve the phone's pairing request if it appears.\n\nif the scan finds nothing, wait for the beacon to finish starting and scan again. if pairing does not finish, keep it powered and nearby, cancel, and retry. if another phone already uses the beacon, turn the beacon off and on, then connect the new phone within two minutes. if it still fails, email support@soyboi.tech."
+        },
+        {
           "id": "q-pair-window",
           "q": "my other phone won't connect to the beacon",
-          "a": "a beacon that already belongs to a phone only accepts a new phone in the first two minutes after it powers on. turn the beacon off and on, then connect within two minutes. that is the whole fix.\n\nthe phone that already paired reconnects whenever it likes, forever, and never has to do this. a brand new beacon that has never been paired is not affected at all, the first phone connects whenever you are ready.\n\nit works this way so that someone who happens to be near your beacon cannot pair to it and read where you have been. the beacon hangs up before it can explain itself, which is why a blocked attempt just looks like a connection that will not take.\n\nonly a real power-up opens the window. a firmware update restarting the board does not, so an update cannot quietly reopen pairing to whoever is standing nearby."
+          "a": "a beacon that already belongs to a phone accepts a new phone only during the first two minutes after a real power-up. turn it off and on, then connect within two minutes. the phone already paired to it can reconnect at any time, and a brand-new beacon is not affected.\n\nthis prevents someone nearby from pairing and reading where you have been. a firmware-update restart does not open the window."
         },
         {
           "id": "q-restart",
-          "q": "the beacon keeps restarting, or the startup sound repeats",
-          "a": "nine times out of ten it's the cable. the USB-C port sits recessed, so a plug can feel seated while it's a hair short of full contact. push the connector straight in until it bottoms out, firmly. swap cables before you suspect the board, and rule out a tired power bank with a wall charger. still cycling on a known-good cable? email me and i'll sort it out."
+          "q": "my beacon keeps restarting, or the startup sound plays over and over",
+          "a": "it is usually the cable, not the beacon. the USB-C port is recessed, so a plug can feel seated while still falling short of full contact. push it straight in until it stops firmly.\n\nif alerts are set to vibrate or silent, the board skips its startup jingle, so the same restart loop makes no sound at all. watch the LED instead, as long as lights out is off: it replays the startup flashes on every restart, and the slow idle heartbeat only settles in once the board stays up.\n\nif that does not fix it, try a slimmer plug, a known-good cable, and a wall charger instead of a power bank. if it still restarts on a known-good cable and wall charger, email me and i'll sort it out."
         },
         {
           "id": "q-airtag",
-          "q": "my AirTag is right next to me, why isn't it flagged?",
-          "a": "on purpose, and it's the beacon working right. a tag near its owner's iPhone broadcasts a quiet 'still with my owner' signal, and the beacon holds fire on those, otherwise it would scream about your own gear all day. a tag only switches to the louder 'separated' broadcast about fifteen minutes after losing touch with its owner's devices, and that separated tag is exactly the one worth knowing about: one slipped into your bag or car."
+          "q": "my AirTag is right next to me, why isn't the beacon flagging it?",
+          "a": "that is intentional. an AirTag near its owner's Apple gear broadcasts a quiet 'still with my owner' signal, which the beacon suppresses so your own phone, watch, earbuds, and tags do not bury the Log. about fifteen minutes after losing contact with all of its owner's Apple devices, the tag switches to a separated broadcast and the beacon can flag it.\n\nto test this, leave a tag away from all of your Apple devices for at least fifteen minutes, then bring it near the beacon. Tile and Samsung tags do not use the same with-owner signal, so they can appear sooner."
         },
         {
           "id": "q-trackerdelay",
-          "q": "why did a tracker on me take a while to show up?",
-          "a": "a tracker you walk past isn't the thing to worry about; one that travels with you is. the beacon logs a separated tag from the first sighting and holds the buzzer for its first minute, so a tag you drift past stays quiet while the sighting still reaches the app. one limit: a separated AirTag changes its identity around 4am, so a tag riding with you overnight looks brand new in the morning."
+          "q": "why did it take a while before a tracker on me showed up?",
+          "a": "once a tag is broadcasting in its separated form, the beacon logs it as soon as it hears it and hands the app that first sighting straight away. the wait before that is the tag's own, not the beacon's. what the beacon holds back for the first minute is the offline buffer, so tags you merely walk past do not fill its flash.\n\nthe board never buzzes for a tracker at all: the category is opt-in and a tag riding past on a stranger would sound all day. star one and it is reported as a watched device instead, and that does get a sound. phone notifications for trackers are their own switch under Beacon and start off. none of this decides for you that a tracker is following you. that requires location over time, and the beacon has no GPS of its own.\n\nthe app gives you each sighting, with when and where, so you can see whether the same tag keeps appearing along your route. one limit: a separated AirTag changes its identity around 4am, so one that stays with you overnight can look like a new tag in the morning."
         },
         {
           "id": "q-mapcam",
-          "q": "the map shows a camera here, but nothing is detected",
-          "a": "the hollow rings are the known-cameras layer, community-mapped ALPR sites. solid pins are live detections. plenty of ALPRs backhaul over their own cellular link and never announce themselves on WiFi or bluetooth, so they sit on the map but stay silent on the air. the beacon can't hear what never transmits. if something IS broadcasting and it still missed it, that's a signature gap, send the log. the map also hides mapped pins that name no manufacturer, because a good share of those turn out to be something else on the pole. map settings has a switch to show them."
+          "q": "the ALPR map shows a camera here, but the beacon isn't detecting it. is it broken?",
+          "a": "no. hollow rings are community-mapped ALPR locations; solid pins are signals your beacon heard live. a ring without a pin usually means the camera is not broadcasting over wifi or bluetooth, often because it uses cellular backhaul. a pin without a ring is gear that is new, moved, or not mapped yet. a ring drawn wide is the third case: a live pin is standing on that mapped location.\n\nthe two layers are complementary, not a test of whether the beacon is working. if you know something was broadcasting and the beacon still missed it, send the Log. map layers turns the whole known-ALPR layer on or off. lower-confidence mapped pins are hidden by default, and the switch for those sits under the gear on the map, in map settings."
         },
         {
           "id": "q-hidden",
-          "q": "can it find a hidden camera in a hotel room?",
-          "a": "sometimes. switch on network cameras and it flags wifi cameras from vendors it knows, hikvision, dahua, reolink, plus ring, wyze and eufy, when they're powered on and transmitting nearby. it cannot find anything wired, on a cellular sim, powered off, or too generic to tell from a smart plug. an empty scan does not mean the room is clean, so pair it with a real physical sweep."
+          "q": "can it find a hidden camera in an airbnb or hotel room?",
+          "a": "sometimes. turn on network cameras and the beacon flags nearby wifi broadcasts whose hardware addresses belong to supported camera vendors. a hit names the vendor, not the device, so it could be a doorbell, recorder, disclosed camera, or another product from the same maker.\n\nit cannot detect wired, analog, cellular-only, powered-off, motion-idle, 5 GHz-only, or unknown cameras that do not emit a recognizable signal. it does no lens or infrared detection. an empty scan does not mean the room is clean. use it alongside a physical sweep: check smoke detectors, vents, and mirrors, look for lens glints with a flashlight, and check for infrared lights through your phone camera in the dark."
         },
         {
           "id": "q-range",
           "q": "how far away can it hear something?",
-          "a": "not far, and that's physics. very roughly tens of meters, stretching toward 100 m outdoors with clear line of sight to something pole-mounted, dropping to a few meters through walls, car bodies, or a bag. treat it as 'what is around me right now', not a neighborhood scanner."
+          "a": "usually tens of meters, not whole neighborhoods. with clear outdoor line of sight, a pole-mounted device may reach toward 100 meters. walls, vehicles, clothing, and bags can cut that to only a few meters. wifi often carries farther than bluetooth, and a real antenna on a pole carries farther than a body cam under a jacket.\n\nplacement matters too: the beacon hears more on a dashboard than inside a backpack. treat it as 'what is around me right now.' a quiet screen means nothing recognizable announced itself in range, not that nothing is there."
         }
       ]
     },
@@ -115,12 +140,12 @@
         {
           "id": "q-battlife",
           "q": "how long does the battery last?",
-          "a": "roughly 4 to 7 hours of continuous scanning, about 4 in a device-dense crowd, up to ~7 somewhere quiet. eco mode stretches it by easing off the wifi sweeps while bluetooth keeps running full-time. need all-day? the slim model runs indefinitely off any USB power bank."
+          "a": "roughly 4 to 7 hours of continuous scanning on a charge, depending on how much is around to detect: about 4 hours in a device-dense crowd and up to 7 somewhere quiet. eco mode stretches it by easing off the wifi sweeps while bluetooth keeps running full-time. need all-day? the slim model runs indefinitely off any USB power bank."
         },
         {
           "id": "q-battjump",
           "q": "why does the battery percentage jump around?",
-          "a": "the battery version reads charge from voltage, not a fuel-gauge chip, so it's a close estimate. under heavy scanning the voltage sags and the percent dips a few points, then climbs back. read it as a fuel gauge, not a stopwatch: full, half, and getting low are what it's good for."
+          "a": "the battery version estimates charge from voltage instead of using a dedicated fuel-gauge chip. the radios draw power in bursts, so heavy scanning can make the voltage dip and the percentage fall a few points, then rise again when the load eases. lithium voltage also stays fairly flat through the middle of a charge, so the estimate moves faster near full and empty.\n\nthe firmware smooths the reading, but a few percent of drift is normal. read it as a fuel gauge, not a stopwatch: full, half, and getting low are what it does well."
         }
       ]
     },
@@ -130,22 +155,22 @@
         {
           "id": "q-datago",
           "q": "where does my data go?",
-          "a": "your detections go nowhere automatically beyond your phone and your own beacon. detections are logged on the beacon and mirrored to the app over a direct connection. there is no account, analytics, or automatic detection upload. if you explicitly use improve detection or export/share a Log CSV or GPX, the selected data goes only to the email recipient, app, or destination you choose."
+          "a": "your detections and location stay on your devices. the app checks for firmware updates and makes network requests only for map tiles, update files, and the known ALPR dataset. the known ALPR map layer is on by default; map layers has a switch to turn it off. the update and dataset files are plain downloads with no location, map view, or detection data attached, though the host still sees an ordinary web request and your IP address, the way any web server does. map tiles are an ordinary web request too, so the tile provider sees the area you are looking at, never your detections. exports and improve detection reports leave only when you choose where to send them."
         },
         {
           "id": "q-storage",
-          "q": "does beacons need access to my files or storage?",
-          "a": "no. log exports and improve detection reports are files the app writes in its own private space. when you share one, the system share sheet opens and you pick exactly where it goes. nothing is uploaded automatically. beacons never asks for a storage permission and cannot see your photos or files."
+          "q": "does the app need access to my files or storage?",
+          "a": "no. Log exports and improve detection reports are files the app writes in its own private space. when you share one, the system share sheet opens and you pick exactly where it goes. nothing is uploaded automatically. the app never asks for storage permission and cannot see your photos or files."
         },
         {
           "id": "q-location",
           "q": "why does the app want my location?",
-          "a": "so a hit becomes a place on a map, not just a beep. your location is used on your device to pin detections and center the map. if location is on, your phone also sends its current fix over the encrypted bluetooth link to your own board, so hits the board records while your phone is away still land on the map in the right place. that fix goes to your board, not automatically to me or anyone else. ordinary Log CSV and GPX exports can include where your phone heard a device and, for drones, the aircraft and operator positions broadcast over remote ID. those ordinary exports do not have location-removal switches, so review the file and destination before sharing. the three location switches apply only to improve detection: your observation and the operator position are off by default, while the aircraft position is on. opening the map loads tiles from a map provider (apple maps on iOS, openstreetmap on android), which sees an ordinary map request and your IP address, never your detections. say no and the app still works, you just lose the pins."
+          "a": "location turns a hit into a place on the map, lets place mutes know when you are within 50 meters, and on iphone keeps Live Mode current in the background. the app asks only after a real beacon is ready or when you open a feature that needs it. your phone uses location to pin detections and sends its current fix over encrypted bluetooth to your own beacon; if the phone leaves, buffered hits use that last fix until it is about 18 hours old, then record with no position at all. ordinary Log CSV and GPX exports have no location switches and do not pass through the improve detection redactor. they can carry your observation location and, for drones, the aircraft and operator positions, so review the file and where it is going before you share it. the improve detection form is the one with separate location switches, and it leaves your own position and the operator position out by default. that redaction is all-or-nothing on purpose: if the file cannot be read back with certainty, the report goes out as a header with no rows rather than rows the app is unsure about, and the note riding with it says zero observations.\n\nopening the map requests tiles from Apple Maps on iOS or OpenStreetMap on android. those providers receive an ordinary map request and your IP address, never your detections. say no and detection and the Log still work, but Live Mode on iphone and most pins based on your phone's position do not."
         },
         {
           "id": "q-pin",
           "q": "does a pin show where the camera is, or where i was?",
-          "a": "for almost everything, where you were, not where the device is. signal strength tells it roughly how close you got, so the pin drops at your closest pass. the exception is drones: they broadcast their own GPS over remote ID, so a drone's pin is where the drone says it is, plus a second pin for the operator."
+          "a": "for almost everything, the pin shows where you were when the signal was strongest, not the device's exact location. read it as 'this was in range around here,' not 'the device is at this dot.' tracker detections also draw a trail of where you were each time the same tracker appeared.\n\ndrones are the exception: remote ID broadcasts the drone's own GPS and often the operator's location, so those pins come from the drone itself."
         },
         {
           "id": "q-account",
@@ -160,51 +185,51 @@
         {
           "id": "q-vanish",
           "q": "what happens if soyboi disappears tomorrow?",
-          "a": "the beacon keeps working. there's no account, no cloud, and no server it depends on. the app and firmware source stay on github, forkable forever. the only thing that would stop is new signature updates."
+          "a": "the beacon keeps working. there's no account, no cloud, and no server it depends on. the app and the ESP32-S3 firmware source stay on github, forkable forever. the only thing that would stop is new signature updates."
         },
         {
           "id": "q-better",
           "q": "does it get better over time?",
-          "a": "yes, and for free. detection is signature based, and new surveillance hardware keeps appearing, so signatures keep coming. when new firmware lands, the app flags it and installs it over the air over bluetooth from one button, which updates both radios in the beacon in a single pass. one purchase; it keeps learning."
+          "a": "yes, and for free. detection is signature based, and new surveillance hardware keeps appearing, so signatures keep coming. when new firmware lands, the app flags it and installs both beacon radios in one pass over bluetooth. you can also use the web flasher over USB. one purchase; it keeps learning."
         },
         {
           "id": "q-opensource",
           "q": "is the hardware open source too?",
-          "a": "the app and the firmware are fully open source, and always will be. the board design itself is not published. you buy the hardware, you own every byte it produces."
+          "a": "the app and the ESP32-S3 firmware are fully open source, and always will be. the nRF scanner firmware and the board design itself are not published. you buy the hardware, you own every byte it produces."
         }
       ]
     }
   ],
   "support": [
     {
-      "title": "Improve detection",
+      "title": "improve detection",
       "sub": "missed something you know was broadcasting? capture it and send the log",
       "action": "improveDetection",
       "external": false
     },
     {
-      "title": "Report an issue",
+      "title": "report an issue",
       "sub": "github · bugs, false positives, crashes",
       "url": "https://github.com/soyboi1312/all-cameras-are-beacons/issues",
       "external": true
     },
     {
-      "title": "Email",
+      "title": "email",
       "sub": "support@soyboi.tech · hardware faults + anything else",
       "url": "mailto:support@soyboi.tech",
       "external": true,
       "note": "CONFIRM ADDRESS before shipping"
     },
     {
-      "title": "Replay the walkthrough",
+      "title": "replay the walkthrough",
       "sub": "the first-run tour, one more time",
       "action": "firstRunTour",
       "external": false
     },
     {
-      "title": "FAQ online",
+      "title": "faq online",
       "sub": "soyboi.tech/faq · always the newest answers",
-      "url": "https://soyboi.tech/faq.html",
+      "url": "https://soyboi.tech/faq",
       "external": true
     }
   ]
