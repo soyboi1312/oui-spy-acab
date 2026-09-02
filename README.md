@@ -14,7 +14,7 @@ It runs on the beacon, our own dual-radio board, and on the **Colonel Panic OUI-
 
 ## Start here
 
-- **Want to look around without hardware?** Install the [iPhone](https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861) or [Android app](https://play.google.com/store/apps/details?id=tech.soyboi.beacons) and tap **See how it works**. It loads six clearly marked fictional detections. Sample settings never configure a board, sample rows never enter your real Log, and leaving the sample restores your saved data.
+- **Want to look around without hardware?** Install the [iPhone app](https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861) or [Android app](https://play.google.com/store/apps/details?id=tech.soyboi.beacons) and tap **See how it works**. It loads six clearly marked fictional detections. Sample settings never configure a board, sample rows never enter your real Log, and leaving the sample restores your saved data.
 - **Already have compatible hardware?** Power the beacon, OUI-Spy, or Mesh-Detect board and tap **Scan** in the app. Grant Bluetooth access on iPhone, Nearby devices on Android 12 or newer, or Location on Android 8 through 11. Choose the board and approve the system pairing prompt. The first encrypted connection opens a short walkthrough followed by the relevant permission and readiness prompts.
 - **Building your own OUI-Spy or Mesh-Detect?** Use the [one-click DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/) or follow the [command-line instructions](#flashing-from-the-command-line).
 - **Looking for the beacon?** Retail hardware is coming soon. Current availability and the waitlist are at [soyboi.tech](https://soyboi.tech).
@@ -119,7 +119,7 @@ The home-screen widget is separate and must be added by the user. It shows today
 
 ### iPhone
 
-The iPhone app lives in [ios/](ios/) and requires iOS 18 or newer. Try the beta through [TestFlight](https://testflight.apple.com/join/RC3j99A8). Install Apple's free [TestFlight app](https://apps.apple.com/us/app/testflight/id899247664) first if needed.
+The iPhone app lives in [ios/](ios/) and requires iOS 18 or newer. You can install it on your phone from [Apple's App Store](https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861).
 
 ### Android
 
