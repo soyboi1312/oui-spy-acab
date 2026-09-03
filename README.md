@@ -1,8 +1,10 @@
 # All Cameras Are Beacons
 
-**All Cameras Are Beacons.** A little gadget that quietly notices when surveillance gear is around you and gives you a heads-up, either on your phone or over a Meshtastic mesh.
+**All Cameras Are Beacons.** [beacon](https://soyboi.tech) is a little gadget that quietly notices when surveillance gear is around you and gives you a heads-up on your phone.
 
 It runs on the beacon, our own dual-radio board, and on the **Colonel Panic OUI-Spy** and **Mesh-Detect** boards built around a Seeed XIAO ESP32-S3. Plug it in and it listens for radio signals that cameras, sensors, trackers, and drones already broadcast. When it recognizes one, it tells you.
+
+- **Want the beacon?** Buy it on [Tindie](https://www.tindie.com/stores/soyboitech/). Pricing, availability and the getting-started guide are at [soyboi.tech](https://soyboi.tech).
 
 > **Important:** detection of nearby devices is passive. Shipping firmware does not probe, jam,
 > spoof, control, or interfere with the devices it observes. The board uses a bonded, encrypted
@@ -17,7 +19,6 @@ It runs on the beacon, our own dual-radio board, and on the **Colonel Panic OUI-
 - **Want to look around without hardware?** Install the [iPhone app](https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861) or [Android app](https://play.google.com/store/apps/details?id=tech.soyboi.beacons) and tap **See how it works**. It loads six clearly marked fictional detections. Sample settings never configure a board, sample rows never enter your real Log, and leaving the sample restores your saved data.
 - **Already have compatible hardware?** Power the beacon, OUI-Spy, or Mesh-Detect board and tap **Scan** in the app. Grant Bluetooth access on iPhone, Nearby devices on Android 12 or newer, or Location on Android 8 through 11. Choose the board and approve the system pairing prompt. The first encrypted connection opens a short walkthrough followed by the relevant permission and readiness prompts.
 - **Building your own OUI-Spy or Mesh-Detect?** Use the [one-click DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/) or follow the [command-line instructions](#flashing-from-the-command-line).
-- **Want the beacon?** Buy it on [Tindie](https://www.tindie.com/stores/soyboitech/). Pricing, availability and the getting-started guide are at [soyboi.tech](https://soyboi.tech).
 - **Need a hand?** Read the [getting-started guide](https://soyboi.tech/getting-started), check the [FAQ and support page](https://soyboi.tech/faq), or open a [GitHub issue](https://github.com/soyboi1312/all-cameras-are-beacons/issues).
 
 A board is required for live detection. Sample data and an existing saved Log remain available without one.
@@ -179,9 +180,9 @@ Release signing uses the protected signing workflow instead. The DIY script does
 
 Every shipping target uses the same detector engine and honors the same per-category settings. The difference is the hardware and where alerts go.
 
+- **the beacon rev-A and rev-B** use a dedicated nRF52840 for continuous Bluetooth scanning while the ESP32-S3 handles Wi-Fi and the app link. The two revisions require different ESP32-S3 images.
 - **OUI-Spy** is a single-radio XIAO ESP32-S3 build that streams detections to either phone app.
 - **Mesh-Detect** is the same single-radio detector with an additional serial uplink to a Heltec V3 running Meshtastic. Messages use labels such as `ALPR camera detected` and `Drone detected`. It also pairs with the phone app, and can add the phone's location to Meshtastic alerts while connected.
-- **the beacon rev-A and rev-B** use a dedicated nRF52840 for continuous Bluetooth scanning while the ESP32-S3 handles Wi-Fi and the app link. The two revisions require different ESP32-S3 images.
 
 Wiring and Meshtastic setup are in [docs/mesh-setup.md](docs/mesh-setup.md).
 
@@ -208,7 +209,7 @@ The companion nRF firmware and the beacon hardware design, PCB, enclosure, and m
 
 The current source version is **2.0.7** for the ESP32-S3 firmware and both phone apps. Public app and firmware distribution can lag the source tree.
 
-The detector, Meshtastic path, native apps, and firmware update flows have been exercised on real hardware. Retail beacon hardware is sold through [Tindie](https://www.tindie.com/stores/soyboitech/); soyboi.tech carries current availability. Detection depends on known, defensible radio signatures, so field capture and ground-truth validation remain ongoing work.
+The detector, Meshtastic path, native apps, and firmware update flows have been exercised on real hardware. Retail beacon hardware is sold through [Tindie](https://www.tindie.com/stores/soyboitech/); [https://soyboi.tech](https://soyboi.tech) carries current availability. Detection depends on known, defensible radio signatures, so field capture and ground-truth validation remain ongoing work.
 
 ESP32-S3 updates verify a signed image on the board and use a health-confirmation rollback path. On the dual-radio beacon, a combined update installs the nRF package first, then the ESP32-S3 image. The phone verifies the nRF package before transfer; the stock nRF bootloader itself provides CRC validation rather than the ESP32-S3's on-device signature check. Triggering that update also requires the encrypted app session and the physical power-on authorization window. The combined sequence has completed successfully from both iPhone and Android test devices.
 
