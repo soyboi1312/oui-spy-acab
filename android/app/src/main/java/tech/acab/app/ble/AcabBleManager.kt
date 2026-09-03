@@ -6528,7 +6528,7 @@ class AcabBleManager(private val context: Context) {
             // "moto" is present so the tour shows the Motorola sub-toggle. Omitting it would make
             // the demo board look like pre-split firmware and hide the control the tour exists to
             // introduce. "axon":true so the parent category is on and the sub-row is not dimmed.
-            """{"fw":"beacon board 2.0.6","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}"""))
+            """{"fw":"beacon board 2.0.7","up":4920,"total":6,"ble":true,"wifi":true,"axon":true,"moto":true,"tracker":true,"glasses":true,"ncam":true,"buzzer":true,"vol":70,"gps":true,"bat":82}"""))
         _state.value = ConnState.READY
         syncLocationOwnership()
         // placeDemoDetections clears + repopulates the same maps the async startup reload fills, so
@@ -6564,8 +6564,11 @@ class AcabBleManager(private val context: Context) {
             """{"t":9,"s":0,"meth":3,"c":60,"mac":"5A:2E:7C:41:08:D3","rssi":-69,"det":"Meta: possible recording glasses or Quest","cid":1422,"lat":37.7804,"lon":-122.4181,"n":2,"new":true}""",
             // Branded IP-camera OUI seen on the host WiFi (matched by source MAC), so the NETCAM
             // tile and NETWORK CAM map chip both show up on the tour. The MAC is a real Hikvision
-            // block, so this row demonstrates the maker-led title end to end.
-            """{"t":10,"s":0,"meth":1,"c":80,"mac":"44:19:B6:22:0A:5C","rssi":-70,"det":"Hikvision on wifi","lat":37.7788,"lon":-122.4183,"n":2,"new":true}""",
+            // block, so this row demonstrates the maker-led title end to end. Wire values are the
+            // firmware's own: s=1 is SRC_WIFI (netcamClassifyWiFi never emits a BLE source) and
+            // c=65 is NETCAM_OUI_CONFIDENCE, the registry tier a validated=0 block lands on; the
+            // twin row in iOS BLEManager.seedDemoData carries the same values.
+            """{"t":10,"s":1,"meth":1,"c":65,"mac":"44:19:B6:22:0A:5C","rssi":-70,"det":"Hikvision on wifi","lat":37.7788,"lon":-122.4183,"n":2,"new":true}""",
         )
         val now = System.currentTimeMillis()
         val wobble = listOf(-6, -3, -7, -1, -4, 2, -2, 1, -3, 0, -1, 1, -2, 0)

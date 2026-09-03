@@ -105,6 +105,7 @@ import tech.acab.app.model.sourceLabel
 import tech.acab.app.model.validCoord
 import tech.acab.app.model.vendor
 import tech.acab.app.ui.theme.Acab
+import tech.acab.app.ui.theme.textTone
 import tech.acab.app.ui.theme.tone
 import tech.acab.app.model.maker
 import tech.acab.app.model.isChipsetRegistrant
@@ -131,6 +132,7 @@ fun DetailScreen(
     val targetId = remember(detection) { detection.id }
     val d = detections.firstOrNull { it.id == targetId } ?: detection
     val tone = d.type.tone()
+    val textTone = d.type.textTone()   // crimson words use the text-safe cut; fills keep tone
     val trend = ble.rssiTrend(d.id)
     val stale = ble.isStale(d.id)
     // Buffered rows the board had no clock for carry an ordering key, not a time. Rendering that
@@ -218,7 +220,7 @@ fun DetailScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
                     // Category lowercased like iOS: the caps in the pill belong to the class
                     // label, the category reads as content.
-                    BadgePill("${d.type.category.lowercase()} · ${d.type.classLabel}", tone)
+                    BadgePill("${d.type.category.lowercase()} · ${d.type.classLabel}", tone, textTone)
                     Text("NODE ${nodeName(d.mac)}", color = Acab.text,
                         fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
                     // NEITHER branch may consult the OUI lookup: the OUI resolves a Flock
@@ -269,7 +271,7 @@ fun DetailScreen(
                     }
                     Spacer(Modifier.weight(1f))
                     Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text(d.sourceLabel, color = tone, fontSize = 20.sp,
+                        Text(d.sourceLabel, color = textTone, fontSize = 20.sp,
                             fontWeight = FontWeight.SemiBold, fontFamily = Acab.display)
                         Kicker("BAND")
                     }
@@ -368,14 +370,14 @@ fun DetailScreen(
                     // datum in an evidence export, and the operator (pilot) fix is the whole point
                     // of a drone detection, so show both as text, not only as a pin.
                     run { val la = d.lat; val lo = d.lon
-                        if (la != null && lo != null && validCoord(la, lo)) add("Position" to "%.5f, %.5f".format(la, lo)) }
+                        if (la != null && lo != null && validCoord(la, lo)) add("Position" to coordText(la, lo)) }
                     d.altitude?.let { add("Altitude" to "$it m") }
                     d.speedH?.let { add("Speed" to "$it m/s") }
                     d.speedV?.takeIf { it != 0 }?.let { add("Vert. speed" to "$it m/s") }
                     d.heading?.let { add("Heading" to "$it°") }
                     d.heightAGL?.let { add("Height AGL" to "$it m") }
                     run { val pla = d.pilotLat; val plo = d.pilotLon
-                        if (pla != null && plo != null && validCoord(pla, plo)) add("Operator pos" to "%.5f, %.5f".format(pla, plo)) }
+                        if (pla != null && plo != null && validCoord(pla, plo)) add("Operator pos" to coordText(pla, plo)) }
                     d.pilotAlt?.let { add("Operator alt" to "$it m") }
                     d.ridStatusLabel?.let { add("Status" to it) }
                 }
@@ -539,7 +541,7 @@ private fun HelpOverlay(questionId: String, onClose: () -> Unit) {
 
 /** Category badge pill in the type tone, like the iOS detail header. */
 @Composable
-private fun BadgePill(label: String, tone: Color) {
+private fun BadgePill(label: String, tone: Color, textTone: Color) {
     val shape = RoundedCornerShape(50)
     Box(
         Modifier
@@ -547,7 +549,7 @@ private fun BadgePill(label: String, tone: Color) {
             .border(1.dp, tone.copy(alpha = 0.35f), shape)
             .padding(horizontal = 9.dp, vertical = 4.dp),
     ) {
-        Text(label, color = tone, fontSize = 9.5.sp, letterSpacing = 1.sp,
+        Text(label, color = textTone, fontSize = 9.5.sp, letterSpacing = 1.sp,
             fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
     }
 }
@@ -957,7 +959,7 @@ private fun LocationPanel(d: Detection, lat: Double, lon: Double, onOpenInMap: (
         Row(verticalAlignment = Alignment.CenterVertically) {
             Kicker("LOCATION")
             Spacer(Modifier.weight(1f))
-            Text(String.format("%.5f, %.5f", lat, lon),
+            Text(coordText(lat, lon),
                 color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono)
         }
         // When the board stamped this from a stale phone fix (offline / Desert mode), say how
@@ -1701,3 +1703,10 @@ private fun seenSpan(ms: Long?): String? {
         else -> "${secs / 86_400}d"
     }
 }
+
+/** "32.76324, -117.15342": the on-screen coordinate pair. Pinned to Locale.US so the decimal
+ *  separator is a dot on every phone; the default-locale format() printed "32,76324" on an
+ *  es/pl/ro/sv device, which reads as a swapped pair and disagrees with the CSV export (see the
+ *  Locale.US note on AcabBleManager.f6) and with iOS, whose String(format:) is locale-free. */
+private fun coordText(lat: Double, lon: Double): String =
+    String.format(java.util.Locale.US, "%.5f, %.5f", lat, lon)

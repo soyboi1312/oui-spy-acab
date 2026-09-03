@@ -278,7 +278,7 @@ struct PunkLine: View {
         // Ornamental brand copy, so it is pinned at its design size: at accessibility text
         // sizes every point it grows is a point stolen from the content around it.
         (Text("they're watching. ").foregroundStyle(ACABTheme.dim)
-         + Text("watch back.").foregroundStyle(ACABTheme.accent).italic())
+         + Text("watch back.").foregroundStyle(ACABTheme.accentText).italic())
             .font(Font.custom("SpaceGrotesk-Medium", fixedSize: 14))
     }
 }

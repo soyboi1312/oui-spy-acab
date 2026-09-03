@@ -346,7 +346,7 @@ fun AcabApp(
                             onStartDefaultLiveMode(true)
                         },
                     ) {
-                        Text("CONTINUE", color = Acab.accent, fontSize = 12.sp,
+                        Text("CONTINUE", color = Acab.accentText, fontSize = 12.sp,
                             fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
                     }
                 },
@@ -711,7 +711,7 @@ private fun BoardRow(board: FoundBoard, onConnect: () -> Unit) {
                     fontFamily = Acab.mono)
                 if (board.firmware != null) {
                     Spacer(Modifier.width(6.dp))
-                    Text("v${board.firmware}", color = Acab.accent, fontSize = 9.sp,
+                    Text("v${board.firmware}", color = Acab.accentText, fontSize = 9.sp,
                         fontWeight = FontWeight.Bold, fontFamily = Acab.mono,
                         modifier = Modifier
                             .background(Acab.accent.copy(alpha = 0.15f), CircleShape)
@@ -1109,7 +1109,7 @@ private fun LiveNotificationBlockedBanner(onDismiss: () -> Unit, modifier: Modif
             Spacer(Modifier.width(8.dp))
             Text(
                 "GOT IT",
-                color = Acab.accent,
+                color = Acab.accentText,
                 fontSize = 10.sp,
                 fontWeight = FontWeight.Bold,
                 fontFamily = Acab.mono,

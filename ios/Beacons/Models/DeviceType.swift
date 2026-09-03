@@ -101,11 +101,22 @@ enum DeviceType: Int, CaseIterable, Identifiable, Codable {
         case .drone:                    return ACABTheme.droneTone
         case .axonBodyCam:              return ACABTheme.axonTone
         case .tracker:                  return ACABTheme.trackerTone
-        case .nearbyDevice:             return Color(red: 0.82, green: 0.67, blue: 0.40)   // desert sand
+        case .nearbyDevice:             return ACABTheme.sandTone   // desert sand
         case .watched:                  return ACABTheme.watchTone
         case .recordingGlasses:         return ACABTheme.glassesTone
         case .networkCamera:            return ACABTheme.netcamTone
         case .unknown:                  return ACABTheme.dim   // neutral, like Android's Acab.dim
+        }
+    }
+
+    /// The category colour for TEXT and digits. Only crimson differs from `tint`: the fill
+    /// accent measures under AA as text on the raised surface, so words in the Flock colour
+    /// use ACABTheme.accentText. Fills, bars, rings and pins keep `tint`.
+    /// Android twin: DeviceType.textTone() in Theme.kt.
+    var textTint: Color {
+        switch self {
+        case .flockCamera, .flockRaven: return ACABTheme.accentText
+        default:                        return tint
         }
     }
 

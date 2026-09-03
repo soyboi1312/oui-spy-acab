@@ -47,6 +47,7 @@ import androidx.compose.material.icons.outlined.RadioButtonChecked
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.MenuDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -101,6 +102,7 @@ import tech.acab.app.model.methodLabel
 import tech.acab.app.model.sourceLabel
 import tech.acab.app.model.bufferHealthNotices
 import tech.acab.app.ui.theme.Acab
+import tech.acab.app.ui.theme.textTone
 import tech.acab.app.ui.theme.tone
 import java.io.File
 import tech.acab.app.model.hasName
@@ -436,14 +438,21 @@ fun LogScreen(
                         Box {
                             ActionChip(Icons.Filled.IosShare,
                                 catFilter?.let { "EXPORT $it" } ?: "EXPORT") { exportMenuOpen = true }
-                            DropdownMenu(expanded = exportMenuOpen, onDismissRequest = { exportMenuOpen = false }) {
+                            // Explicit colours: the app draws no MaterialTheme, so a bare
+                            // DropdownMenu falls back to Material's light defaults.
+                            val menuColors = MenuDefaults.itemColors(
+                                textColor = Acab.text, leadingIconColor = Acab.dim)
+                            DropdownMenu(expanded = exportMenuOpen, onDismissRequest = { exportMenuOpen = false },
+                                containerColor = Acab.bg3) {
                                 DropdownMenuItem(
                                     text = { Text("CSV, shown rows") },
                                     leadingIcon = { Icon(Icons.Filled.IosShare, contentDescription = null) },
+                                    colors = menuColors,
                                     onClick = { exportMenuOpen = false; exportLog(false) })
                                 DropdownMenuItem(
                                     text = { Text("GPX, shown rows") },
                                     leadingIcon = { Icon(Icons.Filled.Place, contentDescription = null) },
+                                    colors = menuColors,
                                     onClick = { exportMenuOpen = false; exportLog(true) })
                             }
                         }
@@ -747,7 +756,7 @@ private fun PauseChip(paused: Boolean, onToggle: () -> Unit) {
 private fun PausedPill(newCount: Int) {
     Text(
         if (newCount > 0) "PAUSED · $newCount NEW" else "PAUSED",
-        color = Acab.accent,
+        color = Acab.accentText,
         fontSize = 9.sp, letterSpacing = 0.5.sp, fontWeight = FontWeight.Bold, fontFamily = Acab.mono,
         maxLines = 1,
         modifier = Modifier
@@ -855,7 +864,7 @@ private fun CategoryTile(
             tint = if (n == 0 && !active) Acab.faint else type.tone(), modifier = Modifier.size(14.dp))
         Text("$n", color = if (n == 0) Acab.faint else Acab.text,
             fontSize = 18.sp, fontWeight = FontWeight.Bold)
-        Text(label, color = if (active) type.tone() else if (n == 0) Acab.faint else Acab.dim,
+        Text(label, color = if (active) type.textTone() else if (n == 0) Acab.faint else Acab.dim,
             fontSize = 8.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Medium,
             fontFamily = Acab.mono, maxLines = 1)
     }
@@ -957,7 +966,7 @@ private fun DetectionRow(
         // if its content still runs to the column edge on some future locale/font combination.
         Spacer(Modifier.size(10.dp))
         Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            Text("${d.rssi}", color = d.type.tone(), fontSize = 13.sp,
+            Text("${d.rssi}", color = d.type.textTone(), fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold, fontFamily = Acab.mono, maxLines = 1)
             SignalBars(rssiBars(d.rssi), tint = d.type.tone())
         }

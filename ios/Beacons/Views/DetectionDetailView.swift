@@ -227,7 +227,7 @@ struct DetectionDetailView: View {
             Text(d.classLabel)
         }
         .font(ACABTheme.mono(9.5, weight: .bold)).tracking(1)
-        .foregroundStyle(d.type.tint)
+        .foregroundStyle(d.type.textTint)
         .padding(.horizontal, 9).padding(.vertical, 4)
         .background(d.type.tint.opacity(0.13), in: Capsule())
         .overlay(Capsule().strokeBorder(d.type.tint.opacity(0.35), lineWidth: 1))
@@ -591,13 +591,13 @@ struct DetectionDetailView: View {
                 Spacer()
                 VStack(alignment: .trailing, spacing: 2) {
                     Text(d.source.label).font(ACABTheme.display(20, weight: .semibold))
-                        .foregroundStyle(d.type.tint)
+                        .foregroundStyle(d.type.textTint)
                     Kicker("BAND")
                 }
             }
             HStack(spacing: 8) {
                 VStack(alignment: .trailing, spacing: 0) {
-                    Kicker("STRONG", color: d.type.tint)
+                    Kicker("STRONG", color: d.type.textTint)
                     Spacer(minLength: 4)
                     Kicker("WEAK", color: ACABTheme.dim)
                 }

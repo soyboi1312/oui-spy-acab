@@ -82,6 +82,9 @@ struct RootView: View {
     // ContributeView capture. This intentionally lasts for the process; the hidden shell is cheap
     // and retaining user-entered field work is more important than rebuilding it after reconnect.
     @State private var hasMountedMain = false
+    /// Bold Text. Mirrored into TypePrefs (the observable the static font helpers read) so a
+    /// change made in Settings reaches every custom-font Text without a relaunch.
+    @Environment(\.legibilityWeight) private var legibilityWeight
     private var hasUsableSession: Bool {
         (ble.sessionReady && ble.connectionState == .connected)
             || (ble.demoMode && ble.connectionState == .connected)
@@ -131,6 +134,9 @@ struct RootView: View {
             .padding(.bottom, (hasMountedMain && (ble.isReconnecting || ble.demoMode)) || ble.offlineSyncBanner != nil ? 8 : 0)
         }
         .animation(.easeInOut, value: ble.offlineSyncBanner)
+        .onChange(of: legibilityWeight, initial: true) { _, w in
+            TypePrefs.shared.bold = (w == .bold)
+        }
         .preferredColorScheme(.dark)
         .animation(.easeInOut, value: ble.connectionState)
         // Mount sample data at its synthetic connected boundary. A real session is mounted by the
@@ -339,7 +345,7 @@ private struct SampleDataBannerView: View {
             Spacer(minLength: 4)
             Button("EXIT") { ble.exitDemo() }
                 .font(ACABTheme.mono(10, weight: .bold)).tracking(0.7)
-                .foregroundStyle(ACABTheme.accent)
+                .foregroundStyle(ACABTheme.accentText)
                 .frame(minWidth: 54, minHeight: 44)
                 .contentShape(Rectangle())
                 .accessibilityLabel("Exit sample data")
@@ -400,13 +406,16 @@ struct MainTabView: View {
         let a = UITabBarAppearance()
         a.configureWithTransparentBackground()
         a.backgroundEffect = UIBlurEffect(style: .systemUltraThinMaterialDark)
-        a.backgroundColor = UIColor(red: 18/255, green: 12/255, blue: 14/255, alpha: 0.74)
+        // Dynamic UIColors, not UIColor(Color) snapshots: UIKit re-resolves these when the
+        // accessibilityContrast trait changes (system Increase Contrast, or the in-app switch
+        // via ContrastPreference), so the tab bar follows the palette like every SwiftUI view.
+        a.backgroundColor = ACABTheme.uiTabBarBackground
 
         let item = UITabBarItemAppearance()
-        item.normal.iconColor = UIColor(ACABTheme.faint)
-        item.normal.titleTextAttributes = [.foregroundColor: UIColor(ACABTheme.faint)]
-        item.selected.iconColor = UIColor(ACABTheme.accent)
-        item.selected.titleTextAttributes = [.foregroundColor: UIColor(ACABTheme.accent)]
+        item.normal.iconColor = ACABTheme.uiFaint
+        item.normal.titleTextAttributes = [.foregroundColor: ACABTheme.uiFaint]
+        item.selected.iconColor = ACABTheme.uiAccent
+        item.selected.titleTextAttributes = [.foregroundColor: ACABTheme.uiAccent]
         a.stackedLayoutAppearance = item
         a.inlineLayoutAppearance = item
         a.compactInlineLayoutAppearance = item

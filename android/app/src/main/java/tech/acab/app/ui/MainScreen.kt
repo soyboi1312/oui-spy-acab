@@ -455,7 +455,7 @@ private fun SampleDataBanner(
                     .padding(horizontal = 12.dp, vertical = 7.dp),
                 contentAlignment = Alignment.Center,
             ) {
-                Text("EXIT SAMPLE DATA", color = Acab.accent, fontSize = 10.sp,
+                Text("EXIT SAMPLE DATA", color = Acab.accentText, fontSize = 10.sp,
                     fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
             }
         }

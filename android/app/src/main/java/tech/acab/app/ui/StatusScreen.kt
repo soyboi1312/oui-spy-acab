@@ -80,6 +80,7 @@ import tech.acab.app.model.Detection
 import tech.acab.app.model.DeviceType
 import tech.acab.app.model.sourceLabel
 import tech.acab.app.ui.theme.Acab
+import tech.acab.app.ui.theme.textTone
 import tech.acab.app.ui.theme.tone
 import kotlin.math.PI
 import kotlin.math.abs
@@ -448,7 +449,7 @@ private fun FinishSetupCard(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center,
         ) {
-            Text("REVIEW IN BEACON", color = Acab.accent, fontSize = 10.sp,
+            Text("REVIEW IN BEACON", color = Acab.accentText, fontSize = 10.sp,
                 fontWeight = FontWeight.Bold, fontFamily = Acab.mono)
             Spacer(Modifier.size(6.dp))
             Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = Acab.accent,
@@ -738,7 +739,7 @@ private fun CountTile(
             tint = if (off || n == 0) Acab.faint else type.tone(), modifier = Modifier.size(14.dp))
         Text(if (off) "off" else "$n", color = if (off || n == 0) Acab.faint else Acab.text,
             fontSize = 18.sp, fontWeight = FontWeight.Bold)
-        Text(label, color = if (off || n == 0) Acab.faint else type.tone(),
+        Text(label, color = if (off || n == 0) Acab.faint else type.textTone(),
             fontSize = 8.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Medium,
             fontFamily = Acab.mono, maxLines = 1)
     }
@@ -773,7 +774,7 @@ private fun NearestCard(d: Detection, onSelect: (Detection) -> Unit) {
                     color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
             }
             Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                Text("${d.rssi}", color = Acab.accent, fontSize = 15.sp,
+                Text("${d.rssi}", color = Acab.accentText, fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold, fontFamily = Acab.mono)
                 SignalBars(rssiBars(d.rssi), tint = d.type.tone())
             }
@@ -792,7 +793,7 @@ private fun PunkLine() {
     val fs = LocalDensity.current.fontScale
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text("they're watching. ", color = Acab.dim, fontSize = 14.sp / fs, fontWeight = FontWeight.Medium)
-        Text("watch back.", color = Acab.accent, fontSize = 14.sp / fs, fontWeight = FontWeight.Medium,
+        Text("watch back.", color = Acab.accentText, fontSize = 14.sp / fs, fontWeight = FontWeight.Medium,
             fontStyle = FontStyle.Italic)
     }
 }

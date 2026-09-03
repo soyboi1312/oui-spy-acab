@@ -359,7 +359,7 @@ struct ConnectView: View {
             } label: {
                 Text("SCAN AGAIN")
                     .font(ACABTheme.mono(11, weight: .bold)).tracking(1)
-                    .foregroundStyle(ACABTheme.accent)
+                    .foregroundStyle(ACABTheme.accentText)
                     .frame(maxWidth: .infinity, minHeight: 44)
                     .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
                         .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
@@ -382,7 +382,7 @@ struct ConnectView: View {
             Button { ble.startScanFromUser() } label: {
                 Text("SCAN AGAIN")
                     .font(ACABTheme.mono(12, weight: .bold)).tracking(1)
-                    .foregroundStyle(ACABTheme.accent)
+                    .foregroundStyle(ACABTheme.accentText)
                     .padding(.horizontal, 16)
                     .frame(minHeight: 44)   // 44pt target
                     .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
@@ -458,7 +458,7 @@ struct ConnectView: View {
             }
             Button("OPEN SETTINGS", action: openAppSettings)
                 .font(ACABTheme.mono(11, weight: .bold)).tracking(1)
-                .foregroundStyle(ACABTheme.accent)
+                .foregroundStyle(ACABTheme.accentText)
                 .frame(maxWidth: .infinity, minHeight: 44)
                 .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
                     .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
@@ -471,7 +471,7 @@ struct ConnectView: View {
             message(title, body, symbol)
             Button("OPEN SETTINGS", action: openAppSettings)
                 .font(ACABTheme.mono(11, weight: .bold)).tracking(1)
-                .foregroundStyle(ACABTheme.accent)
+                .foregroundStyle(ACABTheme.accentText)
                 .frame(maxWidth: .infinity, minHeight: 44)
                 .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
                     .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
@@ -525,7 +525,7 @@ struct ConnectView: View {
                     Text(dev.name).font(ACABTheme.mono(14, weight: .semibold))
                     if let fw = dev.firmware {
                         Text("v\(fw)").font(ACABTheme.mono(9, weight: .bold))
-                            .foregroundStyle(ACABTheme.accent)
+                            .foregroundStyle(ACABTheme.accentText)
                             .padding(.horizontal, 5).padding(.vertical, 1)
                             .background(ACABTheme.accent.opacity(0.15), in: Capsule())
                     }

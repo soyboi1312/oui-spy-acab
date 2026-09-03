@@ -390,7 +390,7 @@ struct DashboardView: View {
                 Text(label)
                     .font(ACABTheme.mono(8, weight: .semibold))
                     .tracking(0.8)
-                    .foregroundStyle(off || n == 0 ? ACABTheme.faint : type.tint)
+                    .foregroundStyle(off || n == 0 ? ACABTheme.faint : type.textTint)
                     .lineLimit(1)
                     .frame(height: categoryCaptionLineHeight)
             }
@@ -432,7 +432,7 @@ struct DashboardView: View {
                     VStack(alignment: .trailing, spacing: 5) {
                         Text("\(d.rssi)")
                             .font(ACABTheme.mono(15, weight: .semibold))
-                            .foregroundStyle(ACABTheme.accent)
+                            .foregroundStyle(ACABTheme.accentText)
                         SignalBars(bars: d.signalBars, tint: d.type.tint)
                     }
                     Image(systemName: "chevron.right")

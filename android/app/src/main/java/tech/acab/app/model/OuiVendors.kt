@@ -239,8 +239,8 @@ fun isChipsetRegistrant(vendor: String): Boolean = vendor in setOf(
  *  WHY THIS EXISTS: an unnamed detection used to lead its log row with the category label, so
  *  twelve cameras in a row all read "Network camera" beside a glyph that already said network
  *  camera. The manufacturer was on the wire the whole time and both apps threw it away:
- *  netcam_detect.cpp writes "<vendor> on wifi" off a 180-OUI table, and not one of those vendors
- *  is in OUI_VENDORS, so [ouiVendor] is null for 100% of network cameras.
+ *  netcam_detect.cpp writes "<vendor> on wifi" from its camera-vendor prefix tables;
+ *  those vendors are absent from OUI_VENDORS, so [ouiVendor] cannot supply these labels.
  *
  *  READ THIS BEFORE ADDING A STEP: the maker is a WEAKER claim than the category label it
  *  replaces, not a stronger one. "Hikvision" could be an NVR or a doorbell; "Network camera"

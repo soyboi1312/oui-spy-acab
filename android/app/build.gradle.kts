@@ -33,8 +33,8 @@ android {
         // Device and Detail, orientation changes, the Drive foreground service, and large-screen
         // layout all need eyes on a real 16 device.
         targetSdk = 36
-        versionCode = 26
-        versionName = "2.0.6"
+        versionCode = 27
+        versionName = "2.0.7"
     }
 
     signingConfigs {

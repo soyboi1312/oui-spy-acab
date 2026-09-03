@@ -53,6 +53,7 @@ import androidx.compose.material.icons.filled.Landscape
 import androidx.compose.material.icons.filled.Lightbulb
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Contrast
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Refresh
@@ -126,6 +127,7 @@ import tech.acab.app.model.DeviceType
 import tech.acab.app.net.FirmwareBuild
 import tech.acab.app.net.FirmwareManifest
 import tech.acab.app.ui.theme.Acab
+import tech.acab.app.ui.theme.ContrastMode
 import tech.acab.app.ui.theme.tone
 import tech.acab.app.widget.BeaconsWidgetProvider
 
@@ -165,10 +167,10 @@ internal fun bufferClearConfirmationCopy(
 
 /** Latest published beacon-board firmware; last-resort offline fallback for an unrecognized
  *  board label (known boards read their per-board version from the manifest). Bump on release. */
-private const val LATEST = "2.0.6"
+private const val LATEST = "2.0.7"
 
 /** Which config drawer section is open. Exactly one at a time (proposal 1g). */
-private enum class ConfigSection { NONE, FIRMWARE, RADIOS, DETECTORS, ALERTS, NOTIFY, DRIVE, DESERT, LED }
+private enum class ConfigSection { NONE, FIRMWARE, RADIOS, DETECTORS, ALERTS, NOTIFY, DISPLAY, DRIVE, DESERT, LED }
 
 /**
  * One optimistic board control, described once. Three sites derive everything from the list of
@@ -553,6 +555,11 @@ fun DeviceScreen(
         AlertMode.SILENT -> "SILENT"
     }
     // "3 ON" / "OFF", so the collapsed row says whether anything will interrupt you.
+    val displayKicker = when {
+        ContrastMode.forced -> "HIGHER CONTRAST · ALWAYS"
+        ContrastMode.systemWantsHigher -> "HIGHER CONTRAST · FROM ANDROID"
+        else -> "DEFAULT CONTRAST"
+    }
     val notifyKicker = DetectionNotifier.NOTIFIABLE.count { notifyIsOn(it) }
         .let { if (it == 0) "OFF" else "$it ON" }
     val driveKicker = "LIVE ${if (shownLiveWanted) "ON" else "OFF"} · COUNTS ${if (shownRedactLock) "PRIVATE" else "VISIBLE"}"
@@ -783,7 +790,7 @@ fun DeviceScreen(
                                 color = Acab.dim, fontSize = 14.sp)
                         },
                         confirmButton = {
-                            Text("ERASE", color = Acab.accent, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                            Text("ERASE", color = Acab.accentText, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                                 letterSpacing = 0.5.sp, fontFamily = Acab.mono,
                                 modifier = Modifier.minimumInteractiveComponentSize()
                                     .clickable { ble.clearBufferLog(); confirmEraseBuffer = false }
@@ -849,7 +856,7 @@ fun DeviceScreen(
                 checked = desertOn,
                 pending = desertPending && !demo,
             ) { desertOn = it; desertPending = true; if (!demo) ble.setDesert(it) }
-            Text("Off the grid, anything new on the air means something arrived. Each device is tagged hardware vs. randomized (phone) MAC.",
+            Text("Off the grid, anything new on the air means something arrived. Each device is tagged hardware or randomized (phone) MAC, or OUI unknown when the radio cannot tell.",
                 color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
             if (desertOn) {
                 // The startup jingle is NOT exempt from the mute (alerts.cpp, 2026-08-24: the boot
@@ -1049,6 +1056,12 @@ fun DeviceScreen(
                         )
                     }
                     HorizontalDivider(color = Acab.line)
+                    // Phone-side like Notifications: nothing here touches the board.
+                    FoldRow(Icons.Filled.Contrast, "Display", displayKicker,
+                        openSection == ConfigSection.DISPLAY, { toggleSection(ConfigSection.DISPLAY) }) {
+                        DisplayCard()
+                    }
+                    HorizontalDivider(color = Acab.line)
                     // Board LED sits with Alerts (both are local feedback), above the situational modes.
                     FoldRow(Icons.Filled.Lightbulb, "Board LED", ledKicker,
                         openSection == ConfigSection.LED, { toggleSection(ConfigSection.LED) },
@@ -1123,7 +1136,7 @@ fun DeviceScreen(
                                 color = Acab.dim, fontSize = 14.sp)
                         },
                         confirmButton = {
-                            Text("POWER OFF", color = Acab.accent, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                            Text("POWER OFF", color = Acab.accentText, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                                 letterSpacing = 0.5.sp, fontFamily = Acab.mono,
                                 modifier = Modifier.minimumInteractiveComponentSize()
                                     .clickable { ble.powerOff(); confirmPowerOff = false }
@@ -1747,7 +1760,8 @@ private fun CombinedStatus(
             modifier = Modifier.fillMaxWidth(), color = Acab.accent, trackColor = Acab.line,
         )
         val e = combined.elapsedSeconds
-        Text(String.format("elapsed %d:%02d", e / 60, e % 60),
+        // Locale.US: the default-locale overload localizes %d digits on some phones.
+        Text(String.format(java.util.Locale.US, "elapsed %d:%02d", e / 60, e % 60),
             color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
     }
 
@@ -1862,6 +1876,32 @@ private fun CardButton(label: String, tint: Color = Acab.accent, filled: Boolean
  * lives in DeviceScreen (with its pending-echo hold), so a status frame mid-drag can't snap
  * the thumb; dragging only repaints, one write on release.
  */
+/** "always use higher contrast": OFF follows the system (the Android 14+ contrast slider, the
+ *  Android 16 high-contrast-text switch), ON forces the higher-contrast palette. Named that way,
+ *  rather than "higher contrast", so a user whose system setting is on understands why turning
+ *  this off changes nothing. The palette lives in Theme.kt; this card only flips ContrastMode.
+ *  Mirrors iOS displayCard (SettingsView.swift). */
+@Composable
+private fun DisplayCard() {
+    val context = LocalContext.current
+    Column(Modifier.fillMaxWidth().panel(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Kicker("DISPLAY")
+        ToggleRow(
+            "always use higher contrast",
+            if (ContrastMode.systemHasControl)
+                "brighter secondary text and clearer control edges · off follows the system contrast settings"
+            else "brighter secondary text and clearer control edges",
+            checked = ContrastMode.forced,
+        ) { ContrastMode.setForced(context, it) }
+        Text(
+            if (ContrastMode.systemWantsHigher)
+                "Android asks for higher contrast, so it stays on while this switch is off."
+            else "text size and bold text follow the Android settings.",
+            color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono,
+        )
+    }
+}
+
 /** Per-category phone notifications. A SEPARATE card from ALERTS on purpose: ALERTS picks how the
  *  BOARD behaves, this picks what is worth interrupting you for on the PHONE. Folding them together
  *  would imply a dependency that does not exist. Mirrors iOS notifyCard. */
@@ -2120,7 +2160,7 @@ private fun IgnoredCard(
                         .clickable { onUnmute(dev.mac) }
                         .padding(horizontal = 8.dp, vertical = 8.dp),
                 ) {
-                    Text("UNMUTE", color = Acab.accent, fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                    Text("UNMUTE", color = Acab.accentText, fontSize = 10.sp, fontWeight = FontWeight.Bold,
                         letterSpacing = 1.sp, fontFamily = Acab.mono)
                 }
             }
@@ -2260,7 +2300,7 @@ private fun RenameWatchedDialog(initial: String, onDismiss: () -> Unit, onSave: 
             }
         },
         confirmButton = {
-            Text("SAVE", color = Acab.accent, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+            Text("SAVE", color = Acab.accentText, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                 letterSpacing = 0.5.sp, fontFamily = Acab.mono,
                 modifier = Modifier.minimumInteractiveComponentSize()
                     .clickable { onSave(text.trim()) }.padding(8.dp))
@@ -2312,7 +2352,7 @@ private fun AboutLink(title: String, sub: String, onClick: () -> Unit) {
             Text(title, color = Acab.text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
             Text(sub, color = Acab.faint, fontSize = 11.sp, fontFamily = Acab.mono)
         }
-        Text("↗", color = Acab.accent, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        Text("↗", color = Acab.accentText, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -2426,7 +2466,7 @@ private fun ReadinessAction(
             .semantics { contentDescription = talkBackLabel },
         contentAlignment = Alignment.Center,
     ) {
-        Text(label, color = Acab.accent, fontSize = 9.5.sp, fontWeight = FontWeight.Bold,
+        Text(label, color = Acab.accentText, fontSize = 9.5.sp, fontWeight = FontWeight.Bold,
             fontFamily = Acab.mono, modifier = Modifier.padding(horizontal = 7.dp, vertical = 8.dp))
     }
 }
@@ -2544,6 +2584,6 @@ private fun DisconnectButton(label: String = "Disconnect", enabled: Boolean = tr
             .padding(vertical = 13.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(label, color = Acab.accent, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        Text(label, color = Acab.accentText, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
     }
 }

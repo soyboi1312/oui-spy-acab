@@ -29,6 +29,9 @@ struct DeviceView: View {
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var manifest: FirmwareManifestStore
     var openDetectorsToken: Int = 0
+    /// Observed directly (not injected) so this view renders in previews and tests that do not
+    /// install the environment object.
+    @ObservedObject private var contrast = ContrastPreference.shared
 
     @State private var master: Double = 72
     @State private var pendingVolume = false   // hold the slider at the user's value while dragging + until the board confirms
@@ -351,7 +354,7 @@ struct DeviceView: View {
     // Which config fold section is currently open. Exactly one at a time (nil = all closed).
     // The firmware row/banner shares this state under `.firmware`, so opening it also
     // collapses any open config section.
-    private enum ConfigSection: Hashable { case firmware, radios, detectors, alerts, notify, drive, desert, led }
+    private enum ConfigSection: Hashable { case firmware, radios, detectors, alerts, notify, display, drive, desert, led }
     @State private var openSection: ConfigSection?
 
     // An update "exists" whenever the board is behind the manifest, or an OTA is mid-flight
@@ -414,6 +417,9 @@ struct DeviceView: View {
             // NOT gated on isMeshDetect, unlike Alerts: these are PHONE notifications, so they work
             // the same on a board with no buzzer. That is precisely the board where they matter most.
             foldRow(.notify, glyph: "app.badge", title: "Notifications", kicker: notifyKicker) { AnyView(notifyCard) }
+            rowDivider
+            // Phone-side like Notifications: nothing here touches the board.
+            foldRow(.display, glyph: "circle.lefthalf.filled", title: "Display", kicker: displayKicker) { AnyView(displayCard) }
             rowDivider
             // Board LED sits with Alerts (both are local feedback), above the situational modes.
             foldRow(.led, glyph: "lightbulb", title: "Board LED", kicker: ledKicker) { AnyView(lightsOutCard) }
@@ -564,7 +570,7 @@ struct DeviceView: View {
                                     .fixedSize(horizontal: false, vertical: true)
                                 Button("RETRY SAVE") { ble.retryManagedListPersistence() }
                                     .font(ACABTheme.mono(10, weight: .bold))
-                                    .foregroundStyle(ACABTheme.accent)
+                                    .foregroundStyle(ACABTheme.accentText)
                                     .padding(.top, 3)
                             }
                         }
@@ -1169,7 +1175,7 @@ struct DeviceView: View {
                         Spacer(minLength: 0)
                         Image(systemName: "arrow.up.right").font(.system(size: 12, weight: .semibold))
                     }
-                    .foregroundStyle(ACABTheme.accent)
+                    .foregroundStyle(ACABTheme.accentText)
                     .padding(.vertical, 11).padding(.horizontal, 13)
                     .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radiusSm, style: .continuous))
                     .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
@@ -1392,7 +1398,7 @@ struct DeviceView: View {
                     } else {
                         Button { confirmEraseBuffer = true } label: {
                             Text("ERASE").font(ACABTheme.mono(10, weight: .bold)).tracking(1)
-                                .foregroundStyle(ACABTheme.accent)
+                                .foregroundStyle(ACABTheme.accentText)
                                 .padding(.horizontal, 8).padding(.vertical, 5)
                                 .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
                                 .frame(minHeight: 44)   // 44pt hit target; drawn capsule unchanged
@@ -1477,7 +1483,7 @@ struct DeviceView: View {
                 } else {
                     Button("ENABLE LOCATION") { ble.requestLocationAccessIfNeeded() }
                         .font(ACABTheme.mono(10.5, weight: .bold)).tracking(0.7)
-                        .foregroundStyle(ACABTheme.accent)
+                        .foregroundStyle(ACABTheme.accentText)
                         .frame(minHeight: 44)
                 }
             }
@@ -1510,7 +1516,7 @@ struct DeviceView: View {
                                           desertOn = $0; pendingDesert = true
                                           awaitConfirmation(.desert); ble.setDesertMode($0)
                                       }))
-            Text("Off the grid, anything new on the air means something arrived. Each device is tagged hardware vs. randomized (phone) MAC.")
+            Text("Off the grid, anything new on the air means something arrived. Each device is tagged hardware or randomized (phone) MAC, or OUI unknown when the radio cannot tell.")
                 .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
                 .fixedSize(horizontal: false, vertical: true)
             if desertOn {
@@ -1733,7 +1739,7 @@ struct DeviceView: View {
         Button(action: openAppSettings) {
             Text("OPEN SETTINGS")
                 .font(ACABTheme.mono(11, weight: .bold)).tracking(1)
-                .foregroundStyle(ACABTheme.accent)
+                .foregroundStyle(ACABTheme.accentText)
                 .frame(maxWidth: .infinity, minHeight: 44)
                 .overlay(RoundedRectangle(cornerRadius: ACABTheme.radiusSm)
                     .strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
@@ -1834,7 +1840,7 @@ struct DeviceView: View {
             Text(ble.demoMode ? "Exit sample data" : "Disconnect")
                 .font(ACABTheme.display(15, weight: .semibold))
                 .frame(maxWidth: .infinity).padding(.vertical, 13)
-                .foregroundStyle(ACABTheme.accent)
+                .foregroundStyle(ACABTheme.accentText)
                 .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: ACABTheme.radius).strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
         }
@@ -1857,7 +1863,7 @@ struct DeviceView: View {
             Text("Power off beacon")
                 .font(ACABTheme.display(15, weight: .semibold))
                 .frame(maxWidth: .infinity).padding(.vertical, 13)
-                .foregroundStyle(ACABTheme.accent)
+                .foregroundStyle(ACABTheme.accentText)
                 .background(ACABTheme.bg2, in: RoundedRectangle(cornerRadius: ACABTheme.radius, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: ACABTheme.radius).strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
         }
@@ -1971,7 +1977,7 @@ struct DeviceView: View {
                     .accessibilityLabel("Rename")
                     Button { ble.unignore(dev.mac) } label: {
                         Text("UNMUTE").font(ACABTheme.mono(10, weight: .bold)).tracking(1)
-                            .foregroundStyle(ACABTheme.accent)
+                            .foregroundStyle(ACABTheme.accentText)
                             .padding(.horizontal, 8).padding(.vertical, 5)
                             .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
                             .frame(minHeight: 44)   // 44pt hit target; drawn capsule unchanged
@@ -1998,6 +2004,34 @@ struct DeviceView: View {
             }
         }
         .panel()
+    }
+
+    // MARK: display
+    //
+    // "always use higher contrast": OFF follows the iOS Increase Contrast setting, ON forces the
+    // higher-contrast palette. Named that way, rather than "higher contrast", so a user whose
+    // iOS setting is on understands why turning this off changes nothing. The palette itself
+    // lives in ACABTheme; this card only flips the window trait (ContrastPreference).
+    // Android twin: DisplayCard in DeviceScreen.kt.
+    private var displayCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Kicker("DISPLAY")
+            radioToggle("always use higher contrast",
+                        "brighter secondary text and clearer control edges \u{00B7} off follows the system contrast settings",
+                        isOn: $contrast.alwaysHigher)
+            Text(contrast.systemIncreased
+                 ? "iOS increase contrast is on, so higher contrast stays on while this switch is off."
+                 : "text size and bold text follow the iOS settings.")
+                .font(ACABTheme.mono(10.5)).foregroundStyle(ACABTheme.faint)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .panel()
+    }
+
+    private var displayKicker: String {
+        if contrast.alwaysHigher { return "HIGHER CONTRAST \u{00B7} ALWAYS" }
+        if contrast.systemIncreased { return "HIGHER CONTRAST \u{00B7} FROM IOS" }
+        return "DEFAULT CONTRAST"
     }
 
     // MARK: about

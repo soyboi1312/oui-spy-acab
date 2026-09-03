@@ -245,12 +245,12 @@ extension DeviceStatus {
     /// firmware manifest (see FirmwareManifestStore); bump this on a beacon-board release so the
     /// offline path still matches. The Colonel Panic single-board builds (oui-spy / mesh-detect)
     /// track a separate line now that the beacon board has moved ahead - see colonelLatestVersion.
-    static let latestVersion = "2.0.6"
+    static let latestVersion = "2.0.7"
 
     /// Latest firmware for the Colonel Panic single-board builds, which stayed on the shared
     /// acab_version.h default when the beacon board diverged. Offline fallback only; bump on a
     /// Colonel Panic release.
-    static let colonelLatestVersion = "2.0.6"
+    static let colonelLatestVersion = "2.0.7"
 
     /// Just the version number out of `fw` ("ACAB-ouispy 0.1.0" -> "0.1.0").
     var version: String { firmware.split(separator: " ").last.map(String.init) ?? firmware }

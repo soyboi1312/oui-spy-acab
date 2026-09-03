@@ -98,7 +98,7 @@ fun rememberAlprMarker(confirmed: Boolean = true, peek: Boolean = false): Bitmap
     // is not a distinction for a red/green-deficient viewer, and telling the two tiers apart is the
     // entire point of the second one. Mirrors iOS ALPRDot.
     val tone = if (confirmed) Acab.flockTone else Acab.warn
-    return remember(density, confirmed, peek) {
+    return remember(density, confirmed, peek, Acab.highContrast) {
         with(density) {
             // Bolder 2026-07-29 (rings washed out on the map); keep in lockstep with iOS ALPRDot.
             // PEEK SIZE, derived from THIS platform's pin. The RULE is shared with iOS: the rim
@@ -165,7 +165,7 @@ fun rememberLaunchMarker(): LaunchMarker {
     val density = LocalDensity.current
     val painter = rememberVectorPainter(Icons.Filled.ArrowUpward)
     val tone = Acab.droneTone
-    return remember(density) {
+    return remember(density, Acab.highContrast) {
         with(density) {
             val discR = 6.5.dp.toPx()
             val backing = 1.5.dp.toPx()
@@ -200,7 +200,7 @@ fun rememberOperatorMarker(): BitmapDrawable {
     val context = LocalContext.current
     val density = LocalDensity.current
     val painter = rememberVectorPainter(Icons.Filled.Person)
-    return remember(density) {
+    return remember(density, Acab.highContrast) {
         with(density) {
             val dotR = 12.dp.toPx()
             val border = 2.dp.toPx()
@@ -229,7 +229,7 @@ private fun rememberCategoryMarker(type: DeviceType, dim: Boolean): BitmapDrawab
     val density = LocalDensity.current
     val painter = rememberVectorPainter(type.icon())
     val tone = if (dim) dimTone(type.tone()) else type.tone()
-    return remember(type, density, dim) {
+    return remember(type, density, dim, Acab.highContrast) {
         with(density) {
             val dotR = 15.dp.toPx()
             val border = 2.dp.toPx()
@@ -341,10 +341,13 @@ class ClusterMarkerFactory(
 
 /** Build a cluster-marker factory bound to the current resources + density. */
 @Composable
+// Keyed on Acab.highContrast as well as density: the factory bakes Acab.bg into every bubble
+// it caches, so a palette swap gets a fresh factory (and an empty cache) rather than stale bitmaps.
+// The same key sits on every other remember() in this file for the same reason.
 fun rememberClusterMarkerFactory(): ClusterMarkerFactory {
     val context = LocalContext.current
     val density = LocalDensity.current
-    return remember(density) { ClusterMarkerFactory(context.resources, density.density) }
+    return remember(density, Acab.highContrast) { ClusterMarkerFactory(context.resources, density.density) }
 }
 
 /** The category pins from [rememberCategoryMarkers], each with a short type tag drawn in a
@@ -363,7 +366,7 @@ class LabeledMarkers(
 fun rememberLabeledCategoryMarkers(base: Map<DeviceType, BitmapDrawable>): LabeledMarkers {
     val context = LocalContext.current
     val density = LocalDensity.current
-    return remember(density) {
+    return remember(density, Acab.highContrast) {
         var anchorV = 0.5f
         val icons = base.mapValues { (type, drawable) ->
             val (labeled, av) = buildLabeledMarker(
@@ -556,5 +559,5 @@ class PinBadgeFactory(
 fun rememberPinBadgeFactory(): PinBadgeFactory {
     val context = LocalContext.current
     val density = LocalDensity.current
-    return remember(density) { PinBadgeFactory(context.resources, density.density) }
+    return remember(density, Acab.highContrast) { PinBadgeFactory(context.resources, density.density) }
 }

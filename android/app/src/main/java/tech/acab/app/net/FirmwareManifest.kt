@@ -244,26 +244,26 @@ class FirmwareManifest private constructor(context: Context) {
             updated = "",
             builds = mapOf(
                 "beacon board" to FirmwareBuild(
-                    version = "2.0.6", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.7", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi.tech/flash.html", notes = "",
                 ),
                 // rev-B rides the beacon version line but flashes from its own page: its image
                 // must never land on rev-A hardware, so the fallback must not point it at
                 // flash.html. Matches the iOS fallback.
                 "beacon board rev-B" to FirmwareBuild(
-                    version = "2.0.6", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.7", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi.tech/flash-revb.html", notes = "",
                 ),
                 "ACAB-ouispy" to FirmwareBuild(
-                    version = "2.0.6", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.7", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
                 "mesh-detect-ACAB" to FirmwareBuild(
-                    version = "2.0.6", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.7", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
                 "mesh-detect-ACAB-ch1" to FirmwareBuild(
-                    version = "2.0.6", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
+                    version = "2.0.7", ota = false, appUrl = "", sha256 = "", size = 0L, sig = "",
                     flasher = "https://soyboi1312.github.io/all-cameras-are-beacons/", notes = "",
                 ),
             ),

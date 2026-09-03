@@ -6,6 +6,7 @@ struct ACABApp: App {
     @StateObject private var ble = BLEManager.shared
     @StateObject private var manifest = FirmwareManifestStore.shared
     @StateObject private var alpr = ALPRStore.shared
+    @StateObject private var contrast = ContrastPreference.shared
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -14,6 +15,10 @@ struct ACABApp: App {
                 .environmentObject(ble)
                 .environmentObject(manifest)
                 .environmentObject(alpr)
+                .environmentObject(contrast)
+                // Puts the "always use higher contrast" trait override on the window as soon as
+                // the window exists; the colours themselves read the trait (see ACABTheme).
+                .background(WindowTraitApplier())
                 .preferredColorScheme(.dark)
                 .tint(ACABTheme.red)
                 .onAppear {

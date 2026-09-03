@@ -283,8 +283,12 @@ data class Detection(
 
     /** True when the transmitter address is randomized / locally-administered (a BLE private
      *  address or a randomized WiFi MAC), read off the "locally administered" bit of the first
-     *  octet, exactly as the firmware derives its randomAddr flag. Phones and item trackers
-     *  rotate these every few minutes, so a starred random MAC may stop matching. */
+     *  octet. That is the firmware's byte test too, but since firmware 2.0.7 the single-radio
+     *  boards also fold in the BLE controller's address type, which this bit cannot see: a
+     *  nearby-device row can read "randomized MAC" while this stays false, because the board
+     *  does not send its randomAddr flag ("rnd") on the wire. Twin: iOS addressIsRandomized.
+     *  Phones and item trackers rotate these every few minutes, so a starred random MAC may
+     *  stop matching. */
     val isRandomAddr: Boolean get() {
         val hex = mac.filter { it != ':' && it != '-' }
         if (hex.length < 2) return false

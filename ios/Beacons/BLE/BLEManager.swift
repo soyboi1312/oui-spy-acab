@@ -5497,7 +5497,7 @@ final class BLEManager: NSObject, ObservableObject {
         // dimmed - the demo forces motorolaSupported precisely to introduce that control, and a
         // dimmed sub-toggle under an off parent defeats the tour. Matches the Android seed.
         demoStatusPayload = [
-            "fw": "beacon board 2.0.6", "up": 4920, "total": 6, "ble": true, "wifi": true,
+            "fw": "beacon board 2.0.7", "up": 4920, "total": 6, "ble": true, "wifi": true,
             "axon": true, "tracker": true, "glasses": true, "ncam": true,
             "buzzer": true, "vol": 70, "gps": true, "bat": 82,
         ]
@@ -5541,8 +5541,11 @@ final class BLEManager: NSObject, ObservableObject {
              "cid": 1422, "lat": 37.7795, "lon": -122.4193, "n": 2, "new": true, "rnd": true],
             // Branded IP-camera OUI seen on the host WiFi (matched by source MAC), so the NETCAM
             // tile and NETWORK CAM map chip both show up on the tour. The MAC is a real Hikvision
-            // block, so this row demonstrates the maker-led title end to end.
-            ["t": 10, "s": 0, "meth": 1, "c": 80, "mac": "44:19:B6:22:0A:5C", "rssi": -70,
+            // block, so this row demonstrates the maker-led title end to end. Wire values are the
+            // firmware's own: s=1 is SRC_WIFI (netcamClassifyWiFi never emits a BLE source) and
+            // c=65 is NETCAM_OUI_CONFIDENCE, the registry tier a validated=0 block lands on; the
+            // twin row in Android AcabBleManager carries the same values.
+            ["t": 10, "s": 1, "meth": 1, "c": 65, "mac": "44:19:B6:22:0A:5C", "rssi": -70,
              "det": "Hikvision on wifi", "lat": 37.7788, "lon": -122.4183, "n": 2, "new": true],
         ]
         // The demo replaces the WHOLE store, so clear every per-id side map - the same eleven-map

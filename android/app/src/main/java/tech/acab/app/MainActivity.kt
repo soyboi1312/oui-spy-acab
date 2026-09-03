@@ -27,6 +27,7 @@ import tech.acab.app.ui.NearbyPermissionDenial
 import tech.acab.app.ui.canRetryAllMissingPermissions
 import tech.acab.app.ui.resolveNearbyPermissionDenial
 import tech.acab.app.ui.theme.Acab
+import tech.acab.app.ui.theme.ContrastMode
 
 class MainActivity : ComponentActivity() {
     private val vm: AcabViewModel by viewModels()
@@ -72,6 +73,10 @@ class MainActivity : ComponentActivity() {
         // before the first Map open, matching iOS (ALPRStore.init refreshes at launch).
         // Construction is inert while the layer is switched off.
         AlprStore.getInstance(applicationContext)
+        // Palette before the first frame: the persisted "always use higher contrast" switch
+        // plus the system contrast inputs. Listeners keep it live while we are up.
+        ContrastMode.load(this)
+        ContrastMode.startListening(this)
         handleDeepLink(intent)
         // The permission prompt is NOT fired here anymore. The connect screen shows a
         // "before the system asks" rationale first, and its CTA calls onRequestPermissions,
@@ -109,9 +114,15 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         syncPermissionState()
+        ContrastMode.syncSystem(this)
         maybeStartPermissionScan()
         maybeStartRequestedDrive()
         completeDefaultLiveStartIfPossible()
+    }
+
+    override fun onDestroy() {
+        ContrastMode.stopListening(this)
+        super.onDestroy()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {

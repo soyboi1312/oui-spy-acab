@@ -10,8 +10,8 @@ options:
 # Mark the project as reviewed for the current Xcode so it stops nagging
 # "Update to recommended settings" (XcodeGen otherwise defaults this to 1430).
 attributes:
-  LastUpgradeCheck: "2650"
-  LastSwiftUpdateCheck: "2650"
+  LastUpgradeCheck: "2660"
+  LastSwiftUpdateCheck: "2660"
 
 # Nordic's iOS DFU library, for updating the nRF52840 co-processor over BLE. The nRF runs the
 # Adafruit/Seeed bootloader (LEGACY Nordic DFU, service 0x1530), which the library speaks. BSD-3.
@@ -23,7 +23,7 @@ packages:
 
 settings:
   base:
-    MARKETING_VERSION: "2.0.6"
+    MARKETING_VERSION: "2.0.7"
     # The build number RESTARTS AT 0 for each new MARKETING_VERSION, and only climbs when a SECOND
     # build of the SAME version has to go up. App Store Connect requires the build to be unique
     # within a version string, NOT across the app, so 0 is always free on a version that has never
@@ -39,11 +39,14 @@ settings:
     # clobbered by the next `xcodegen generate` AND it only touches the app target, leaving
     # BeaconsWidget behind -> "extension version must match parent app". Both targets read
     # $(CURRENT_PROJECT_VERSION), so setting it HERE and regenerating keeps them in lockstep.
-    CURRENT_PROJECT_VERSION: "0"
+    CURRENT_PROJECT_VERSION: "1"   # 2.0.7 (0) already uploaded 2026-09; (1) carries the locale fixes
     SWIFT_VERSION: "5.0"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: "49B9T69XPF"        # baked in so `xcodegen generate` keeps signing
     ENABLE_USER_SCRIPT_SANDBOXING: YES    # Xcode-recommended build setting
+    # Xcode 26.6 "recommended settings" nag. The app has no String Catalog yet, so this is inert;
+    # it lives here (not in the Xcode dialog) because the xcodeproj is regenerated from this file.
+    STRING_CATALOG_GENERATE_SYMBOLS: YES
 
 targets:
   Beacons:

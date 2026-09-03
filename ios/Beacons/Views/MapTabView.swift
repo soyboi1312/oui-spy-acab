@@ -1541,7 +1541,7 @@ struct MapTabView: View {
                 Button(action: openAppSettings) {
                     Text("OPEN SETTINGS")
                         .font(ACABTheme.mono(11, weight: .bold)).tracking(1)
-                        .foregroundStyle(ACABTheme.accent)
+                        .foregroundStyle(ACABTheme.accentText)
                         .padding(.horizontal, 14)
                         .frame(minHeight: 44)   // 44pt target
                         .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))

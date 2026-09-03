@@ -100,6 +100,19 @@ enum TimeBasisCopy {
         fixed(isRecent(date) ? "EEE HH:mm" : "MMM d, HH:mm").string(from: date)
     }
 
+    /// "14:32": the capture-window endpoints in the contribution flow (review sentence,
+    /// disclosure block, and the note that ships with the CSV). Fixed 24-hour, same POSIX pin as
+    /// the rest of this file, because the note is evidence handed to a third party and the
+    /// disclosure text is a byte-for-byte contract with Android. Until 2026-09-02 this was a bare
+    /// "h:mm a" DateFormatter: a 12-hour clock whose AM/PM token the device locale spelled
+    /// differently, and one that Foundation rewrote to a 24-hour clock with no token at all
+    /// whenever the user had forced 24-Hour Time in Settings, so the string followed the device
+    /// preference as well as the locale (the same rewrite `fixed` documents in the other
+    /// direction). Android twin: clockTimeText in ui/Components.kt.
+    static func clock(_ date: Date) -> String {
+        fixed("HH:mm").string(from: date)
+    }
+
     /// "between Tue 14:00 and Wed 09:00", or the one-sided forms when only one boot could be
     /// found to bound against. Returns nil when there is nothing to state.
     static func range(after: Date?, before: Date?) -> String? {

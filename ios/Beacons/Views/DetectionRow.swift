@@ -164,7 +164,7 @@ struct DetectionRow: View {
         VStack(alignment: .trailing, spacing: 5) {
             Text("\(d.rssi)")
                 .font(ACABTheme.mono(13, weight: .semibold))
-                .foregroundStyle(d.type.tint).monospacedDigit()
+                .foregroundStyle(d.type.textTint).monospacedDigit()
             SignalBars(bars: d.signalBars, tint: d.type.tint)
         }
         .accessibilityElement(children: .ignore)

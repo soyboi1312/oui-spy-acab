@@ -207,6 +207,16 @@ fun bracketTimeText(atMs: Long): String =
     DateTimeFormatter.ofPattern(if (isRecentStamp(atMs)) "EEE HH:mm" else "MMM d, HH:mm", Locale.US)
         .format(Instant.ofEpochMilli(atMs).atZone(ZoneId.systemDefault()))
 
+/** "14:32": the capture-window endpoints in the contribution flow (review sentence, disclosure
+ *  block, and the note that ships with the CSV). Fixed 24-hour on Locale.US like the two
+ *  formatters above, because the note is evidence handed to a third party and the disclosure text
+ *  is a byte-for-byte contract with iOS. Until 2026-09-02 this was SimpleDateFormat("h:mm a") on
+ *  the default locale, a 12-hour clock whose AM/PM token changed with the phone language.
+ *  iOS twin: TimeBasisCopy.clock in Models/TimeBasis.swift. */
+fun clockTimeText(atMs: Long): String =
+    DateTimeFormatter.ofPattern("HH:mm", Locale.US)
+        .format(Instant.ofEpochMilli(atMs).atZone(ZoneId.systemDefault()))
+
 /** The one-line time a row shows, with its qualification built in. [TimeBasis.Exact] returns
  *  null: a live stamp renders exactly as it always has, and this model adds nothing to it. */
 fun TimeBasis.primaryText(): String? = when (this) {

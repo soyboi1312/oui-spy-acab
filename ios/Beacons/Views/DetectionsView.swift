@@ -412,7 +412,7 @@ struct DetectionsView: View {
                 Text(label)
                     .font(ACABTheme.mono(8, weight: .semibold))
                     .tracking(0.8)
-                    .foregroundStyle(n == 0 ? ACABTheme.faint : type.tint)
+                    .foregroundStyle(n == 0 ? ACABTheme.faint : type.textTint)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 10)
@@ -518,7 +518,7 @@ struct DetectionsView: View {
             if paused {
                 Text(snap.pausedNewCount > 0 ? "PAUSED \u{00B7} \(snap.pausedNewCount) NEW" : "PAUSED")
                     .font(ACABTheme.mono(9, weight: .bold)).tracking(0.5)
-                    .foregroundStyle(ACABTheme.accent)
+                    .foregroundStyle(ACABTheme.accentText)
                     .padding(.horizontal, 7).padding(.vertical, 3)
                     .background(ACABTheme.accent.opacity(0.12), in: Capsule())
             }

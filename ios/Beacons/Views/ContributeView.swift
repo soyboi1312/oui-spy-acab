@@ -253,7 +253,7 @@ struct ContributeView: View {
 
     // ---- CAPTURING: live count + elapsed, until the user stops -------------------------------
     @ViewBuilder private var capturingStep: some View {
-        Text("CAPTURING").font(ACABTheme.mono(11, weight: .bold)).foregroundStyle(ACABTheme.accent)
+        Text("CAPTURING").font(ACABTheme.mono(11, weight: .bold)).foregroundStyle(ACABTheme.accentText)
             .tracking(1)
         Text("Walk around the device, then stop.").font(ACABTheme.mono(13)).foregroundStyle(ACABTheme.dim)
         Text("\(liveCount) observation\(liveCount == 1 ? "" : "s") heard  ·  \(Self.elapsed(startMs, nowMs))")
@@ -426,7 +426,7 @@ struct ContributeView: View {
                     if photoItem != nil { photoItem = nil } else { loadPhoto(nil) }
                 } label: {
                     Text("REMOVE").font(ACABTheme.mono(10, weight: .bold)).tracking(1)
-                        .foregroundStyle(ACABTheme.accent)
+                        .foregroundStyle(ACABTheme.accentText)
                         .padding(.horizontal, 8).padding(.vertical, 5)
                         .overlay(Capsule().strokeBorder(ACABTheme.lineStrong, lineWidth: 1))
                         .frame(minHeight: 44)   // 44pt hit target
@@ -665,9 +665,10 @@ struct ContributeView: View {
         let s = max(0, toMs - fromMs) / 1000
         return String(format: "%d:%02d", s / 60, s % 60)
     }
+    /// Fixed 24-hour clock (TimeBasisCopy.clock), not the device's 12/24-hour preference: this
+    /// string lands in the shared note and in the disclosure block Android must match byte for byte.
     nonisolated private static func clockTime(_ ms: Int64) -> String {
-        let f = DateFormatter(); f.dateFormat = "h:mm a"
-        return f.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
+        TimeBasisCopy.clock(Date(timeIntervalSince1970: Double(ms) / 1000))
     }
 
     private func loadPhoto(_ item: PhotosPickerItem?) {

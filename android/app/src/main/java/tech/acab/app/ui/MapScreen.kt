@@ -1577,7 +1577,7 @@ fun MapScreen(
                             Text("NODE ${d.mac.replace(":", "").takeLast(4).uppercase()}",
                                 color = Acab.dim, fontSize = 10.sp, fontFamily = Acab.mono)
                         }
-                        Text("${d.rssi}", color = Acab.accent, fontSize = 12.sp, fontFamily = Acab.mono)
+                        Text("${d.rssi}", color = Acab.accentText, fontSize = 12.sp, fontFamily = Acab.mono)
                     }
                 }
                 }
@@ -1671,14 +1671,21 @@ private fun MapSettingRow(label: String, checked: Boolean, note: String? = null,
     }
 }
 
+// Count grouping policy, both platforms: DATASET sizes on these captions group by the device
+// locale ("12,345" / "12 345" / "12.345"), because they are chrome, not evidence; iOS uses
+// Int.formatted() for the same captions in MapTabView. Session counters (tiles, log headers)
+// stay ungrouped on both platforms. Until 2026-09-02 this file pinned Locale.US here, so once a
+// count reached 1,000 the caption disagreed with iOS on any phone whose locale groups digits
+// differently from en-US (12 345, 12.345, 1,23,456).
+
 /** All tiers are dataset records; only tiers 0 and 1 are canonical ALPR entries. */
 private fun alprRecordCount(n: Int): String =
-    String.format(java.util.Locale.US, "%,d ALPR record%s", n, if (n == 1) "" else "s")
+    String.format(java.util.Locale.getDefault(), "%,d ALPR record%s", n, if (n == 1) "" else "s")
 
 /** Same grouping, counting PINS instead. The unconfirmed tier is deliberately not called cameras:
  *  that some of them are not cameras is the entire reason the toggle exists. */
 private fun pinCount(n: Int): String =
-    String.format(java.util.Locale.US, "%,d pin%s", n, if (n == 1) "" else "s")
+    String.format(java.util.Locale.getDefault(), "%,d pin%s", n, if (n == 1) "" else "s")
 
 /** Manifest `updated` ("2026-07-27") -> "Jul 27" for the settings caption; the raw string if it
  *  ever arrives in another shape, null when we have no dataset stamp at all. */
@@ -1757,7 +1764,7 @@ private fun AlprDatasetRows(alpr: AlprStore, nodes: IntArray, loading: Boolean,
         val tierSummary = buildList {
             if (tier0 > 0) add("${pinCount(tier0)} with no structured manufacturer")
             if (tier2 > 0) add(String.format(
-                java.util.Locale.US,
+                java.util.Locale.getDefault(),
                 "%,d legacy candidate%s",
                 tier2,
                 if (tier2 == 1) "" else "s",

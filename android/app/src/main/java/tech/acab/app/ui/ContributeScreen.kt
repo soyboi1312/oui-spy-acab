@@ -207,7 +207,7 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
 
             // ---- CAPTURING: live count + elapsed, until the user stops ---------------------------
             CapturePhase.CAPTURING -> {
-                Text("CAPTURING", color = Acab.accent, fontSize = 11.sp,
+                Text("CAPTURING", color = Acab.accentText, fontSize = 11.sp,
                     fontWeight = FontWeight.Bold, fontFamily = Acab.mono, letterSpacing = 1.sp)
                 Text("Walk around the device, then stop.", color = Acab.dim, fontSize = 13.sp)
                 Text("$liveCount observation${if (liveCount == 1) "" else "s"} heard  ·  ${elapsed(vm.startMs, vm.nowMs)}",
@@ -459,7 +459,7 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
                     color = Acab.dim, fontSize = 14.sp)
             },
             confirmButton = {
-                Text("DISCARD", color = Acab.accent, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                Text("DISCARD", color = Acab.accentText, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                     letterSpacing = 0.5.sp, fontFamily = Acab.mono,
                     modifier = Modifier.minimumInteractiveComponentSize()
                         .clickable(enabled = !vm.sharePreparing) {
@@ -479,15 +479,17 @@ fun ContributeContent(ble: AcabBleManager, vm: ContributionViewModel) {
     }
 }
 
-/** "M:SS" elapsed between two wall-clock millis. */
+/** "M:SS" elapsed between two wall-clock millis. Locale.US: a bare format() takes the default
+ *  locale, which localizes %d digits on some phones; iOS String(format:) is locale-free. */
 private fun elapsed(fromMs: Long, toMs: Long): String {
     val s = ((toMs - fromMs).coerceAtLeast(0)) / 1000
-    return "%d:%02d".format(s / 60, s % 60)
+    return String.format(java.util.Locale.US, "%d:%02d", s / 60, s % 60)
 }
 
-/** Local clock time like "2:14 PM". */
-private fun clockTime(ms: Long): String =
-    java.text.SimpleDateFormat("h:mm a", java.util.Locale.getDefault()).format(java.util.Date(ms))
+/** Fixed 24-hour clock like "14:14" (clockTimeText in Components.kt), not the device's 12/24-hour
+ *  preference: this string lands in the shared note and in the disclosure block iOS must match
+ *  byte for byte. */
+private fun clockTime(ms: Long): String = clockTimeText(ms)
 
 /** The picked photo as a real thumbnail with explicit Replace / Remove actions (48dp targets).
  *  Decoded downsampled on IO so a 50MP camera roll image never stalls the main thread. */
@@ -530,7 +532,7 @@ private fun PhotoAttachmentRow(
             fontWeight = FontWeight.Bold,
             modifier = Modifier.minimumInteractiveComponentSize()
                 .clickable(enabled = enabled, onClick = onReplace).padding(4.dp))
-        Text("Remove", color = Acab.accent, fontSize = 12.sp, fontFamily = Acab.mono,
+        Text("Remove", color = Acab.accentText, fontSize = 12.sp, fontFamily = Acab.mono,
             fontWeight = FontWeight.Bold,
             modifier = Modifier.minimumInteractiveComponentSize()
                 .clickable(enabled = enabled, onClick = onRemove).padding(4.dp))
