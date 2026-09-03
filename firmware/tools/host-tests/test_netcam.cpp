@@ -1,5 +1,5 @@
-// Host regression test for the network-camera classifier: 180 branded IP-camera vendor OUIs matched
-// off an 802.11 source MAC.
+// Host regression test for the network-camera classifier: branded IP-camera vendor prefixes
+// matched off an 802.11 source MAC with their registered widths preserved.
 //
 // WHY THIS FILE EXISTS. Three separate contracts run through netcam_detect.cpp, and none of them is
 // checked by the compiler:
@@ -144,17 +144,35 @@ static const uint8_t MAC_ANKER[6]  = { 0xe8, 0xee, 0xcc, 0x5a, 0x5b, 0x5c };   /
 static const uint8_t MAC_ARLO[6]   = { 0xa4, 0x11, 0x62, 0x0b, 0x2d, 0x62 };   // Arlo, from our own 2026-07-24 capture
 static const uint8_t MAC_ARLO2[6]  = { 0xfc, 0x9c, 0x98, 0xb4, 0xe5, 0x18 };   // Arlo, ditto
 static const uint8_t MAC_ARLO3[6]  = { 0x48, 0x62, 0x64, 0x28, 0xd8, 0x59 };   // Arlo, ditto
+// Independently recorded WiFi addresses from camarillo_drive.log. The block was heard,
+// but neither device was visually confirmed as a camera, so both remain at the 65 tier.
+static const uint8_t MAC_WYZE_CAPTURE1[6] = { 0xa4, 0xda, 0x22, 0x2e, 0xfe, 0x07 };
+static const uint8_t MAC_WYZE_CAPTURE2[6] = { 0xa4, 0xda, 0x22, 0x2e, 0xa7, 0xbe };
+// Independent capture addresses for the newly covered vendors. Hearing an address does
+// not meet the visual-confirmation requirement for the field-validated confidence tier.
+struct VendorCase {
+    const char* vendor;
+    uint8_t mac[6];
+};
+static const VendorCase CAPTURED_VENDORS[] = {
+    { "Blink",     {0x74,0xab,0x93,0xe2,0x93,0xa0} }, // beacon-lvt.log
+    { "Night Owl", {0x54,0x2b,0x57,0x55,0x86,0xad} }, // compare-devices-dual.csv
+    { "SkyBell",   {0xd0,0xc1,0x93,0x1e,0xdd,0xfe} }, // camarillo_drive.log
+    { "Juan OEM",  {0x9c,0xa3,0xa9,0x95,0x15,0x97} }, // camarillo_drive.log
+    { "WUUK",      {0xb0,0xb3,0x53,0x7f,0x01,0x23} }, // aug-9-drive2.log
+};
 // A well-formed PUBLIC MAC in NO vendor table. Used where the test is about the SSID alone, so an
 // accidental OUI hit cannot be mistaken for the SSID rule working.
 static const uint8_t MAC_PAD[6]    = { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11 };
 
 // The vendor labels the apps are allowed to see. Exact strings: casing, the slash and the
 // hyphen are part of the wire contract, not cosmetics. Ezviz/Lorex/Swann added 2026-08-02;
-// the six on the second row added 2026-08-07 with the registry expansion.
+// the six through Samsung Techwin added 2026-08-07 with the registry expansion.
 static const char* const KNOWN_VENDORS[] = {
     "Hikvision", "Dahua", "Amcrest", "Axis", "Reolink", "Ring", "Wyze", "Anker/eufy",
     "Ezviz", "Lorex", "Swann", "Arlo",
-    "Verkada", "i-PRO", "Vivotek", "Uniview", "Hanwha", "Samsung Techwin"
+    "Verkada", "i-PRO", "Vivotek", "Uniview", "Hanwha", "Samsung Techwin",
+    "Blink", "Night Owl", "SkyBell", "Juan OEM", "WUUK"
 };
 
 int main() {
@@ -171,10 +189,25 @@ int main() {
       chk("OFF: a real Hikvision uplink frame -> no hit", run(f, true, &d), false); }
     { std::vector<uint8_t> f = uplink(MAC_HIK);
       chk("OFF: same frame as a mgmt frame -> no hit", run(f, false, &d), false); }
+    { std::vector<uint8_t> f = uplink(MAC_WYZE_CAPTURE1);
+      chk("OFF: Wyze MA-M capture -> no hit", run(f, true, &d), false); }
+    for (const VendorCase& v : CAPTURED_VENDORS) {
+        std::vector<uint8_t> f = uplink(v.mac);
+        char label[96];
+        snprintf(label, sizeof(label), "OFF: captured %s -> no hit", v.vendor);
+        chk(label, run(f, true, &d), false);
+    }
     // The OUI table lookup is NOT gated: only the classifier is. The scanner reuses this helper on
     // the BLE path, so gating it would break a caller that has nothing to do with the WiFi filter.
     chkStr("OFF: netcamVendorOui() still resolves (helper is un-gated)",
            netcamVendorOui(MAC_HIK), "Hikvision");
+    chkStr("OFF: helper still resolves Wyze MA-M capture",
+           netcamVendorOui(MAC_WYZE_CAPTURE1), "Wyze");
+    for (const VendorCase& v : CAPTURED_VENDORS) {
+        char label[96];
+        snprintf(label, sizeof(label), "OFF: helper still resolves captured %s", v.vendor);
+        chkStr(label, netcamVendorOui(v.mac), v.vendor);
+    }
     chkBool("OFF: no filter refresh has happened yet", gFilterRefreshes == 0);
 
     netcamSetEnabled(true);
@@ -210,6 +243,109 @@ int main() {
           d.detail, "Anker/eufy on wifi"); }
     chkStr("netcamVendorOui() label keeps the slash too", netcamVendorOui(MAC_ANKER), "Anker/eufy");
 
+    // ---- additional IEEE blocks, with fixtures independent of the production tables ---------
+    { const uint8_t mac[6] = { 0x38, 0xf2, 0x5d, 0x12, 0x34, 0x56 };
+      std::vector<uint8_t> f = uplink(mac);
+      chk("Ezviz 38:f2:5d -> registry tier", run(f, true, &d), true,
+          d.confidence, 65, d.detail, "Ezviz on wifi");
+      chkStr("helper resolves added Ezviz MA-L", netcamVendorOui(mac), "Ezviz"); }
+    { const uint8_t mac[6] = { 0x14, 0xba, 0x88, 0x65, 0x43, 0x21 };
+      std::vector<uint8_t> f = uplink(mac);
+      chk("Uniview 14:ba:88 -> registry tier", run(f, true, &d), true,
+          d.confidence, 65, d.detail, "Uniview on wifi");
+      chkStr("helper resolves added Uniview MA-L", netcamVendorOui(mac), "Uniview"); }
+
+    // These fixtures are spelled out independently of CAMERA_VENDOR_OUI: a missing or
+    // mistyped registration must fail even if the production table's own sweep still passes.
+    const VendorCase additionalOuis[] = {
+        { "Blink",     {0x3c,0xa0,0x70,0x12,0x34,0x56} },
+        { "Blink",     {0x70,0xad,0x43,0x12,0x34,0x56} },
+        { "Blink",     {0xf0,0x74,0xc1,0x12,0x34,0x56} },
+        { "Blink",     {0x74,0x13,0x48,0x12,0x34,0x56} },
+        { "Blink",     {0xc8,0x19,0xd8,0x12,0x34,0x56} },
+        { "Blink",     {0x74,0xab,0x93,0x12,0x34,0x56} },
+        { "Night Owl", {0x54,0x2b,0x57,0x12,0x34,0x56} },
+        { "SkyBell",   {0xd0,0xc1,0x93,0x12,0x34,0x56} },
+        { "Juan OEM",  {0x08,0x3a,0x2f,0x12,0x34,0x56} },
+        { "Juan OEM",  {0x9c,0xa3,0xa9,0x12,0x34,0x56} },
+        { "Juan OEM",  {0x84,0xd0,0xdb,0x12,0x34,0x56} },
+        { "Juan OEM",  {0xa4,0x86,0xdb,0x12,0x34,0x56} },
+    };
+    for (const VendorCase& v : additionalOuis) {
+        std::vector<uint8_t> f = uplink(v.mac);
+        char label[96], detail[64];
+        snprintf(label, sizeof(label), "%s %02x:%02x:%02x -> registry tier",
+                 v.vendor, v.mac[0], v.mac[1], v.mac[2]);
+        snprintf(detail, sizeof(detail), "%s on wifi", v.vendor);
+        chk(label, run(f, true, &d), true, d.confidence, 65, d.detail, detail);
+        snprintf(label, sizeof(label), "helper resolves %s %02x:%02x:%02x",
+                 v.vendor, v.mac[0], v.mac[1], v.mac[2]);
+        chkStr(label, netcamVendorOui(v.mac), v.vendor);
+    }
+    for (const VendorCase& v : CAPTURED_VENDORS) {
+        std::vector<uint8_t> f = uplink(v.mac);
+        char label[96], detail[64];
+        snprintf(label, sizeof(label), "captured %s stays at registry tier", v.vendor);
+        snprintf(detail, sizeof(detail), "%s on wifi", v.vendor);
+        chk(label, run(f, true, &d), true, d.confidence, 65, d.detail, detail);
+    }
+
+    // IEEE MA-M assignments 3446632, A4DA222, 0C0EC14 and B0B3537 cover these exact inclusive
+    // endpoints. Spell out adjacent addresses rather than deriving them from the table or
+    // matcher: truncating to /24 must fail the negatives; narrowing to /32 must fail the highs.
+    struct PrefixCase {
+        const char* vendor;
+        uint8_t low[6], high[6], before[6], after[6];
+    };
+    const PrefixCase prefixes[] = {
+        { "Amcrest",
+          {0x34,0x46,0x63,0x20,0x00,0x00}, {0x34,0x46,0x63,0x2f,0xff,0xff},
+          {0x34,0x46,0x63,0x1f,0xff,0xff}, {0x34,0x46,0x63,0x30,0x00,0x00} },
+        { "Wyze",
+          {0xa4,0xda,0x22,0x20,0x00,0x00}, {0xa4,0xda,0x22,0x2f,0xff,0xff},
+          {0xa4,0xda,0x22,0x1f,0xff,0xff}, {0xa4,0xda,0x22,0x30,0x00,0x00} },
+        { "Swann",
+          {0x0c,0x0e,0xc1,0x40,0x00,0x00}, {0x0c,0x0e,0xc1,0x4f,0xff,0xff},
+          {0x0c,0x0e,0xc1,0x3f,0xff,0xff}, {0x0c,0x0e,0xc1,0x50,0x00,0x00} },
+        { "WUUK",
+          {0xb0,0xb3,0x53,0x70,0x00,0x00}, {0xb0,0xb3,0x53,0x7f,0xff,0xff},
+          {0xb0,0xb3,0x53,0x6f,0xff,0xff}, {0xb0,0xb3,0x53,0x80,0x00,0x00} },
+    };
+    for (const PrefixCase& p : prefixes) {
+        char label[96], detail[64];
+        snprintf(detail, sizeof(detail), "%s on wifi", p.vendor);
+        const uint8_t* endpoints[] = { p.low, p.high };
+        for (size_t i = 0; i < 2; i++) {
+            std::vector<uint8_t> f = uplink(endpoints[i]);
+            snprintf(label, sizeof(label), "%s /28 %s endpoint -> 65", p.vendor, i ? "last" : "first");
+            chk(label, run(f, true, &d), true, d.confidence, 65, d.detail, detail);
+            snprintf(label, sizeof(label), "%s /28 %s endpoint helper label", p.vendor, i ? "last" : "first");
+            chkStr(label, netcamVendorOui(endpoints[i]), p.vendor);
+        }
+        const uint8_t* neighbors[] = { p.before, p.after };
+        for (size_t i = 0; i < 2; i++) {
+            std::vector<uint8_t> f = uplink(neighbors[i]);
+            snprintf(label, sizeof(label), "%s /28 immediately %s -> no hit", p.vendor, i ? "after" : "before");
+            chk(label, run(f, true, &d), false);
+            snprintf(label, sizeof(label), "%s /28 helper rejects %s neighbor", p.vendor, i ? "upper" : "lower");
+            chkBool(label, netcamVendorOui(neighbors[i]) == nullptr);
+        }
+        uint8_t randomized[6]; memcpy(randomized, p.low, sizeof(randomized));
+        randomized[0] |= 0x02;
+        std::vector<uint8_t> f = uplink(randomized);
+        snprintf(label, sizeof(label), "%s /28 with locally-administered bit -> no hit", p.vendor);
+        chk(label, run(f, true, &d), false);
+        snprintf(label, sizeof(label), "%s /28 helper rejects locally-administered MAC", p.vendor);
+        chkBool(label, netcamVendorOui(randomized) == nullptr);
+    }
+    { std::vector<uint8_t> f = uplink(MAC_WYZE_CAPTURE1);
+      chk("Camarillo Wyze a4:da:22:2e:fe:07 -> 65", run(f, true, &d), true,
+          d.confidence, 65, d.detail, "Wyze on wifi"); }
+    { std::vector<uint8_t> f = uplink(MAC_WYZE_CAPTURE2);
+      chk("Camarillo Wyze a4:da:22:2e:a7:be -> 65", run(f, true, &d), true,
+          d.confidence, 65, d.detail, "Wyze on wifi");
+      chkStr("helper resolves second Camarillo Wyze", netcamVendorOui(MAC_WYZE_CAPTURE2), "Wyze"); }
+
     // ---- the whole table, in one sweep --------------------------------------------------------
     // Every entry must hit, format identically, and land on the tier its validated flag claims.
     // This is what catches a new OUI pasted in with a typo'd label or a stray validated=1.
@@ -234,9 +370,12 @@ int main() {
     // 2026-08-07: Hikvision 7 -> 86 and Dahua 6 -> 33 (the vendors' COMPLETE MA-L sets, the table
     // had held under a tenth of what those two companies own), plus Verkada, i-PRO, Vivotek,
     // Uniview x4, Amcrest x2, Hanwha x2 and Samsung Techwin. All re-confirmed against a fresh
-    // standards-oui.ieee.org pull. If you are here because this failed, go read the DELIBERATELY
+    // standards-oui.ieee.org pull. The 2026-09-01 refresh adds Ezviz and Uniview MA-Ls plus
+    // three separate MA-M blocks. The capture review then adds twelve MA-L blocks across
+    // Blink, Night Owl, SkyBell and Juan OEM, plus WUUK's MA-M. If this failed, read the DELIBERATELY
     // ABSENT block at the bottom of netcam_signatures.h before you bump the number.
-    chkBool("table still holds exactly 180 OUIs", CAMERA_VENDOR_OUI_COUNT == 180);
+    chkBool("table holds exactly 194 MA-L OUIs", CAMERA_VENDOR_OUI_COUNT == 194);
+    chkBool("fallback holds exactly 4 narrower prefixes", CAMERA_VENDOR_PREFIX_COUNT == 4);
     { note[0] = 0;
       for (size_t i = 0; i < CAMERA_VENDOR_OUI_COUNT; i++) {
           bool known = false;
@@ -245,7 +384,14 @@ int main() {
           if (!known && !note[0]) snprintf(note, sizeof(note), "idx %zu unknown label \"%s\"", i,
                                            CAMERA_VENDOR_OUI[i].vendor);
       }
-      chkBool("every label is one of the 18 exact known vendor strings", note[0] == 0, note); }
+      for (size_t i = 0; i < CAMERA_VENDOR_PREFIX_COUNT; i++) {
+          bool known = false;
+          for (size_t v = 0; v < sizeof(KNOWN_VENDORS)/sizeof(KNOWN_VENDORS[0]); v++)
+              if (!strcmp(CAMERA_VENDOR_PREFIX[i].vendor, KNOWN_VENDORS[v])) known = true;
+          if (!known && !note[0]) snprintf(note, sizeof(note), "prefix idx %zu unknown label \"%s\"", i,
+                                           CAMERA_VENDOR_PREFIX[i].vendor);
+      }
+      chkBool("every label is one of the 23 exact known vendor strings", note[0] == 0, note); }
     // A table OUI with the locally-administered bit set could never match, because netcamEntry()
     // rejects LA addresses before it looks at the table. Such an entry would be dead weight and a
     // sign the block was transcribed wrong, so assert none exists.
@@ -398,7 +544,7 @@ int main() {
     { uint8_t m[6] = { 0x24, 0x0a, 0xc4, 0x01, 0x02, 0x03 }; std::vector<uint8_t> f = uplink(m);
       chk("Espressif 24:0a:c4 (shared silicon, excluded) -> no hit", run(f, true, &d), false); }
     { uint8_t m[6] = { 0x44, 0x65, 0x0d, 0x01, 0x02, 0x03 }; std::vector<uint8_t> f = uplink(m);
-      chk("Amazon 44:65:0d (Blink rides it, excluded) -> no hit", run(f, true, &d), false); }
+      chk("Amazon 44:65:0d (shared product block, excluded) -> no hit", run(f, true, &d), false); }
     { uint8_t m[6] = { 0x18, 0xb4, 0x30, 0x01, 0x02, 0x03 }; std::vector<uint8_t> f = uplink(m);
       chk("Nest 18:b4:30 (excluded) -> no hit", run(f, true, &d), false); }
     // Randomized / locally-administered source MACs: the OUI means nothing there, so they are
@@ -417,6 +563,7 @@ int main() {
     { const uint8_t randomized[6] = { 0x1a, 0x68, 0xcb, 0, 0, 0 };
       chkBool("netcamVendorOui() returns nullptr for a randomized MAC",
               netcamVendorOui(randomized) == nullptr); }
+    chkBool("netcamVendorOui() returns nullptr for a null MAC", netcamVendorOui(nullptr) == nullptr);
     // On a miss the output record must be left completely alone: the caller reuses one AcabDetection
     // across every classifier in the chain, so a partial write here would leak a phantom camera
     // detail onto whichever detector matches next.

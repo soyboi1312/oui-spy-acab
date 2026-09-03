@@ -34,9 +34,9 @@ bool netcamIsEnabled();
 // Reload the persisted opt-in on boot (NVS); defaultEnabled if never set (callers pass false).
 void netcamRestoreEnabled(bool defaultEnabled);
 
-// Match a MAC's OUI against the branded IP-camera vendor table. Returns the vendor label on
-// a hit, or nullptr. Skips randomized / locally-administered MACs (no real OUI). Public so
-// the scanner can reuse it on either radio path.
+// Match a MAC against the branded IP-camera vendor tables, retaining the registered 24/28-bit
+// prefix width. Returns the vendor label on a hit, or nullptr. Skips null and locally-administered
+// MACs (no real IEEE assignment). Public so the scanner can reuse it on either radio path.
 const char* netcamVendorOui(const uint8_t mac[6]);
 
 // Classify one 802.11 frame as a branded IP camera by its OUI. No-op (returns false) unless

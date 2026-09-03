@@ -16,11 +16,13 @@
  *   and is "Arlo base station" for the SSID match added 2026-08-05 - that one names the BOX, not a
  *   lens, because a broadcast SSID proves the hardware is there and nothing about what it sees.
  *
- * Every block below is a corporate MA-L registration held by the camera vendor or its parent,
+ * Every block below is a corporate MA-L or MA-M registration held by the camera vendor or its parent,
  * verified against the live IEEE registry: the original set on 2026-07-17 (api.maclookup.app),
  * the consumer brands on 2026-07-31, and the Hikvision/Dahua expansion plus six new vendors on
- * 2026-08-07 (a direct standards-oui.ieee.org/oui/oui.csv pull). No commodity-module silicon,
- * so it passes the no-shared-silicon rule the rest of the OUI tables follow.
+ * 2026-08-07 (a direct standards-oui.ieee.org/oui/oui.csv pull). The 2026-09-01 additions
+ * were checked against the same MA-L registry and standards-oui.ieee.org/oui28/mam.csv.
+ * No commodity-module silicon, so it passes the no-shared-silicon rule the rest of the
+ * OUI tables follow.
  *
  * Two precisions, because the wording here used to overstate two things. "The vendor's OWN"
  * is not literally true for every row: Anker/eufy registers as Fantasia Trading LLC, and much
@@ -41,6 +43,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "oui_prefix.h"
 
 // One IP-camera vendor OUI: the 3-byte corporate MA-L block plus a short vendor label so
 // the detection detail names the maker ("Hikvision on wifi", etc).
@@ -48,6 +51,15 @@ struct NetcamOui {
     uint8_t     oui[3];     // vendor's own corporate MA-L block (IEEE), high byte first
     const char* vendor;     // short label for the "<Vendor> on wifi" detail string
     uint8_t     validated;  // 1 = seen in our own capture AND confirmed a real camera by eye
+};
+
+// Smaller IEEE assignments keep their full prefix width; truncating an MA-M to three
+// bytes would attribute fifteen unrelated neighboring blocks to the same camera vendor.
+struct NetcamPrefix {
+    uint8_t     prefix[5];
+    uint8_t     prefixBits;
+    const char* vendor;
+    uint8_t     validated;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -69,22 +81,21 @@ struct NetcamOui {
 // on the EXACT registrant name rather than a substring: a first substring pass on "ring"
 // returned 24 blocks because it also matched "ENGINEERING". These are the real ones.
 //
-// Why these brands and not Nest / Blink: a vendor OUI is only worth having when the
-// REGISTRANT is narrow. Ring LLC and Wyze Labs register in their own names and ship little
-// but cameras. Nest Labs holds only 2 blocks and current Nest cameras sit under Google's
-// 108 blocks (shared with Pixel, Chromecast, Home) - unusable. Blink rides Amazon
-// Technologies' 209 blocks (Echo, Fire TV, Kindle, eero) - unusable. A lot of budget
-// camera hardware transmits under Espressif's 335 blocks - unusable. Narrowness is the test.
+// A vendor OUI is useful here when the REGISTRANT identifies a camera-system vendor.
+// Generic Google, Amazon Technologies and Espressif blocks also cover unrelated phones,
+// speakers, routers and module-based products, so those blocks stay excluded. Blink has
+// its own SIX "Blink by Amazon" MA-L registrations, all included below; the former claim
+// that Blink only used shared Amazon blocks was wrong. A Blink hit may still be a Sync
+// Module rather than a camera, so it keeps the vendor label and registry confidence.
 //
-// ARLO USED TO BE LISTED ON THAT "not" LINE AND IT WAS WRONG (corrected 2026-08-05). It was
-// named without a reason while Nest and Blink each got one, i.e. swept in by association.
+// Arlo was incorrectly omitted until 2026-08-05 despite its own narrow registrations.
 // Arlo Technology holds THREE blocks and ships nothing with a radio but cameras, doorbells,
 // and the hubs that serve them. It passes the narrowness test more cleanly than Wyze does.
-// It is also the only block in this table we have already HEARD: see the Arlo entries below.
+// See the Arlo entries below for their capture provenance.
 // Ring LLC. Doorbells and security cameras, i.e. the most street-facing camera class there
 // is. Camera/doorbell-only registrant, so the OUI is a strong vendor read. src: IEEE MA-L.
-// Arlo Technology. THE ONLY BLOCKS IN THIS TABLE WE HAVE ACTUALLY HEARD OURSELVES, and they
-// are STILL validated=0 (see below). The 2026-07-24 A/B drive logged TWELVE
+// Arlo Technology. These blocks were heard in our own captures, but remain validated=0
+// (see below). The 2026-07-24 A/B drive logged TWELVE
 // distinct Arlo-OUI devices spread across the route (compare-devices-dual.csv), all three
 // blocks firing, and THREE of them named themselves in the SSID: A4:11:62:0B:2D:62,
 // A4:11:62:6C:8F:24 and FC:9C:98:B4:E5:18 were beaconing "ARLO_VMB_<digits>" (see
@@ -117,7 +128,7 @@ struct NetcamOui {
 // hit is "a Wyze device" first and a camera second. CAVEAT to settle in the field: some
 // Wyze models are built on Espressif/Realtek silicon and may transmit under the CHIP
 // vendor's OUI instead of Wyze's, in which case these blocks simply never fire.
-// src: IEEE MA-L.
+// src: IEEE MA-L; the separately listed MA-M block uses the same vendor caveat.
 // eufy, via Anker. THE WEAKEST ENTRIES IN THIS TABLE, and labelled to say so. There is no
 // "eufy" or "Anker" registrant in the IEEE registry at all - Anker registers as Fantasia
 // Trading LLC, which covers their ENTIRE catalogue: USB chargers, PowerCore banks,
@@ -127,14 +138,15 @@ struct NetcamOui {
 // ambiguity to the user rather than hiding it behind a camera claim. If a capture shows
 // these firing mostly on vacuums and speakers, delete them. src: IEEE MA-L.
 // ---- added 2026-08-02, every block re-confirmed against a fresh standards-oui.ieee.org pull --
-// Hangzhou Ezviz Software Co.,Ltd. - 14 blocks in the registry, all of them listed here.
+// Hangzhou Ezviz Software Co.,Ltd. - 14 MA-L blocks at the initial addition, plus
+// 38:F2:5D in the 2026-09-01 refresh below.
 // Ezviz is Hikvision's CONSUMER brand and holds its OWN registrations, so the Hikvision blocks
 // above never catch an Ezviz camera: a real hole, not a duplicate. The registrant is a camera
 // company, so the block is narrow in the way this file demands. src: IEEE MA-L.
-// Lorex Technology Inc. and Swann communications Pty Ltd - one block each, their entire
-// registry presence. Both sell driveway/perimeter DVR kits, i.e. cameras pointed at a street,
-// which is squarely what this table is for. One block per vendor also keeps the blast radius
-// small if either turns out to be re-used on an NVR or a bridge. src: IEEE MA-L.
+// Lorex Technology Inc. and Swann communications Pty Ltd - one MA-L block each. Swann's
+// separate MA-M block is also included in the refresh below. Both sell driveway/perimeter DVR
+// kits, i.e. cameras pointed at a street, which is squarely what this table is for. A hit can
+// also be an NVR or a bridge. src: IEEE MA-L and MA-M.
 //
 // 2026-08-07 EXPANSION. Hikvision 7 -> 86 and Dahua 6 -> 33, i.e. each vendor's COMPLETE
 // MA-L set. The table had held under a tenth of the blocks those two companies own, so a
@@ -146,6 +158,27 @@ struct NetcamOui {
 // mostly WRONG - 54 of 57 vendor labels in one disagreed with IEEE, and it would have had
 // us flag Apple, Nintendo, Dell and GM hardware as cameras - so nothing was imported. Only
 // the vendors were taken as leads, and every block re-derived from the registry.
+//
+// 2026-09-01 REFRESH. Added Ezviz 38:F2:5D and Uniview 14:BA:88 from IEEE MA-L,
+// and Amcrest 3446632, Wyze A4DA222, Swann 0C0EC14 from IEEE MA-M. The latter three
+// retain all 28 registered bits in CAMERA_VENDOR_PREFIX. All five remain validated=0.
+// camarillo_drive.log contains A4:DA:22:2E:FE:07 and A4:DA:22:2E:A7:BE,
+// so the Wyze block is field-observed, but the log does not identify a camera model or
+// record visual confirmation. An observed address does not earn the validated tier.
+//
+// 2026-09-01 CAPTURED-VENDOR EXPANSION. IEEE MA-L confirms all six "Blink by Amazon"
+// assignments, Night Owl SP (542B57), SKYBELL, INC (D0C193), and the four Juan assignments:
+//   083A2F  Guangzhou Juan Intelligent Tech Joint Stock Co.,Ltd
+//   9CA3A9  Guangzhou Juan Optical and Electronical Tech Joint Stock Co., Ltd
+//   84D0DB, A486DB  Guangdong Juan Intelligent Technology Joint Stock Co., Ltd.
+// IEEE MA-M confirms WUUK LABS CORP. (B0B3537). Its fourth-byte high nibble stays 7.
+// Juan is a surveillance OEM serving multiple retail brands; "Juan OEM" names that
+// manufacturer without inventing a retail brand or camera model. Night Owl may be an NVR,
+// WUUK a base station, and SkyBell a chime. The capture collection contains addresses from
+// each vendor, but no visual confirmation; every added row therefore has validated=0.
+// Representative names include BLINK-5AJB, NVR542b5707c2a1, SkybellHD_2151974911 and
+// NVR083a2f4cc78b. These support the vendor attribution without changing the OUI tier or
+// adding an SSID rule. Exact assignments, source links and capture counts: docs/signatures.md.
 // ---------------------------------------------------------------------------------------
 
 // Registry-confirmed camera-brand OUIs (IEEE MA-L). The original 19 were verified 2026-07-17
@@ -179,6 +212,9 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0x00, 0xbc, 0x99 }, "Hikvision", 0 },
     { { 0x04, 0x03, 0x12 }, "Hikvision", 0 },
     { { 0x04, 0xee, 0xcd }, "Hikvision", 0 },
+    // Juan OEM
+    { { 0x08, 0x3a, 0x2f }, "Juan OEM", 0 },
+    // Hikvision
     { { 0x08, 0x3b, 0xc1 }, "Hikvision", 0 },
     { { 0x08, 0x54, 0x11 }, "Hikvision", 0 },
     { { 0x08, 0xa1, 0x89 }, "Hikvision", 0 },
@@ -193,6 +229,8 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0x10, 0x12, 0xfb }, "Hikvision", 0 },
     // Dahua
     { { 0x14, 0xa7, 0x8b }, "Dahua", 0 },
+    // Uniview
+    { { 0x14, 0xba, 0x88 }, "Uniview", 0 },
     // Hikvision
     { { 0x18, 0x68, 0xcb }, "Hikvision", 0 },
     // Ring
@@ -229,8 +267,12 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0x34, 0xc6, 0xdd }, "Ezviz", 0 },
     // Dahua
     { { 0x38, 0xaf, 0x29 }, "Dahua", 0 },
+    // Ezviz
+    { { 0x38, 0xf2, 0x5d }, "Ezviz", 0 },
     // Hikvision
     { { 0x3c, 0x1b, 0xf8 }, "Hikvision", 0 },
+    // Blink
+    { { 0x3c, 0xa0, 0x70 }, "Blink", 0 },
     // Dahua
     { { 0x3c, 0xe3, 0x6b }, "Dahua", 0 },
     { { 0x3c, 0xef, 0x8c }, "Dahua", 0 },
@@ -263,6 +305,9 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0x50, 0xe4, 0x67 }, "Ring", 0 },
     // Hikvision
     { { 0x50, 0xe5, 0x38 }, "Hikvision", 0 },
+    // Night Owl
+    { { 0x54, 0x2b, 0x57 }, "Night Owl", 0 },
+    // Hikvision
     { { 0x54, 0x8c, 0x81 }, "Hikvision", 0 },
     { { 0x54, 0xc4, 0x15 }, "Hikvision", 0 },
     // Ezviz
@@ -296,8 +341,13 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0x6c, 0x1c, 0x71 }, "Dahua", 0 },
     // Uniview
     { { 0x6c, 0xf1, 0x7e }, "Uniview", 0 },
+    // Blink
+    { { 0x70, 0xad, 0x43 }, "Blink", 0 },
+    { { 0x74, 0x13, 0x48 }, "Blink", 0 },
     // Hikvision
     { { 0x74, 0x3f, 0xc2 }, "Hikvision", 0 },
+    // Blink
+    { { 0x74, 0xab, 0x93 }, "Blink", 0 },
     // Dahua
     { { 0x74, 0xc9, 0x29 }, "Dahua", 0 },
     // Ezviz
@@ -316,6 +366,8 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0x80, 0xf5, 0xae }, "Hikvision", 0 },
     { { 0x84, 0x94, 0x59 }, "Hikvision", 0 },
     { { 0x84, 0x9a, 0x40 }, "Hikvision", 0 },
+    // Juan OEM
+    { { 0x84, 0xd0, 0xdb }, "Juan OEM", 0 },
     // Uniview
     { { 0x88, 0x26, 0x3f }, "Uniview", 0 },
     // Hikvision
@@ -343,6 +395,9 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0x9c, 0x76, 0x13 }, "Ring", 0 },
     // Amcrest
     { { 0x9c, 0x8e, 0xcd }, "Amcrest", 0 },
+    // Juan OEM
+    { { 0x9c, 0xa3, 0xa9 }, "Juan OEM", 0 },
+    // Amcrest
     { { 0xa0, 0x60, 0x32 }, "Amcrest", 0 },
     // Dahua
     { { 0xa0, 0xbd, 0x1d }, "Dahua", 0 },
@@ -354,6 +409,9 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0xa4, 0x14, 0x37 }, "Hikvision", 0 },
     { { 0xa4, 0x29, 0x02 }, "Hikvision", 0 },
     { { 0xa4, 0x4b, 0xd9 }, "Hikvision", 0 },
+    // Juan OEM
+    { { 0xa4, 0x86, 0xdb }, "Juan OEM", 0 },
+    // Hikvision
     { { 0xa4, 0xa4, 0x59 }, "Hikvision", 0 },
     { { 0xa4, 0xd5, 0xc2 }, "Hikvision", 0 },
     // Dahua
@@ -403,6 +461,8 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0xc4, 0xaa, 0xc4 }, "Dahua", 0 },
     // Ring
     { { 0xc4, 0xdb, 0xad }, "Ring", 0 },
+    // Blink
+    { { 0xc8, 0x19, 0xd8 }, "Blink", 0 },
     // Hikvision
     { { 0xc8, 0xa7, 0x02 }, "Hikvision", 0 },
     { { 0xcc, 0x13, 0xf3 }, "Hikvision", 0 },
@@ -410,6 +470,8 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     { { 0xcc, 0x3b, 0xfb }, "Ring", 0 },
     // Wyze
     { { 0xd0, 0x3f, 0x27 }, "Wyze", 0 },
+    // SkyBell
+    { { 0xd0, 0xc1, 0x93 }, "SkyBell", 0 },
     // i-PRO
     { { 0xd4, 0x2d, 0xc5 }, "i-PRO", 0 },
     // Dahua
@@ -446,6 +508,8 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
     // Hikvision
     { { 0xec, 0xa9, 0x71 }, "Hikvision", 0 },
     { { 0xec, 0xc8, 0x9c }, "Hikvision", 0 },
+    // Blink
+    { { 0xf0, 0x74, 0xc1 }, "Blink", 0 },
     // Wyze
     { { 0xf0, 0xc8, 0x8b }, "Wyze", 0 },
     // Ezviz
@@ -480,6 +544,17 @@ static constexpr NetcamOui CAMERA_VENDOR_OUI[] = {
 };
 static constexpr size_t CAMERA_VENDOR_OUI_COUNT = sizeof(CAMERA_VENDOR_OUI) / sizeof(CAMERA_VENDOR_OUI[0]);
 
+// IEEE MA-M assignments, checked against standards-oui.ieee.org/oui28/mam.csv.
+// Keep these separate so MA-L matching retains its binary search on the data-frame path.
+static constexpr NetcamPrefix CAMERA_VENDOR_PREFIX[] = {
+    { ACAB_OUI_MAM(0x34, 0x46, 0x63, 0x2), "Amcrest", 0 },
+    { ACAB_OUI_MAM(0xa4, 0xda, 0x22, 0x2), "Wyze", 0 },
+    { ACAB_OUI_MAM(0x0c, 0x0e, 0xc1, 0x4), "Swann", 0 },
+    { ACAB_OUI_MAM(0xb0, 0xb3, 0x53, 0x7), "WUUK", 0 },
+};
+static constexpr size_t CAMERA_VENDOR_PREFIX_COUNT =
+    sizeof(CAMERA_VENDOR_PREFIX) / sizeof(CAMERA_VENDOR_PREFIX[0]);
+
 // The table's 24-bit sort key, and a COMPILE-TIME guard that it really is sorted.
 //
 // netcamEntry() binary-searches CAMERA_VENDOR_OUI, which is only correct while the rows are in
@@ -503,8 +578,8 @@ static_assert(netcamOuiSorted(),
 // FIRST FIELD VALIDATION 2026-07-23. An airport capture returned 8 network-camera rows across
 // four OUIs (Dahua 4C:11:BF x2, BC:32:5F x2, E0:50:8B x1; Reolink EC:71:DB x3) and the user
 // confirmed all 8 were real network cameras. So both halves held: the OUI named the vendor
-// correctly AND the device really was a camera. The other 176 OUIs in this table remain
-// REGISTRY-SOURCED ONLY and unconfirmed.
+// correctly AND the device really was a camera. Every other prefix remains at the
+// registry tier; observing the Wyze MA-M addresses does not establish their product type.
 //
 // The confidence below is deliberately NOT raised on that result, and this is the important
 // part: 8 hits at ONE site is exactly the evidence shape that made POLICE_OUI's "3 distinct
@@ -520,7 +595,7 @@ static_assert(netcamOuiSorted(),
 // fallback (60). Honesty over alarm.
 #define NETCAM_OUI_CONFIDENCE  65
 // A field-validated block earns the same tier as the field-validated Axon OUI (75). Only the
-// four entries flagged validated=1 get it; the other 176 stay registry-only at 65.
+// four entries flagged validated=1 get it; every other prefix stays at 65.
 #define NETCAM_OUI_CONFIDENCE_VALIDATED  75
 
 // ---------------------------------------------------------------------------
@@ -540,9 +615,14 @@ static_assert(netcamOuiSorted(),
 // Deliberately matched case-insensitively and as a PREFIX, not an exact string, because the
 // numeric tail is per-unit. FP risk is negligible: nothing else names an AP "ARLO_VMB_".
 #define NETCAM_SSID_ARLO_PREFIX  "ARLO_VMB_"
-// The NETGEAR-era form of the same box. NOT YET CAPTURED BY US - listed because it is the only
-// route to pre-2018 Arlo, and because the downside of an uncaptured SSID literal is a MISS, never
-// a false positive. Promote the comment to "captured" if one ever lands in a log.
+// The NETGEAR-era form of the same box, listed because it is the only route to pre-2018 Arlo
+// (the downside of an SSID literal is a MISS, never a false positive). CAPTURED, repeatedly: our
+// own drive logs (firmware/tools/detection logs, gitignored) carry NTGR_VMB_ hubs in nine captures
+// from 2026-07-24 (compare-dual) to 2026-09-02 (Santa Barbara), 33 distinct hubs in all, 18 on Arlo's
+// A4:11:62 and 15 on nine NETGEAR blocks (2C:30:33, CC:40:D0, B0:39:56, A0:40:A0, A0:04:60,
+// 9C:3D:CF, 78:D2:94, 50:6A:03, 14:59:C0) that no OUI row here reaches, exactly the case above.
+// Observed, not eyeballed, so the 88 tier rests on the self-attesting SSID as before, not on a
+// validated=1 sighting. The "not yet captured" note that stood here was stale from August on.
 #define NETCAM_SSID_ARLO_LEGACY_PREFIX  "NTGR_VMB_"
 // Same tier as the Flock SSID match (88) and for the identical reason: the device broadcast its
 // own vendor and model class in the clear. Above every OUI tier in this file, including the

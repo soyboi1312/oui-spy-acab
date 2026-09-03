@@ -42,27 +42,34 @@ void netcamRestoreEnabled(bool defaultEnabled) {
 
 // Branded IP-camera OUI match. Skip randomized / locally-administered MACs (the OUI is
 // meaningless there), like the flock/drone OUI matchers. This is the ONLY per-data-frame work
-// in production when the toggle is on. Table entry for this MAC, or nullptr. Callers that only
-// want the label use netcamVendorOui below; the classifier needs the whole entry so it can
-// grade a field-validated block above a registry-only one.
-static const NetcamOui* netcamEntry(const uint8_t mac[6]) {
-    if (mac[0] & 0x02) return nullptr;   // locally-administered / randomized: no real OUI
+// in production when the toggle is on. Both table shapes return the same metadata so the
+// classifier grades a field-validated block above a registry-only one on either path.
+struct NetcamMatch {
+    const char* vendor;
+    uint8_t validated;
+};
+static NetcamMatch netcamEntry(const uint8_t mac[6]) {
+    if (!mac || (mac[0] & 0x02)) return { nullptr, 0 };   // no real IEEE assignment
     // BINARY SEARCH over the sorted table. This runs on EVERY data frame while the
     // network-camera opt-in is on, which is the busiest path in the firmware: that opt-in is
-    // what widens the promiscuous filter to the data-frame firehose. The table grew from 62
-    // entries to 180 when Hikvision and Dahua were expanded to their full registered blocks, so
-    // a linear scan would have roughly tripled the cost of the one thing already on the hot
-    // path. ~8 comparisons instead of up to 180. The sort order this depends on is enforced by
-    // the static_assert in netcam_signatures.h; do not revert to a scan without removing that.
+    // what widens the promiscuous filter to the data-frame firehose. The sort order is enforced
+    // by netcamOuiSorted(). A miss checks only the small CAMERA_VENDOR_PREFIX fallback with
+    // the shared width-aware matcher, rather than scanning the MA-L table.
     const uint32_t key = ((uint32_t)mac[0] << 16) | ((uint32_t)mac[1] << 8) | (uint32_t)mac[2];
     size_t lo = 0, hi = CAMERA_VENDOR_OUI_COUNT;
     while (lo < hi) {
         const size_t mid = lo + (hi - lo) / 2;
         const uint32_t k = netcamOuiKey(CAMERA_VENDOR_OUI[mid]);
-        if (k == key) return &CAMERA_VENDOR_OUI[mid];
+        if (k == key) {
+            const NetcamOui& e = CAMERA_VENDOR_OUI[mid];
+            return { e.vendor, e.validated };
+        }
         if (k < key) lo = mid + 1; else hi = mid;
     }
-    return nullptr;
+    for (const NetcamPrefix& e : CAMERA_VENDOR_PREFIX)
+        if (acabOuiPrefixMatches(e.prefix, e.prefixBits, mac))
+            return { e.vendor, e.validated };
+    return { nullptr, 0 };
 }
 
 // Case-insensitive prefix test for the base-station SSID rule. Mirrors ciEndsWith in
@@ -79,8 +86,7 @@ static bool netcamSsidPrefix(const char* ssid, const char* pfx) {
 }
 
 const char* netcamVendorOui(const uint8_t mac[6]) {
-    const NetcamOui* e = netcamEntry(mac);
-    return e ? e->vendor : nullptr;
+    return netcamEntry(mac).vendor;
 }
 
 bool netcamClassifyWiFi(const uint8_t* frame, size_t len, bool isDataFrame,
@@ -146,8 +152,8 @@ bool netcamClassifyWiFi(const uint8_t* frame, size_t len, bool isDataFrame,
                             out->confidence = NETCAM_SSID_CONFIDENCE;
                             // KEEP THE SSID. It is the entire justification for ranking this above
                             // the eyeball-validated 75 tier, so discarding it would leave the log
-                            // with no way to check the claim - and no way to tell a CAPTURED
-                            // ARLO_VMB_ hit from an NTGR_VMB_ hit we have never actually seen. It
+                            // with no way to check the claim - and no way to tell an ARLO_VMB_
+                            // hit from the rarer NTGR_VMB_ legacy form (both field-captured). It
                             // also gives the row a real title: with name empty both apps fall all
                             // the way back to the bare type label "Network camera". Same as
                             // flock_detect.cpp and desert_detect.cpp do with their SSID matches.
@@ -167,14 +173,13 @@ bool netcamClassifyWiFi(const uint8_t* frame, size_t len, bool isDataFrame,
         }
     }
 
-    const NetcamOui* e = netcamEntry(frame + saOff);
-    if (!e) return false;
-    const char* vendor = e->vendor;
+    const NetcamMatch e = netcamEntry(frame + saOff);
+    if (!e.vendor) return false;
 
     acabInit(out, ACAB_NETCAM, SRC_WIFI, frame + saOff, (int16_t)rssi);
     out->method     = M_OUI;
-    out->confidence = e->validated ? NETCAM_OUI_CONFIDENCE_VALIDATED : NETCAM_OUI_CONFIDENCE;
+    out->confidence = e.validated ? NETCAM_OUI_CONFIDENCE_VALIDATED : NETCAM_OUI_CONFIDENCE;
     // HONEST label: names the vendor + that it is on the network. NOT "hidden camera".
-    snprintf(out->detail, sizeof(out->detail), "%s on wifi", vendor);
+    snprintf(out->detail, sizeof(out->detail), "%s on wifi", e.vendor);
     return true;
 }

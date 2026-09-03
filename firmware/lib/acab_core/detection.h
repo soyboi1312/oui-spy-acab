@@ -131,15 +131,22 @@ struct AcabDetection {
     // address is public because the TYPE field says so, not because of any bit pattern. Axon's
     // 00:25:DF has the 0x02 bit clear AND top bits 00, so a "top two bits" rule applied blind
     // would call every body-cam OUI hit a non-resolvable private address and cap its confidence
-    // at 25. The fix belongs at ingest: NimBLE hands the type to AcabAdvCallbacks::onResult
-    // (acab_scanner.cpp, NimBLEAddress::getType()) where it is currently discarded, and the
-    // dual-radio nRF forward frame needs the same byte added before dual-radio adverts are
-    // covered. Until that lands, read this as "randomized WiFi MAC".
+    // at 25. So the type is plumbed from the radio instead (AcabBleAddrType): the native NimBLE
+    // scan on the single-radio boards passes NimBLEAdvertisedDevice::getAddressType() into
+    // acabScannerIngestBLE, which sets this true when the controller reported RANDOM. It never
+    // clears it: a public address with the 0x02 bit set is locally administered and still owns
+    // no IEEE OUI. The dual-radio nRF forward line carries no type (the co-processor image is
+    // pinned at v2 and the line format cannot grow), so on the beacon board a BLE address with
+    // the bit clear stays UNKNOWN and this field stays false; desertClassifyBLE labels that case
+    // "OUI unknown" rather than claiming an OUI it cannot see.
     //
     // Nothing serializes it - there is no "rnd" key anywhere under firmware/ - so no app has
     // ever seen a board-sourced value. iOS decodes "rnd" and defaults it false; Android does not
-    // read it at all. Both then run the identical local 0x02 test on the MAC string, so both
-    // inherit exactly this gap, and they keep inheriting it until the firmware emits the flag.
+    // read it at all. Both then run the identical local 0x02 test on the MAC string. So on a
+    // native-BLE board a Desert row can say "randomized MAC" (controller reported RANDOM, bit
+    // clear) while the app's own randomized badge stays off; the row text is the right one.
+    // Closing that needs "rnd" on the wire (11 bytes against the iPhone notify budget) plus the
+    // Android decode, deliberately not part of the 2.0.7 change.
     bool           randomAddr;
 
     // Transient routing flag: true when this is a REPLAY of a stored record (nRF
@@ -182,6 +189,17 @@ static inline const char* acabSourceLabel(AcabSource s) {
     }
 }
 
+// BLE address type as reported by the controller that heard the advert. BLE signals a random
+// address in the advertising PDU's TxAdd flag, not in the address bytes, so only the radio that
+// received the packet can say. Public/random here is that flag; UNKNOWN is the honest value on
+// every path that never saw it (the dual-radio nRF forward line carries no type, and a replayed
+// black-box record stores none). Readers must treat UNKNOWN as "cannot tell", never as public.
+typedef enum {
+    ACAB_BLE_ADDR_UNKNOWN = 0,
+    ACAB_BLE_ADDR_PUBLIC  = 1,
+    ACAB_BLE_ADDR_RANDOM  = 2,
+} AcabBleAddrType;
+
 // Zero out a detection and stamp the basics.
 static inline void acabInit(AcabDetection* d, AcabDeviceType type, AcabSource src,
                             const uint8_t mac[6], int16_t rssi) {
@@ -193,8 +211,9 @@ static inline void acabInit(AcabDetection* d, AcabDeviceType type, AcabSource sr
         memcpy(d->mac, mac, 6);
         // 802.11 locally-administered bit. Right for SRC_WIFI, and a KNOWN under-detect for
         // SRC_BLE, which encodes randomness in the address TYPE and not in this bit. The type
-        // is not available at this call site; see the long note on AcabDetection::randomAddr
-        // for why it must be plumbed from the scanner rather than guessed from the bytes.
+        // is not available at this call site; acabScannerIngestBLE ORs in the controller's
+        // RANDOM report after the classifier chain (see the note on AcabDetection::randomAddr
+        // for why it is plumbed from the radio rather than guessed from the bytes).
         d->randomAddr = (mac[0] & 0x02) != 0;
     }
 }
@@ -208,22 +227,35 @@ static inline void acabInit(AcabDetection* d, AcabDeviceType type, AcabSource sr
 // which keep their confidence because they never depended on the address. This cap is not
 // that mechanism, and the comment here used to imply it was.
 //
-// DEFENCE IN DEPTH, AND UNREACHABLE TODAY. Every M_OUI emitter already refuses a
-// locally-administered MAC before it stamps a record - flock_detect ouiMatch/falconWifiOui,
-// police_detect ouiMatch, netcam_detect netcamEntry, drone_detect through
-// acabOuiPrefixMatches, axon_detect utilOui and axonOuiHit - and the one arm with no
-// source-level guard, axonClassifyBLE's signature-table loop, can only match 00:25:DF, whose
-// 0x02 bit is clear. So at the single call site the condition never holds, and no INGEST path
-// can reach the branch: the assertion that pins it (test_flock.cpp) has to take a real OUI hit
-// and then set randomAddr by hand, because no scan input produces both together. It is kept as
-// the central backstop for a future matcher added WITHOUT its own guard.
+// DEFENCE IN DEPTH. Every M_OUI emitter already refuses a locally-administered MAC before it
+// stamps a record - flock_detect ouiMatch/falconWifiOui, police_detect ouiMatch, netcam_detect
+// netcamEntry, drone_detect through acabOuiPrefixMatches, axon_detect utilOui and axonOuiHit -
+// and the one arm with no source-level guard, axonClassifyBLE's signature-table loop, can only
+// match 00:25:DF, whose 0x02 bit is clear. So from the BYTES alone the condition never holds.
 //
-// It also stops being unreachable the moment randomAddr is derived correctly for BLE (see the
-// note on that field): a resolvable private address such as 44:xx:xx has the 0x02 bit CLEAR,
-// so it walks straight through every per-matcher guard, and this cap is the only thing that
-// would catch the OUI hit it can produce.
+// It IS reachable from the radio's address type. A resolvable private address such as 44:xx:xx
+// has the 0x02 bit CLEAR, so it walks straight through every per-matcher guard; when the native
+// NimBLE scan reports it RANDOM, acabScannerIngestBLE sets randomAddr after the chain and this
+// cap is the only thing that catches the OUI hit it can produce. On the dual-radio path the type
+// is unknown, randomAddr stays byte-derived, and the cap is again only a backstop. The pinning
+// assertion in test_flock.cpp still sets randomAddr by hand because the classifiers are tested
+// below the ingest layer; the reachable case lives in acab_scanner.cpp, which the host harness
+// does not compile, so it has NO host test. Its proof is a native-BLE board (oui-spy or
+// mesh-detect) with Desert on: a bit-clear address the controller reports RANDOM must render
+// "randomized MAC" on the row.
 static inline void acabApplyDurability(AcabDetection* d) {
     if (d->method == M_OUI && d->randomAddr && d->confidence > 25) d->confidence = 25;
+}
+
+// THE ONE OWNER of "what the controller's address type does to randomAddr". OR, never assign: a
+// RANDOM report sets it; a PUBLIC report does not clear a set 0x02 bit (a locally-administered
+// public address still owns no IEEE OUI); UNKNOWN (dual-radio UART, replays) leaves the
+// byte-derived value alone. Called from acabScannerIngestBLE after the classifier chain (so it
+// covers every classified row) and from desertClassifyBLE for its own row (so a caller that reads
+// the record straight from the classifier, as test_desert.cpp does, sees label and flag agree).
+// Pulled out here, like acabApplyDurability, so the host harness can pin the rule directly.
+static inline void acabNoteBleAddrType(AcabDetection* d, AcabBleAddrType t) {
+    if (t == ACAB_BLE_ADDR_RANDOM) d->randomAddr = true;
 }
 
 // Format a MAC into "aa:bb:cc:dd:ee:ff". buf needs >= 18 bytes.

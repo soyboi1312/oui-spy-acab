@@ -5,14 +5,16 @@
 //   1. the enable toggle (OFF by default). If that ever defaults on, every phone, laptop and
 //      fridge in range becomes an alert row, which is indistinguishable from "the product is
 //      broken" to a user who is not in the desert.
-//   2. the randomized-MAC vs hardware-OUI call. That single bit is the ONLY thing that tells a
-//      real device apart from phone-MAC churn, and the whole point of the mode is "something
-//      arrived". Get it backwards and every rotating phone address looks like new hardware.
+//   2. the randomized-MAC vs hardware-OUI call. On WiFi that is one bit; on BLE it is that bit
+//      OR the controller's address type, and with no type the row must say "OUI unknown" rather
+//      than claim hardware. That label is the ONLY thing that tells a real device apart from
+//      phone-MAC churn, and the whole point of the mode is "something arrived". Get it
+//      backwards and every rotating phone address looks like new hardware.
 // Both are one-line behaviours that compile fine when wrong, and neither shows up on the bench:
 // the mode is opt-in, so a regression here ships silently and only surfaces in the field.
 //
-// Also locks the exact detail strings ("randomized MAC" / "hardware OUI") and the field stamping,
-// because the apps consume both verbatim on the detection row.
+// Also locks the exact detail strings ("randomized MAC" / "hardware OUI" / "OUI unknown")
+// and the field stamping, because the apps consume both verbatim on the detection row.
 #include "desert_detect.h"
 #include <Preferences.h>   // the stub now really stores; see the persistence block at the end
 #include <cstdio>
@@ -80,9 +82,11 @@ static void addName(std::vector<uint8_t>& a, uint8_t adType, const char* s) {
     a.push_back((uint8_t)(1 + n)); a.push_back(adType);
     for (size_t i = 0; i < n; i++) a.push_back((uint8_t)s[i]);
 }
-static bool runBle(const uint8_t mac[6], std::vector<uint8_t>& a, AcabDetection* out) {
+// Default = ACAB_BLE_ADDR_UNKNOWN, which is what the dual-radio UART path and replays deliver.
+static bool runBle(const uint8_t mac[6], std::vector<uint8_t>& a, AcabDetection* out,
+                   AcabBleAddrType t = ACAB_BLE_ADDR_UNKNOWN) {
     memset(out, 0, sizeof(*out));
-    return desertClassifyBLE(mac, a.data(), a.size(), -84, out);
+    return desertClassifyBLE(mac, a.data(), a.size(), -84, out, t);
 }
 
 // ---- 802.11 mgmt frame builder ----
@@ -134,7 +138,7 @@ int main() {
       memset(&d, 0, sizeof(d)); d.type = ACAB_FLOCK_CAMERA; d.confidence = 99;
       strcpy(d.detail, "sentinel");
       std::vector<uint8_t> a; addName(a, 0x09, "PIXEL-7");
-      bool hit = desertClassifyBLE(macOui, a.data(), a.size(), -84, &d);
+      bool hit = desertClassifyBLE(macOui, a.data(), a.size(), -84, &d, ACAB_BLE_ADDR_UNKNOWN);
       chkTrue("disabled: caller's detection left untouched",
               !hit && d.type == ACAB_FLOCK_CAMERA && d.confidence == 99 &&
               strcmp(d.detail, "sentinel") == 0); }
@@ -145,9 +149,16 @@ int main() {
     chkTrue("desertSetEnabled(true) reflected by desertIsEnabled()", desertIsEnabled() == true);
 
     // ------------------------------------------------------- BLE, enabled
+    { // No address type (dual-radio UART path): the bytes alone cannot prove an OUI, so the
+      // row says so instead of claiming one. This used to read "hardware OUI" for every BLE
+      // address with the 0x02 bit clear, which filed about half of all rotating phone
+      // addresses under real hardware.
+      std::vector<uint8_t> a;
+      chk("BLE: OUI-shaped MAC, type UNKNOWN -> OUI unknown", runBle(macOui, a, &d), true,
+          d.detail, "OUI unknown", d.name, ""); }
     { std::vector<uint8_t> a;
-      chk("BLE: bare hardware-OUI MAC, no advert data", runBle(macOui, a, &d), true,
-          d.detail, "hardware OUI", d.name, ""); }
+      chk("BLE: OUI-shaped MAC, type PUBLIC -> hardware OUI",
+          runBle(macOui, a, &d, ACAB_BLE_ADDR_PUBLIC), true, d.detail, "hardware OUI", d.name, ""); }
     { // Every field the app reads off a desert row. type 7 = ACAB_NEARBY_DEVICE is the wire value
       // in the BLE t= field, so a renumber here silently retypes rows in both apps.
       chkTrue("BLE: type=NEARBY src=BLE method=M_NONE",
@@ -161,6 +172,12 @@ int main() {
     { chkTrue("BLE: companyId left 0 (scanner stamps it later)", d.companyId == 0); }
     { chkTrue("BLE: randomAddr=false agrees with the detail string",
               d.randomAddr == false && strcmp(d.detail, "hardware OUI") == 0); }
+    { // The controller's word beats the bytes: a public-LOOKING address reported RANDOM is a
+      // resolvable private address, and both the label and randomAddr must say so.
+      std::vector<uint8_t> a;
+      chk("BLE: OUI-shaped MAC, type RANDOM -> randomized MAC",
+          runBle(macOui, a, &d, ACAB_BLE_ADDR_RANDOM), true, d.detail, "randomized MAC");
+      chkTrue("BLE: type RANDOM sets randomAddr even with the 0x02 bit clear", d.randomAddr == true); }
 
     { std::vector<uint8_t> a;
       chk("BLE: locally-administered MAC c2: -> randomized", runBle(macRand, a, &d), true,
@@ -176,35 +193,64 @@ int main() {
       // the addresses you happen to try by hand.
       const uint8_t m[6] = {0x01, 0x25, 0xdf, 0x11, 0x22, 0x33};
       std::vector<uint8_t> a;
-      chk("BLE: 01: multicast bit is NOT randomized", runBle(m, a, &d), true, d.detail, "hardware OUI"); }
+      chk("BLE: 01: multicast bit is NOT randomized", runBle(m, a, &d, ACAB_BLE_ADDR_PUBLIC), true,
+          d.detail, "hardware OUI"); }
+    { // A set 0x02 bit is conclusive on its own: no IEEE OUI has it, so even a PUBLIC report
+      // (a locally-administered public address) must not promote it to "hardware OUI".
+      std::vector<uint8_t> a;
+      chk("BLE: LAA bit set + type PUBLIC stays randomized", runBle(macRand, a, &d, ACAB_BLE_ADDR_PUBLIC),
+          true, d.detail, "randomized MAC"); }
     { const uint8_t m[6] = {0x03, 0x25, 0xdf, 0x11, 0x22, 0x33};   // both bits
       std::vector<uint8_t> a;
       chk("BLE: 03: multicast + LAA -> randomized", runBle(m, a, &d), true, d.detail, "randomized MAC"); }
-    { // CONCERN, LOCKED IN AS-IS: this is a real captured BLE resolvable private address (top two
-      // bits 01). On BLE, "random address" is signalled by the address TYPE flag in the advert
-      // report, not by the U/L bit, and an RPA does not set bit 1 - so desert files a rotating
-      // phone address under "hardware OUI". Reported here as current behaviour, not as approval:
-      // fixing it needs the address type plumbed in from NimBLE, which the classifier never sees.
+    { // A real captured BLE resolvable private address (top two bits 01, 0x02 bit clear). With
+      // the type plumbed from the radio it is labelled correctly; without a type (dual-radio
+      // UART path) it is no longer misfiled as hardware, it is reported as unknowable. The
+      // former "locked in as-is" assertion here recorded the old misfiling.
       const uint8_t rpa[6] = {0x41, 0xbc, 0xbc, 0x7d, 0xe0, 0x53};
       std::vector<uint8_t> a;
-      chk("BLE: RPA 41: reported as hardware OUI (see comment)", runBle(rpa, a, &d), true,
-          d.detail, "hardware OUI"); }
+      chk("BLE: RPA 41: type RANDOM -> randomized MAC", runBle(rpa, a, &d, ACAB_BLE_ADDR_RANDOM), true,
+          d.detail, "randomized MAC");
+      chk("BLE: RPA 41: type UNKNOWN -> OUI unknown (never hardware OUI)", runBle(rpa, a, &d), true,
+          d.detail, "OUI unknown"); }
+
+    // ------------------------------------------------- label width is a WIRE CONTRACT
+    { // The live BLE notify can only elide RID fields, which a Nearby row never carries, so a row
+      // that outgrows the iPhone-class 182-byte notify cap is a LOST live sighting. The three
+      // BLE labels are held to the widths that shipped before 2.0.7: "randomized MAC" is the
+      // 14-byte worst case, and the two labels that stand in for the old "hardware OUI" stay at
+      // its 12 bytes, so no row's name budget moves. A 20-byte draft of the third label once cut
+      // the deliverable name length on GPS-stamped rows from 24 to 16 chars.
+      std::vector<uint8_t> a;
+      runBle(macOui, a, &d, ACAB_BLE_ADDR_PUBLIC);  size_t lp = strlen(d.detail);
+      runBle(macOui, a, &d, ACAB_BLE_ADDR_RANDOM);  size_t lr = strlen(d.detail);
+      runBle(macOui, a, &d, ACAB_BLE_ADDR_UNKNOWN); size_t lu = strlen(d.detail);
+      chkTrue("BLE: desert labels hold their pre-2.0.7 widths (<=12 / <=14 / <=12 bytes)",
+              lp <= 12 && lr <= 14 && lu <= 12); }
+    { // The rule's single owner, pinned directly: RANDOM sets, PUBLIC and UNKNOWN never clear.
+      AcabDetection x; memset(&x, 0, sizeof(x));
+      acabNoteBleAddrType(&x, ACAB_BLE_ADDR_UNKNOWN); bool u = x.randomAddr;
+      acabNoteBleAddrType(&x, ACAB_BLE_ADDR_PUBLIC);  bool p = x.randomAddr;
+      acabNoteBleAddrType(&x, ACAB_BLE_ADDR_RANDOM);  bool r = x.randomAddr;
+      acabNoteBleAddrType(&x, ACAB_BLE_ADDR_PUBLIC);  bool p2 = x.randomAddr;
+      chkTrue("acabNoteBleAddrType: UNKNOWN/PUBLIC leave false, RANDOM sets, PUBLIC never clears",
+              !u && !p && r && p2); }
 
     // ------------------------------------------------- BLE name decoding
     { std::vector<uint8_t> a; addName(a, 0x09, "PIXEL-7");
-      chk("BLE: complete local name (AD 0x09) decoded", runBle(macOui, a, &d), true,
+      chk("BLE: complete local name (AD 0x09) decoded", runBle(macOui, a, &d, ACAB_BLE_ADDR_PUBLIC), true,
           d.detail, "hardware OUI", d.name, "PIXEL-7"); }
     { std::vector<uint8_t> a; addFlags(a); addName(a, 0x08, "abc");
-      chk("BLE: shortened name (AD 0x08) after flags", runBle(macOui, a, &d), true,
+      chk("BLE: shortened name (AD 0x08) after flags", runBle(macOui, a, &d, ACAB_BLE_ADDR_PUBLIC), true,
           d.detail, "hardware OUI", d.name, "abc"); }
     { std::vector<uint8_t> a; addFlags(a);
-      chk("BLE: flags only, no name AD -> empty name", runBle(macOui, a, &d), true,
+      chk("BLE: flags only, no name AD -> empty name", runBle(macOui, a, &d, ACAB_BLE_ADDR_PUBLIC), true,
           d.detail, "hardware OUI", d.name, ""); }
     { // Sanitizer on ingest: a crafted name full of control bytes must not reach the app, because
       // raw control chars break the detection JSON and iOS silently drops invalid JSON.
       std::vector<uint8_t> a;
       a.push_back(4); a.push_back(0x09); a.push_back('h'); a.push_back(0x00); a.push_back(0x1b);
-      chk("BLE: control bytes in name become dots", runBle(macOui, a, &d), true,
+      chk("BLE: control bytes in name become dots", runBle(macOui, a, &d, ACAB_BLE_ADDR_PUBLIC), true,
           d.detail, "hardware OUI", d.name, "h.."); }
     { // 50-char name into a 40-byte field: must truncate to 39 chars + NUL, never overrun.
       std::vector<uint8_t> a; a.push_back(51); a.push_back(0x09);
@@ -212,7 +258,7 @@ int main() {
       for (int i = 0; i < 50; i++) { uint8_t c = (uint8_t)('A' + (i % 26)); a.push_back(c);
                                      if (i < 39) want[i] = (char)c; }
       want[39] = 0;
-      bool hit = runBle(macOui, a, &d);
+      bool hit = runBle(macOui, a, &d, ACAB_BLE_ADDR_PUBLIC);
       chk("BLE: 50-char name truncated to the 39-char field", hit, true,
           d.detail, "hardware OUI", d.name, want); }
 
@@ -221,21 +267,22 @@ int main() {
       // all is exactly the "something arrived" case desert exists for.
       memset(&d, 0, sizeof(d));
       chk("BLE: null advert pointer still hits, empty name",
-          desertClassifyBLE(macOui, nullptr, 0, -84, &d), true, d.detail, "hardware OUI", d.name, ""); }
+          desertClassifyBLE(macOui, nullptr, 0, -84, &d, ACAB_BLE_ADDR_PUBLIC), true,
+          d.detail, "hardware OUI", d.name, ""); }
     { std::vector<uint8_t> a;
-      chk("BLE: empty buffer (len 0) still hits, empty name", runBle(macOui, a, &d), true,
+      chk("BLE: empty buffer (len 0) still hits, empty name", runBle(macOui, a, &d, ACAB_BLE_ADDR_PUBLIC), true,
           d.detail, "hardware OUI", d.name, ""); }
     { // Hostile length field: claims 200 bytes inside a 3-byte buffer. Must stop, not read past
       // the end, and still report the device.
       std::vector<uint8_t> a = {200, 0x09, 'A'};
-      chk("BLE: AD length overruns buffer -> no name, no read", runBle(macOui, a, &d), true,
+      chk("BLE: AD length overruns buffer -> no name, no read", runBle(macOui, a, &d, ACAB_BLE_ADDR_PUBLIC), true,
           d.detail, "hardware OUI", d.name, ""); }
     { // Zero length field would advance the cursor by 1 forever: the loop must break out.
       std::vector<uint8_t> a = {0, 0x09, 'A', 'B'};
-      chk("BLE: zero AD length -> breaks, no infinite loop", runBle(macOui, a, &d), true,
+      chk("BLE: zero AD length -> breaks, no infinite loop", runBle(macOui, a, &d, ACAB_BLE_ADDR_PUBLIC), true,
           d.detail, "hardware OUI", d.name, ""); }
     { std::vector<uint8_t> a = {0x09};   // single dangling byte
-      chk("BLE: 1-byte truncated advert", runBle(macOui, a, &d), true,
+      chk("BLE: 1-byte truncated advert", runBle(macOui, a, &d, ACAB_BLE_ADDR_PUBLIC), true,
           d.detail, "hardware OUI", d.name, ""); }
 
     // ------------------------------------------------------ WiFi, enabled

@@ -149,8 +149,9 @@ static int nameMatch(const char* name) {
     // Bare 10-digit-name matching removed 2026-06-18: in the field it false-
     // positived on rotating/private BLE addresses with placeholder numeric names (a
     // phone advertising "0102000000", not a camera). The specific Flock signatures
-    // (Penguin / FS / 0x09C8 / Flock- SSID / b4:1e:52) stay. To bring 10-digit
-    // matching back safely, gate it on a public (non-random) BLE address.
+    // (Penguin / FS / 0x09C8 / Flock- SSID / b4:1e:52) stay. Reconsider 10-digit
+    // matching only with independent Flock-specific evidence; a public address
+    // alone cannot establish that identity.
     return NM_NONE;
 }
 
@@ -279,17 +280,15 @@ bool flockClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
         acabInit(out, ACAB_FLOCK_CAMERA, SRC_BLE, mac, (int16_t)rssi);
         out->method = M_NAME;
         // Only the "FS Ext Battery" literal ranks strong on its own. The anchored
-        // prefix forms and the loose "Flock" prefix rank strong only with a co-signal:
-        // a public (non-random) BLE address - real Flock beacons don't rotate - or the
-        // 0x09C8 mfg id. Without one they stay hint-grade (70), so a consumer gadget
-        // named "FS-100" on a rotating address never draws a strong ALPR verdict.
-        // Mirrors the public-address gate prescribed for the removed 10-digit pattern
-        // (see nameMatch).
+        // prefix forms and the loose "Flock" prefix need the 0x09C8 mfg co-signal
+        // to rank 80; name-only hits stay hint-grade (70) for every address.
+        // A public address does not identify Flock, and mac[0] & 0x02 cannot tell
+        // public from random BLE addresses: that requires controller metadata.
+        // 0x09C8 is shared XUNTONG silicon; this retains the existing name+mfg tier.
         bool mfgHit = false;
         for (size_t i = 0; f.haveMfg && i < FLOCK_MFG_COUNT; i++)
             if (f.mfgId == FLOCK_MFG_IDS[i]) { mfgHit = true; break; }
-        bool cosignal = !(mac[0] & 0x02) || mfgHit;
-        out->confidence = (nm == NM_LITERAL || cosignal) ? 80 : 70;
+        out->confidence = (nm == NM_LITERAL || mfgHit) ? 80 : 70;
         strncpy(out->name, f.name, sizeof(out->name) - 1);
         return true;
     }

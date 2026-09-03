@@ -8,10 +8,16 @@
  * It is the LAST classifier in the scan chain, so the specific detectors still win
  * for known gear; this only labels whatever is left over. Each device is tagged
  * hardware-OUI vs randomized-MAC (phones rotate theirs ~every 15 min) so the app
- * can tell a real device from phone-MAC churn. The advert name / WiFi SSID is
+ * can tell a real device from phone-MAC churn. On WiFi that is the 802.11
+ * locally-administered bit. On BLE it is the controller's address type when the
+ * radio reported one; a BLE address with no reported type and the bit clear is
+ * labelled "OUI unknown", because the bytes alone cannot tell a public
+ * OUI from a resolvable private address. The advert name / WiFi SSID is
  * decoded into the detection for display. OFF by default; toggled via the app
  * {desert} config key. Reuses the scanner's existing dedup + "new device" + alert
- * + offline-buffer pipeline, so show/log/alert-on-new all come for free.
+ * pipeline, so show/log/alert-on-new all come for free. NOT the offline buffer:
+ * shouldBuffer in acab_scanner.cpp refuses ACAB_NEARBY_DEVICE unless "record
+ * everything" (bufferAll) is on, see docs/ble-protocol.md.
  */
 #ifndef ACAB_DESERT_DETECT_H
 #define ACAB_DESERT_DETECT_H
@@ -29,8 +35,11 @@ void desertRestoreEnabled(bool defaultEnabled);
 
 // Catch-all: returns true for ANY device when Desert mode is on (emits
 // ACAB_NEARBY_DEVICE). MUST be tried LAST, after every specific classifier.
+// addrType is what the receiving radio reported (ACAB_BLE_ADDR_UNKNOWN on the dual-radio
+// UART path and on black-box replays); it selects the detail label, see the header note.
+// No default on purpose: the one production caller (acabScannerIngestBLE) always knows.
 bool desertClassifyBLE(const uint8_t mac[6], const uint8_t* adv, size_t advLen,
-                       int rssi, AcabDetection* out);
+                       int rssi, AcabDetection* out, AcabBleAddrType addrType);
 bool desertClassifyWiFi(const uint8_t* frame, size_t len, int rssi, AcabDetection* out);
 
 #endif // ACAB_DESERT_DETECT_H

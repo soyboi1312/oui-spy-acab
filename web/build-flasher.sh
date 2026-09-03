@@ -133,7 +133,10 @@ BOOT_APP0="$(find "$HOME/.platformio/packages/framework-arduinoespressif32/tools
 
 # A syntactically valid private key can still belong to another checkout/trust root. Prove the
 # key's derived public DER is exactly what ota_pubkey.h bakes into every board before any build or
-# served-tree mutation. USB-only mode intentionally has no signing-key dependency.
+# served-tree mutation. The one exception is the declared rotation cut (release_tools.OTA_ROTATION):
+# for that release the header bakes the NEW root and the key must be the RETIRING signer, so the
+# line below reports the baked root, not a key match. USB-only mode intentionally has no
+# signing-key dependency.
 if [ "$UNSIGNED_OK" != "1" ]; then
   "$PY" - "$FW/tools" "$OTA_KEY" "$FW/lib/acab_core/ota_pubkey.h" <<'PY'
 import sys
@@ -144,7 +147,7 @@ try:
 except ReleaseToolError as exc:
     print(f"!! {exc}", file=sys.stderr)
     raise SystemExit(1)
-print(f">> OTA signing key matches baked trust root ({digest[:12]})")
+print(f">> OTA signing key accepted for baked trust root ({digest[:12]})")
 PY
 fi
 

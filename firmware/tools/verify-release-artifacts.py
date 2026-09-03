@@ -39,6 +39,7 @@ from release_tools import (
     expected_project_for_artifact,
     expected_version_for_artifact,
     filter_release_profile,
+    ota_rotation_for_versions,
     read_baked_ota_public_key_der,
     read_esp_app_desc,
     require_manifest_image_identity,
@@ -86,6 +87,12 @@ CANARIES = {
     # The independent source-mtime and raw esp_app_desc checks stay what actually proves each
     # staged image was rebuilt from current source in a round shaped like this one.
     "2.0.6": None,
+    # 2.0.7 adds vendor rows to the shared netcam tables, so every production image gains detail-
+    # string labels that exist in no earlier image. "Juan OEM" and "Night Owl" are two of the five
+    # new labels; neither is a substring of any string a 2.0.6 image carries ("Blink" was avoided
+    # as a canary because it is short enough to false-pass on an unrelated run of bytes). The
+    # Flock change in this cut alters confidence arithmetic only and introduces no literal.
+    "2.0.7": ["Juan OEM", "Night Owl"],
 }
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -132,17 +139,21 @@ OTA_APP_FILES = {**COLONEL_OTA_FILES, **BEACON_OTA_FILES}
 WEB_MANIFEST_ENVS = ("oui-spy", "mesh-detect", "mesh-detect-ch1")
 NRF_PACKAGE_FILE = "beacon-nrf-dfu.zip"
 
-# The OTA signing key this release is EXPECTED to be rooted in: SHA-256 of the
-# SubjectPublicKeyInfo DER baked into ota_pubkey.h. Nothing else in the release path tests WHICH
-# key is in force - release.sh only checks the private key file exists, and the signature checks
-# below verify against whatever pub file is sitting in ota_signing/ - so a silent key swap (or a
-# stray keypair from another checkout) would sail through while every fielded board rejects the
-# update. Pinning the fingerprint makes a rotation an explicit, reviewed edit of this constant.
+# The OTA trust root this release is EXPECTED to bake: SHA-256 of the SubjectPublicKeyInfo DER in
+# ota_pubkey.h. The stagers prove the private key on the machine matches THAT header
+# (release_tools.require_ota_signing_key_identity), but nothing else in the release path says which
+# header is right - release.sh only checks the private key file exists, and the signature checks
+# below verify against whatever pub file is sitting in ota_signing/ - so a swapped header with its
+# matching stray keypair from another checkout would sail through while every fielded board rejects
+# the update. Pinning the fingerprint makes a rotation an explicit, reviewed edit of this constant.
 #
-# THIS IS THE DOCUMENTED DEV KEY (ota_pubkey.h says so). When the production key is generated,
-# rotate the header and update this hash in the same commit, and flip IS_DEV to False.
-INTENDED_OTA_KEY_SHA256 = "39e03b1581db574822be12631df557ac136a3c5b9c00b8e32e07dc4a9b6d3df1"
-INTENDED_OTA_KEY_IS_DEV = True
+# PRODUCTION KEY since 2.0.7 (private half offline and backed up; ota_pubkey.h documents the
+# rotation). The development key it replaced signed every image through 2.0.6 and signs 2.0.7 ONLY:
+# that transition cut bakes this root while being signed by the retiring key, so a board still
+# rooted in the development key accepts it and trusts this key from its next boot. The window is
+# declared once, in release_tools.OTA_ROTATION, and check_ota_key_identity below is where the one
+# release in which the signer and the baked root legitimately differ is admitted.
+INTENDED_OTA_KEY_SHA256 = "c5d86430652e89c02dc357a1ee15601f95ea18726dbeed486d9b98f57c0399e9"
 
 FAIL = []
 OK = []
@@ -247,9 +258,12 @@ def web_manifest_inventory(repo):
     return expected, actual
 
 
-def check_ota_key_identity():
-    """Pin the OTA trust root: header DER == recorded fingerprint == the pub file signatures are
-    verified against. The header is what fielded boards enforce, so all three must be one key."""
+def check_ota_key_identity(shared_ver, beacon_ver, images):
+    """Pin the OTA trust root: header DER == recorded fingerprint == the DER inside every staged
+    image, and the pub file the signatures below are verified against is that same key. The one
+    exception is the declared rotation cut (release_tools.OTA_ROTATION): there the pub file must
+    be the RETIRING signer, because the images bake the new root and a fielded board accepts them
+    only while they are signed by the root it already runs."""
     print("\nOTA KEY IDENTITY  (the baked-in trust root must be the recorded release key)")
     header = os.path.join(FW, "lib/acab_core/ota_pubkey.h")
     header_der = None
@@ -262,6 +276,34 @@ def check_ota_key_identity():
         check(digest == INTENDED_OTA_KEY_SHA256,
               f"baked-in OTA public key matches the recorded release fingerprint "
               f"({digest[:12]} vs {INTENDED_OTA_KEY_SHA256[:12]})")
+        # THE HEADER IS NOT THE IMAGE. The board enforces whatever DER its image carries, and
+        # ACAB_OTA_PUBKEY_DER is emitted as one contiguous run of bytes (every staged 2.0.6 image
+        # contained the then-current DER exactly once when this row was added). An image copied
+        # from a stale build product is newer than the source by mtime, current by version and
+        # by signature, and still ships the retired root; the DER itself is the only thing that
+        # proves the rebuild picked the rotation up.
+        for p in images:
+            rel = os.path.relpath(p, os.path.dirname(REPO))
+            try:
+                with open(p, "rb") as handle:
+                    data = handle.read()
+            except OSError as exc:
+                check(False, f"{rel} is readable for the trust-root scan ({exc})")
+                continue
+            check(header_der in data, f"{rel} bakes the {digest[:12]} trust root verbatim")
+    rotation = None
+    if shared_ver is not None and beacon_ver is not None:
+        try:
+            rotation = ota_rotation_for_versions(shared_ver, beacon_ver)
+        except ReleaseToolError as exc:
+            check(False, f"OTA rotation declaration agrees with the declared versions ({exc})")
+    if rotation is not None:
+        check(rotation["trust_root_sha256"] == INTENDED_OTA_KEY_SHA256,
+              "OTA_ROTATION names the recorded release fingerprint as its new trust root")
+        print(f"  !!    ROTATION CUT {rotation['release']}: images bake trust root "
+              f"{rotation['trust_root_sha256'][:12]} and are signed by the retiring key "
+              f"{rotation['signer_sha256'][:12]}; fielded boards accept this cut only because "
+              f"they still trust the retiring key")
     pub = os.path.join(REPO, "firmware/tools/ota_signing/beacon_ota_pub.pem")
     file_der = None
     if os.path.exists(pub):
@@ -274,13 +316,13 @@ def check_ota_key_identity():
             file_der = open(pub, "rb").read()
     if file_der is None:
         check(False, "ota_signing pub key file exists and is readable")
+    elif rotation is not None:
+        check(hashlib.sha256(file_der).hexdigest() == rotation["signer_sha256"],
+              f"{os.path.basename(pub)} is the retiring {rotation['signer_sha256'][:12]} key "
+              f"that signs the {rotation['release']} rotation cut")
     else:
         check(hashlib.sha256(file_der).hexdigest() == INTENDED_OTA_KEY_SHA256,
               f"{os.path.basename(pub)} is the same key the boards bake in")
-    if INTENDED_OTA_KEY_IS_DEV:
-        print("  --    NOTE: this is the documented DEV key (ota_pubkey.h). Rotate to an offline"
-              " production key before shipping OTA-capable hardware, then update"
-              " INTENDED_OTA_KEY_SHA256 in the same commit.")
 
 
 def beacon_usb_parts(files):
@@ -503,7 +545,7 @@ def main():
               " the reviewed way to record a round that changed no shipped literal.")
 
     if args.production and not args.usb_only:
-        check_ota_key_identity()
+        check_ota_key_identity(shared_ver, beacon_ver, images)
 
     mf = os.path.join(SITE, "firmware/firmware-latest.json")
     if args.production:

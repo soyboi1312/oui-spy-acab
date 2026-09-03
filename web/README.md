@@ -85,11 +85,11 @@ workflow ([.github/workflows/pages.yml](../.github/workflows/pages.yml)) that
 copies the `web/` folder up to GitHub Pages any time something in it changes, and
 the live copy lands at https://soyboi1312.github.io/all-cameras-are-beacons/.
 
-That github.io URL is this page's whole public address. `soyboi.tech/flash.html` is **not**
-a friendlier front door to it: it is a separate page in the sibling site repo that installs
-`firmware/manifest-beacon.json`, the rev-A beacon image. Do not describe the two as the same
-page anywhere, in docs or in copy, because the mix-up is what puts a XIAO build on someone's
-beacon board. If you fork this, switch Pages on under
+That github.io URL is this page's public address. The sibling site's `soyboi.tech/flash.html`
+installs `firmware/manifest-beacon.json`, the rev-A beacon image. Its "other supported hardware"
+section links here using `#oui-spy` and `#mesh-detect`, which identify the matching installer
+cards. Keep those IDs stable. The USB manifests and firmware parts for these boards stay here;
+the sibling page provides discovery links. If you fork this, switch Pages on under
 **Settings → Pages → Source: GitHub Actions** and yours will do the same.
 
 ## Rebuilding the firmware files
@@ -104,11 +104,15 @@ It aborts rather than publish something it cannot stand behind:
 
 - **No OTA signing key.** An empty signature ships a manifest every board rejects in the
   field. Pass `--unsigned-usb-only` to build an explicitly unsigned, USB-only cut instead.
-- **The key is there but cannot sign it—or it is the wrong valid key.** A passphrase-protected or
+- **The key is there but cannot sign it, or it is the wrong valid key.** A passphrase-protected or
   corrupt PEM, an unreadable file, an openssl that rejects the arguments, or a key whose derived
   public DER differs from `firmware/lib/acab_core/ota_pubkey.h`: the run prints the failure and
   stops before building or changing either served tree, instead of producing an OTA every board
-  rejects. `--unsigned-usb-only` continues here too, with an empty sig, on your explicit say-so.
+  rejects. The one exception is a declared key rotation cut (`OTA_ROTATION` in
+  `firmware/tools/release_tools.py`): for that release only, the header must bake the new key and
+  the PEM must be the retiring key, because fielded boards accept only an image signed by the key
+  they already trust. The "OTA key rotation" section of `firmware/tools/RELEASE.md` walks the
+  window. `--unsigned-usb-only` continues here too, with an empty sig, on your explicit say-so.
   The flag defines the output, so it deliberately leaves signatures empty even when a usable key
   is present; moving the same USB-only command to another machine cannot silently turn OTA back on.
 - **The vendored ESP Web Tools graph is not what HEAD would deploy.** Every file under

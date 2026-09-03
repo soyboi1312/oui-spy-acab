@@ -26,6 +26,28 @@
 // field above 1023 is therefore un-shippable over the air: the apps compare unclamped, would keep offering
 // the update, and the board would refuse it forever. Bump the MINOR when the patch field runs out.
 //
+// 2.0.7: network-camera table expansion and a Flock grading correction.
+//        NETCAM: 14 more registry-verified MA-L blocks (Blink x6 under its own "Blink by Amazon"
+//        registrations, Night Owl, SkyBell, Juan OEM x4, Ezviz 38:F2:5D, Uniview 14:BA:88; the
+//        table grows 180 -> 194) plus a new CAMERA_VENDOR_PREFIX table of four MA-M /28 blocks
+//        (Amcrest, Wyze, Swann, WUUK) matched at their full 28-bit width after a binary-search
+//        miss. Every new row is registry-tier (validated=0, confidence 65); the detector stays
+//        opt-in and still reports "<Vendor> on wifi".
+//        FLOCK: the anchored BLE name forms (Penguin-, FS-, Flock prefix) rank 80 only with the
+//        0x09C8 manufacturer co-signal. The former "public address" co-signal keyed on the
+//        802.11 U/L bit, which does not encode BLE address type, so name-only hits now stay at
+//        70 on every address. The "FS Ext Battery" literal still ranks 80 on its own.
+//        OTA TRUST ROOT: this image bakes in the PRODUCTION signing key and is the transition
+//        cut, signed with the retiring development key so every fielded 2.0.5/2.0.6 board
+//        accepts it and trusts the production key from its next boot. 2.0.8 onward is signed
+//        with the production key only.
+//        DESERT: BLE nearby-device rows no longer claim "hardware OUI" from the 802.11 U/L bit,
+//        which a resolvable private address leaves clear. The controller's address type is now
+//        plumbed through acabScannerIngestBLE (AcabBleAddrType): the native NimBLE scan on the
+//        single-radio boards labels public/random exactly, and the dual-radio path, whose nRF
+//        forward line carries no type, says "OUI unknown" for a clear-bit BLE address
+//        instead of guessing. A RANDOM report also sets randomAddr, so the OUI-on-random
+//        durability cap is reachable for the first time on native-BLE boards.
 // 2.0.6: adds capture instrumentation for i-PRO BWC4000 activation accessories and Getac
 //        BC-02/BC-03 cameras plus TB/HS vehicle triggers. These are capture candidates, not
 //        production classifiers, until a ground-truthed advert supplies a stable passive value.
@@ -103,7 +125,7 @@
 // 2.0.0: the Colonel Panic builds pick up the full v2 detection set the beacon board ships
 // with (offline buffer, watchlist/custom category, ignore list, refreshed OUIs, glasses).
 #ifndef ACAB_FW_VERSION
-#define ACAB_FW_VERSION "2.0.6"
+#define ACAB_FW_VERSION "2.0.7"
 #endif
 
 #endif // ACAB_VERSION_H

@@ -37,6 +37,27 @@ ESP_APP_PROJECT_OFFSET = ESP_APP_VERSION_OFFSET + 32
 ESP_APP_TEXT_FIELD_SIZE = 32
 OTA_FIRMWARE_BASE_URL = "https://soyboi.tech/firmware/"
 
+# ONE-RELEASE OTA KEY ROTATION WINDOW, or None while no rotation is in progress.
+#
+# The board pins exactly one trust root (lib/acab_core/ota_pubkey.h) and accepts only an image
+# signed by the root it already runs, so a rotation needs one transition cut that BAKES the new
+# root while being SIGNED by the retiring key: every fielded board accepts that cut and trusts the
+# new root from its next boot. It is the one release in which the signer and the baked root may
+# legitimately differ. require_ota_signing_key_identity admits the difference only for the release
+# named here (every stager calls it before it builds or stages anything), and
+# verify-release-artifacts.py re-proves it against the staged images. Every later release is
+# signed by the new root alone, and both gates refuse a declaration that has outlived its release,
+# so set OTA_ROTATION back to None when the version after "release" is cut. Keep the name:
+# ota_rotation_for_versions reads it, and the tests patch it by name.
+#
+# 2.0.7 retires the development key, which signed every image through 2.0.6, for the offline
+# production key. Both fingerprints are SHA-256 over SubjectPublicKeyInfo DER.
+OTA_ROTATION: Optional[dict] = {
+    "release": "2.0.7",
+    "trust_root_sha256": "c5d86430652e89c02dc357a1ee15601f95ea18726dbeed486d9b98f57c0399e9",
+    "signer_sha256": "39e03b1581db574822be12631df557ac136a3c5b9c00b8e32e07dc4a9b6d3df1",
+}
+
 
 class ReleaseToolError(RuntimeError):
     """A release artifact or source tree does not satisfy its contract."""
@@ -340,7 +361,14 @@ def require_ota_signing_key_identity(
     key fail without opening an interactive prompt, while a normal offline key derives its SPKI
     public DER. Comparing those bytes directly to the firmware header catches a valid key from a
     different checkout before it signs and stages a release every fielded board would reject.
-    Returns the matching key fingerprint for the release log.
+
+    The one exception is the declared rotation cut (OTA_ROTATION). The header belongs to a
+    firmware tree (``<firmware>/lib/acab_core/ota_pubkey.h``), and when the versions that tree
+    declares name the rotation release, the header must bake the NEW root and the key must be the
+    RETIRING signer, because a fielded board accepts only an image signed by the root it already
+    runs. Any other pairing in that release fails closed: the new key cannot sign the transition
+    cut, and an unrotated header cannot ship under the rotation's name. Returns the baked
+    trust-root fingerprint for the release log in both cases.
     """
     key = Path(key_path)
     if not key.is_file():
@@ -362,15 +390,40 @@ def require_ota_signing_key_identity(
         raise ReleaseToolError(
             f"cannot derive public key from {key}: {detail or 'empty public key'}"
         )
+    signer = result.stdout
     baked = read_baked_ota_public_key_der(header_path)
-    if result.stdout != baked:
-        actual = hashlib.sha256(result.stdout).hexdigest()[:12]
-        expected = hashlib.sha256(baked).hexdigest()[:12]
+    signer_digest = hashlib.sha256(signer).hexdigest()
+    baked_digest = hashlib.sha256(baked).hexdigest()
+    rotation = None
+    if OTA_ROTATION is not None:
+        # The window is placed by the versions of the tree that owns the header. A declared
+        # rotation that cannot be placed is refused rather than demoted to the plain rule: an
+        # unplaceable header is exactly the misrouted or stale one this check exists to stop.
+        try:
+            firmware_dir = Path(os.path.abspath(header_path)).parents[2]
+            shared, beacon = declared_versions(firmware_dir)
+        except (IndexError, OSError) as exc:
+            raise ReleaseToolError(
+                f"cannot read the declared versions of the firmware tree that owns {header_path} "
+                f"to place the {OTA_ROTATION['release']} OTA rotation window: {exc}"
+            ) from exc
+        rotation = ota_rotation_for_versions(shared, beacon)
+    if rotation is not None:
+        if (baked_digest != rotation["trust_root_sha256"]
+                or signer_digest != rotation["signer_sha256"]):
+            raise ReleaseToolError(
+                f"the {rotation['release']} OTA rotation cut must bake the new trust root "
+                f"{rotation['trust_root_sha256'][:12]} and be signed by the retiring key "
+                f"{rotation['signer_sha256'][:12]}, but {header_path} bakes {baked_digest[:12]} "
+                f"and {key} signs as {signer_digest[:12]}"
+            )
+        return baked_digest
+    if signer != baked:
         raise ReleaseToolError(
             f"{key} does not match the OTA trust root baked into {header_path} "
-            f"({actual} vs {expected})"
+            f"({signer_digest[:12]} vs {baked_digest[:12]})"
         )
-    return hashlib.sha256(baked).hexdigest()
+    return baked_digest
 
 
 def require_usb_only_manifest_build(build: object, source: str) -> dict:
@@ -480,6 +533,57 @@ def declared_versions(firmware_dir: Union[os.PathLike, str]) -> Tuple[str, str]:
         else shared
     )
     return shared, beacon
+
+
+def _ota_version_core(version: str) -> Tuple[int, int, int]:
+    """Return the three fields acabOtaVersionPack packs, absent trailing fields as 0.
+
+    The packer (firmware/lib/acab_core/ota_policy.h) starts every field at 0 and stops at the
+    first non-digit, so "2.0" and "2.0.0" order the same here as they do on the board and a
+    dash suffix is ignored the same way.
+    """
+    match = OTA_VERSION_RE.fullmatch(version)
+    if not match:
+        raise ReleaseToolError(f"{version!r} is not an OTA-packable version")
+    fields = [int(field) for field in match.group("core").split(".")] + [0, 0]
+    return fields[0], fields[1], fields[2]
+
+
+def ota_rotation_for_versions(shared_version: str, beacon_version: str) -> Optional[dict]:
+    """Return OTA_ROTATION when the declared versions ARE its transition cut, else None.
+
+    Both declared versions must name the rotation release: the shared version labels the Colonel
+    Panic images and the beacon override labels the beacon images, one signing key on the release
+    machine signs all of them, and ota_pubkey.h is shared source that stales every product at once.
+    A declaration whose release either declared version has moved past is stale and raises: the
+    window is one release by contract, and a leftover declaration would misdescribe the next
+    rotation. A declaration for a release the source has not reached yet is simply inactive.
+    """
+    rotation = OTA_ROTATION
+    if rotation is None:
+        return None
+    release = require_ota_packable_version(str(rotation["release"]), "release_tools.OTA_ROTATION")
+    declared = (
+        ("acab_version.h", shared_version),
+        ("platformio.ini [env:beacon-board]", beacon_version),
+    )
+    if all(version == release for _, version in declared):
+        return rotation
+    release_core = _ota_version_core(release)
+    for source, version in declared:
+        if _ota_version_core(version) > release_core:
+            raise ReleaseToolError(
+                f"release_tools.OTA_ROTATION still declares the {release} rotation cut, but "
+                f"{source} declares {version!r}; every image after {release} is signed by the "
+                f"new trust root alone, so delete the stale declaration"
+            )
+    if any(version == release for _, version in declared):
+        raise ReleaseToolError(
+            f"release_tools.OTA_ROTATION declares the {release} rotation cut, but acab_version.h "
+            f"declares {shared_version!r} and platformio.ini [env:beacon-board] declares "
+            f"{beacon_version!r}; both must declare {release} to cut the rotation"
+        )
+    return None
 
 
 def expected_version_for_artifact(

@@ -1063,11 +1063,14 @@ static void markPrintSnapshot(const char* label, uint32_t startMs, uint32_t durM
             r += snprintf(sol + r, sizeof(sol) - r, "%s%s-SOLICIT:%04X",
                           r ? "," : "", VENDOR_BLE_ID[k].tag, VENDOR_BLE_ID[k].val);
         }
-        // addr=unknown until the address TYPE is threaded through ingestion. The top-two-bits
-        // encoding describes the random-address SUBTYPE and only means anything once the controller
-        // has said the address is random; a PUBLIC address may hold any pattern. Applied blind it
-        // mislabels exactly the devices this capture is for - Axon's public 00:25:DF has top bits
-        // 00 and printed as "rand-nonres". Guessing invents a property of the device.
+        // addr=unknown: the mark table stores no address type. The type now reaches
+        // acabScannerIngestBLE (AcabBleAddrType) from the native NimBLE scan, but every capture
+        // env is dual-radio, where the nRF forward line carries none, so there is nothing true to
+        // print here yet. Never derive it from the bytes: the top-two-bits encoding describes the
+        // random-address SUBTYPE and only means anything once the controller has said the address
+        // is random; a PUBLIC address may hold any pattern. Applied blind it mislabels exactly the
+        // devices this capture is for - Axon's public 00:25:DF has top bits 00 and printed as
+        // "rand-nonres". Guessing invents a property of the device.
         Serial.printf("[mark]   %02X:%02X:%02X:%02X:%02X:%02X addr=unknown n=%lu best=%d "
                       "first=%lus last=%lus classifier=%s vendor=%s solicit=%s name=\"%s\"\n",
                       m->mac[0], m->mac[1], m->mac[2], m->mac[3], m->mac[4], m->mac[5],
@@ -1136,7 +1139,8 @@ static void markNote(const uint8_t* mac, int rssi, const char* name,
 }
 #endif  // ACAB_CAPTURE_BUILD
 
-void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t plen, int rssi, bool isReplay) {
+void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t plen, int rssi, bool isReplay,
+                          AcabBleAddrType addrType) {
     gBleSeen++;
 #if defined(ACAB_CAPTURE_BUILD) || defined(ACAB_DIAG)
     // Parse the advert's local name ONCE per live packet and share the buffer. Capture builds
@@ -1341,9 +1345,15 @@ void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t p
     // starred; this only suppresses the generic Desert row. See isSiblingBoard().
     if (!matched && isSiblingBoard(payload, plen)) return;
     // Desert mode (LAST): catch every remaining device as a generic "nearby device".
-    if (!matched) matched = desertClassifyBLE(mac, payload, plen, rssi, &d);
+    if (!matched) matched = desertClassifyBLE(mac, payload, plen, rssi, &d, addrType);
     if (!matched) return;
     if (companyId) d.companyId = companyId;   // stamp the BLE mfg company ID on the match
+    // The controller's address type outranks the byte test acabInit ran: a resolvable private
+    // address has the 0x02 bit clear, so this is the only way randomAddr ever turns true for
+    // the rotating BLE addresses that walk through every per-matcher OUI guard, and the only
+    // way acabApplyDurability (in handleDetection) can cap such an OUI-only hit. The rule
+    // itself lives in acabNoteBleAddrType (detection.h), the single owner.
+    acabNoteBleAddrType(&d, addrType);
     handleDetection(d, isReplay);
 }
 
@@ -1370,9 +1380,18 @@ public:
         // defined by the dual-radio capture envs, which clear cfg.enableBLE, so this callback
         // is not even installed there and anything left behind here is dead. Nothing to log here.
 
+        // The controller's address type, straight off the advertising report (TxAdd). NimBLE
+        // encodes it as BLE_ADDR_PUBLIC (0) / BLE_ADDR_RANDOM (1) plus the *_ID variants for
+        // resolved identity addresses (2 / 3); bit 0 is the public/random flag in all four, and
+        // an identity address reported with bit 0 set was still received on a random address.
+        // This is the ONLY place the type is known: the dual-radio UART line has no field for
+        // it, so beacon-board adverts arrive at the funnel as ACAB_BLE_ADDR_UNKNOWN.
+        const AcabBleAddrType addrType = (dev->getAddressType() & 0x01) ? ACAB_BLE_ADDR_RANDOM
+                                                                        : ACAB_BLE_ADDR_PUBLIC;
+
         // Hand the advert to the shared classifier chain (kept in one place so the
         // dual-radio UART path runs the exact same detectors).
-        acabScannerIngestBLE(mac, payload, plen, rssi);
+        acabScannerIngestBLE(mac, payload, plen, rssi, /*isReplay=*/false, addrType);
     }
 };
 

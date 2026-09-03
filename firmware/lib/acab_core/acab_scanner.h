@@ -71,7 +71,10 @@ void acabScannerSetSelfGPS(double lat, double lon, bool valid);
 // human order (mac[0] = OUI first byte); payload is the raw advert AD bytes.
 // isReplay=true routes a recovered black-box record to the app WITHOUT beeping or
 // polluting the live dedup table / gTotal / offline buffer (see AcabDetection::replay).
-void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t plen, int rssi, bool isReplay = false);
+// addrType: the receiving controller's public/random report. The native NimBLE scan passes the
+// real value; the dual-radio UART forward and black-box replays have none and take the default.
+void acabScannerIngestBLE(const uint8_t mac[6], const uint8_t* payload, size_t plen, int rssi, bool isReplay = false,
+                          AcabBleAddrType addrType = ACAB_BLE_ADDR_UNKNOWN);
 
 // Finish the two-phase app-disconnect boundary. Call Block below before publishing connection
 // teardown, clear all link-owned GPS/replay/key state, then call ReArm: it consumes the reserved

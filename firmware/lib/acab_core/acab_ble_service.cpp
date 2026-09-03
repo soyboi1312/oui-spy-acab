@@ -2009,9 +2009,12 @@ void acabBleNotifyDetection(const AcabDetection& d, bool isNew) {
         if (len == 0) return;
     }
     if (len > notifyCap()) {
-        // Even the minimal record does not fit. Near-impossible now (it needs a long name/detail on
-        // a 23-byte MTU), but if it ever happens it is a real gap in the live feed and must stay
-        // visible rather than becoming silence. Counter is surfaced in the {"diag":true} reply.
+        // Even the minimal record does not fit. Rare, not impossible: on an iPhone link (182 B)
+        // a GPS-stamped Nearby row has nothing to elide, and with a 12-byte detail the name
+        // budget is about 24 chars, so a longer BLE local name (one such device in the
+        // 2026-09-02 Santa Barbara log) lands here. That is why every Desert label is held to
+        // its pre-2.0.7 width (test_desert.cpp). A gap in the live feed must stay visible rather than
+        // becoming silence. Counter is surfaced in the {"diag":true} reply.
         gNotifyOverCap++;
         static uint32_t sLastWarn = 0;
         if (millis() - sLastWarn > 5000) {

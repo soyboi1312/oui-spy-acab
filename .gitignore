@@ -9,6 +9,10 @@ _reference/
 # The open-source project is the apps + firmware only; the hardware stays proprietary.
 hardware/
 
+# Field captures (drive logs, app CSV exports, compare summaries). They carry my
+# GPS routes, per-device MACs, names and timestamps. Never publish. Docs may cite them by path.
+firmware/tools/detection logs/
+
 # nRF co-processor firmware for the dual-radio board; kept local with the hardware.
 # Its README spells out the board's pinout / UART wiring / block diagram, which is part
 # of the proprietary design, so it stays out of the public repo.

@@ -118,10 +118,10 @@ static const uint8_t FLOCK_SSID_FALCON_SUFFIX_EXT = 1;
 //   FLOCK_NAME_PREFIX_DIGITS name starts with the pattern + a 1+ decimal-digit tail
 //   FLOCK_NAME_PREFIX_HEX    name starts with the pattern + a 1+ hex-digit tail
 //   FLOCK_NAME_PREFIX        name starts with the pattern (no structural tail)
-// The PREFIX forms rank strong (80) only when a co-signal backs them - a public
-// (non-random) BLE address (real Flock beacons don't rotate) or the 0x09C8 mfg id -
-// and stay hint-grade (70) otherwise, so an "FS-100" gadget on a rotating address
-// never draws a strong ALPR verdict. See nameMatch in flock_detect.cpp.
+// The PREFIX forms rank strong (80) only with the 0x09C8 mfg co-signal and stay
+// hint-grade (70) otherwise, regardless of address bytes. A public address adds
+// no Flock-specific evidence. 0x09C8 is shared XUNTONG silicon; this preserves
+// the existing name+mfg tier. See flockClassifyBLE in flock_detect.cpp.
 //   "FS Ext Battery"             -> ryanohoro (external-battery health beacons)
 //   "Penguin-" + digits          -> ryanohoro (Penguin-##########)
 //   "FS-" + hex                  -> own field capture (FS-BEC46A, 2026-06; one capture,
@@ -129,7 +129,8 @@ static const uint8_t FLOCK_SSID_FALCON_SUFFIX_EXT = 1;
 //   "Flock" prefix               -> brand string, public; loosest of the four
 // (A bare 10-digit name is a documented post-Mar-2025 Flock pattern but is NOT
 // matched here: in the field it false-positived on phones broadcasting placeholder
-// numeric names like "0102000000". Re-add only behind a public-BLE-address gate.)
+// numeric names like "0102000000". Reconsider only with independent Flock-specific
+// evidence; a public BLE address alone cannot establish that identity.)
 enum FlockNameForm : uint8_t {
     FLOCK_NAME_LITERAL,
     FLOCK_NAME_PREFIX_DIGITS,

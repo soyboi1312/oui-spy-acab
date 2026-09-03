@@ -6,10 +6,10 @@ Rebuild the firmware's detection tables from here and write your own parser.
 
 ## Why this is clean
 
-Facts are not copyrightable: MAC OUIs, Bluetooth company IDs, service UUIDs, SSID
-patterns, and published standards are public facts. Each entry below cites where it
-comes from. The only thing you cannot reuse is upstream *code and curation*, so source
-the facts here and implement your own matching.
+Each entry cites the registry, standard, or observed radio signature used to build
+these tables. The classifiers implement the matching independently. Reusing upstream
+code or curated datasets requires following their respective licenses; see
+`CREDITS.md` for project lineage and the current `flock-you` MIT license.
 
 ## Public registries (the backbone)
 
@@ -40,13 +40,16 @@ BLE names are matched ANCHORED, not substring-anywhere (except the specific
 `FS Ext Battery` literal): `FS-` is a generic white-label model prefix and bare
 `penguin`/`flock` substrings match phones and novelty gadgets. Only the
 `FS Ext Battery` literal ranks strong (80) on its own. The prefix forms rank 80 only
-when a co-signal backs them - a public (non-random) BLE address (real Flock beacons
-do not rotate) or the `0x09C8` mfg id - and stay hint-grade (70) otherwise, so a
-consumer gadget named `FS-100` on a rotating address never draws a strong ALPR
-verdict. The bare 10-decimal-digit name ryanohoro documents as the post-Mar-2025
+when the `0x09C8` manufacturer ID backs them, and stay hint-grade (70) otherwise,
+regardless of address bytes. This preserves the existing name-plus-manufacturer
+tier; `0x09C8` identifies shared XUNTONG silicon and is not exclusive to Flock.
+The public-address confidence boost was removed on 2026-09-01: a public address
+provides no Flock-specific evidence, and the WiFi local-address bit cannot determine
+BLE address type. A name-only `FS-100` hit therefore stays at 70 for every address.
+The bare 10-decimal-digit name ryanohoro documents as the post-Mar-2025
 pattern is deliberately NOT matched: it false-positived in the field on a phone
-advertising the placeholder name `0102000000` (removed 2026-06-18). Re-add it only
-behind a public (non-random) BLE-address gate.
+advertising the placeholder name `0102000000` (removed 2026-06-18). Reconsider it
+only with independent Flock-specific evidence.
 
 **Detection-quality notes (read before you copy the old tables):**
 - The WiFi/BT chip is a LiteOn WCBN3510A. Lite-On's OUIs are shared across millions of
@@ -102,9 +105,9 @@ behind a public (non-random) BLE-address gate.
   the `ACAB_DIAG` build (it logs `*** PIGVISION CANDIDATE ***`), never in production. A confirmed
   field sighting is the trigger to promote it into `FLOCK_NAME_PATTERNS`.
 - The bare 10-digit BLE name is inherently ambiguous (any device with a 10-digit name
-  matches, including phones) and is NOT in the shipped tables. If it is ever re-added, gate
-  it on a public (non-random) BLE address - the gate the code itself prescribes - not on
-  RSSI, which says nothing about what the device is.
+  matches, including phones) and is NOT in the shipped tables. Reconsidering it requires
+  independent Flock-specific evidence; neither public address type nor RSSI establishes
+  what the device is.
 
 ## Flock Raven (audio sensor)
 
@@ -383,6 +386,74 @@ uplink is LTE, and LTE is not a band this device listens to.
 
 ## Network cameras
 
+### Vendor-prefix additions (2026-09-01)
+
+The following assignments extend vendors already supported by the opt-in network-camera
+detector. OUI-Master-Database supplied the leads; each assignment was independently checked
+against the [IEEE MA-L registry](https://standards-oui.ieee.org/oui/oui.csv) or
+[IEEE MA-M registry](https://standards-oui.ieee.org/oui28/mam.csv).
+
+| Vendor label | Exact IEEE registrant | Registered prefix |
+|---|---|---|
+| Ezviz | Hangzhou Ezviz Software Co.,Ltd. | `38:F2:5D:00:00:00/24` |
+| Uniview | Zhejiang Uniview Technologies Co.,Ltd. | `14:BA:88:00:00:00/24` |
+| Amcrest | Amcrest Technologies | `34:46:63:20:00:00/28` |
+| Wyze | Wyze Labs Inc | `A4:DA:22:20:00:00/28` |
+| Swann | SWANN COMMUNICATIONS PTY LTD | `0C:0E:C1:40:00:00/28` |
+
+The MA-L rows join `CAMERA_VENDOR_OUI`; the MA-M rows live in `CAMERA_VENDOR_PREFIX`
+and use `acabOuiPrefixMatches` to retain all 28 registered bits. The existing MA-L binary
+search stays in place. A three-byte comparison of an MA-M entry would include fifteen
+neighboring blocks outside the vendor's assignment.
+
+All five entries keep `validated=0` and the existing confidence of 65. The local
+`firmware/tools/detection logs/camarillo_drive.log` contains two addresses in the Wyze assignment:
+`A4:DA:22:2E:FE:07` and `A4:DA:22:2E:A7:BE`. These establish that the block was heard;
+neither was visually confirmed as a camera. A vendor match can also identify a hub,
+recorder, or another product from that company. The detector remains opt-in and reports
+the existing `<Vendor> on wifi` detail.
+
+### Captured vendor additions (2026-09-01)
+
+These 13 assignments add five vendor labels to the opt-in WiFi detector. Each was checked
+against the [IEEE MA-L registry](https://standards-oui.ieee.org/oui/oui.csv) or
+[IEEE MA-M registry](https://standards-oui.ieee.org/oui28/mam.csv); OUI-Master-Database
+and local captures supplied the leads.
+
+| Vendor label | Exact IEEE registrant | Registered prefixes |
+|---|---|---|
+| Blink | Blink by Amazon | `3C:A0:70:00:00:00/24`, `70:AD:43:00:00:00/24`, `74:13:48:00:00:00/24`, `74:AB:93:00:00:00/24`, `C8:19:D8:00:00:00/24`, `F0:74:C1:00:00:00/24` |
+| Night Owl | Night Owl SP | `54:2B:57:00:00:00/24` |
+| SkyBell | SKYBELL, INC | `D0:C1:93:00:00:00/24` |
+| Juan OEM | Guangzhou Juan Intelligent Tech Joint Stock Co.,Ltd | `08:3A:2F:00:00:00/24` |
+| Juan OEM | Guangzhou Juan Optical and Electronical Tech Joint Stock Co., Ltd | `9C:A3:A9:00:00:00/24` |
+| Juan OEM | Guangdong Juan Intelligent Technology Joint Stock Co., Ltd. | `84:D0:DB:00:00:00/24`, `A4:86:DB:00:00:00/24` |
+| WUUK | WUUK LABS CORP. | `B0:B3:53:70:00:00/28` |
+
+The review covered all 23 files under `firmware/tools/detection logs/`, including ignored
+captures and CSV exports. Counts below deduplicate full WiFi MAC addresses across that
+collection; they are observed addresses, not physical-device counts or visual confirmations.
+
+| Vendor | Distinct WiFi addresses | Product evidence and limits |
+|---|---:|---|
+| Blink | 7 | [Blink documents](https://support.blinkforhome.com/wi-fi-or-network-issues/what-is-the-blink-wifi-connection) temporary `BLINK-XXXX` networks from both Sync Modules and cameras. Captures include `BLINK-5AJB`. |
+| Night Owl | 14 | [Night Owl documents](https://nightowlsp.com/pages/fwip2-series-camera-features-and-specifications) 2.4 GHz cameras and compatible recorders. Captured names include `NVR542b5707c2a1`, so a hit may identify a recorder. |
+| SkyBell | 1 | [SkyBell's network requirements](https://support.skybell.com/hc/en-us/articles/360003105312-Network-Requirements) cover both doorbells and the SkyBell Chime. The capture includes `SkybellHD_2151974911`; the OUI alone does not establish a model. |
+| Juan OEM | 64 | [Juan's catalogue](https://www.juancloud.com/products/) includes WiFi cameras, NVRs, and DVRs. Captured names include `NVR083a2f4cc78b`. The label names the manufacturer, not a retail brand or camera model. |
+| WUUK | 3 | [WUUK documents](https://support.wuuklabs.com/hc/en-us/articles/7702681660185-Introducing-WUUK-Base-Station) a base station that creates a 2.4 GHz network for cameras and doorbells, so the transmitting device may be the base station. |
+
+Only Blink's `3C:A0:70/24` and `74:AB:93/24` appear in these captures; its other four
+assignments are registry additions. The earlier Blink exclusion overlooked its separate
+`Blink by Amazon` registrations. Generic Amazon Technologies blocks still cover unrelated
+products and remain excluded.
+
+All 13 entries have `validated=0` and use `NETCAM_OUI_CONFIDENCE` (65). The WUUK entry
+uses `CAMERA_VENDOR_PREFIX` and preserves its full /28 assignment; the adjacent blocks
+are not WUUK matches. Network-camera detection remains off by default, with the existing
+`<Vendor> on wifi` detail. A captured name supports further review but does not earn the
+visually validated OUI tier of 75. No new SSID rule is added; the existing Arlo base-station
+SSID rules remain at `NETCAM_SSID_CONFIDENCE` (88).
+
 ### ADMITTED 2026-08-05: Arlo, and the base-station SSID rule
 
 The first netcam vendor admitted on **our own field capture** rather than on a registry pull.
@@ -399,8 +470,8 @@ The first netcam vendor admitted on **our own field capture** rather than on a r
   is. It also reaches what the OUI cannot. The hub is mains-powered and beacons constantly while
   the battery cameras sleep, which is why 11 of the 12 drive hits were single sightings; and
   pre-2018 Arlo broadcasts the same SSID form while its MAC sits in NETGEAR's 76 unusable blocks.
-  `NTGR_VMB_` is listed for that legacy case but has never been captured by us, so it is a
-  potential miss, never a false positive.
+  `NTGR_VMB_` covers that legacy case and earns its keep: across our drive logs from 2026-07-24 to
+  2026-09-02 it caught 33 hubs, 15 of them on NETGEAR blocks that no OUI row could have reached.
 - **The label is "Arlo base station", not "camera".** A hub serves cameras and has no other
   purpose, but the SSID does not prove a lens is pointed at anyone.
 - **Stated misses**, so nobody reads this as complete: 5GHz-only installs (Ultra on a VMB5000 hub,
@@ -422,9 +493,10 @@ person starts from data rather than from the proposal:
   than cameras. Admitting those two would flag a router as a camera, which is the TP-Link rejection
   in miniature.
 
-Neither is added. Registered OUI is not detectability, and this table's rule is field validation
-before confidence: nothing goes in on a registry lookup alone. For comparison, the rejected TP-Link
-registrant holds **263** blocks, every one tagged Router.
+Neither is added. A registered OUI establishes the assigned vendor, not whether a product will
+be heard or whether it is a camera. The table admits unvalidated vendor hints at confidence 65;
+visual confirmation is required for the validated OUI tier of 75. These candidates still need
+captures that establish which product line transmits.
 
 If either is pursued, SimpliSafe is the clean one and needs a single capture of a real unit
 broadcasting. For Vivint, take `84:EB:3E`/`84:EB:3F` only, and only after a capture proves which

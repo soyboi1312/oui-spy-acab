@@ -417,7 +417,11 @@ Off by default. When enabled (`{"desert":true}`), the board reports **every** de
 it sees - not just the known surveillance signatures - as a `Nearby device` detection
 (`t=7`). The specific detectors still run first, so known gear keeps its real type;
 Desert mode only labels the leftovers. Each nearby device is tagged hardware-OUI vs
-randomized-MAC (phones rotate theirs), with the BLE advert name or Wi-Fi SSID when
+randomized-MAC (phones rotate theirs). On Wi-Fi that is the locally-administered
+bit. On BLE it is the controller's reported address type, which only the native
+single-radio scan can see; on the dual-radio board a BLE address with the bit clear
+is tagged "OUI unknown" rather than claimed as hardware. Rows carry the
+BLE advert name or Wi-Fi SSID when
 present. Built for low-RF / remote areas (the desert) where anything new on the air is
 worth knowing about. It reuses the dedup and alert pipeline, so it shows, logs, and alerts on new
 devices like any other detection. **The offline buffer is the one part it does NOT reuse:**

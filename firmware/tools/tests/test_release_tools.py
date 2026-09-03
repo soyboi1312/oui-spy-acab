@@ -13,12 +13,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 
 TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, os.fspath(TOOLS))
 
+import release_tools  # noqa: E402
 from release_tools import (  # noqa: E402
     ESP_APP_DESC_MAGIC,
     ESP_APP_DESC_OFFSET,
@@ -31,6 +33,7 @@ from release_tools import (  # noqa: E402
     dirty_tree_digest,
     expected_project_for_artifact,
     filter_release_profile,
+    ota_rotation_for_versions,
     parse_esp_app_desc,
     read_baked_ota_public_key_der,
     read_esp_app_desc,
@@ -90,35 +93,254 @@ def write_ota_public_key_header(path: Path, der: bytes) -> None:
     )
 
 
-class OtaSigningKeyIdentityTests(unittest.TestCase):
-    def test_private_key_must_match_the_baked_public_der(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            matching_key = root / "matching.pem"
-            wrong_key = root / "wrong.pem"
-            public_der = root / "matching.der"
-            header = root / "ota_pubkey.h"
-            for key in (matching_key, wrong_key):
-                subprocess.run(
-                    ["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout",
-                     "-out", key],
-                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-            subprocess.run(
-                ["openssl", "pkey", "-in", matching_key, "-pubout", "-outform", "DER",
-                 "-out", public_der],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            expected = public_der.read_bytes()
-            write_ota_public_key_header(header, expected)
+def generate_p256_key(key: Path) -> bytes:
+    """Write a throwaway P-256 private key and return its SubjectPublicKeyInfo DER."""
+    subprocess.run(
+        ["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", key],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    result = subprocess.run(
+        ["openssl", "pkey", "-in", key, "-pubout", "-outform", "DER"],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    return result.stdout
 
-            self.assertEqual(read_baked_ota_public_key_der(header), expected)
+
+def declare_versions(firmware: Path, shared: str, beacon: str) -> None:
+    """Write the two version sources declared_versions reads, in the shapes the real tree uses."""
+    (firmware / "lib/acab_core").mkdir(parents=True, exist_ok=True)
+    (firmware / "lib/acab_core/acab_version.h").write_text(
+        f'#define ACAB_FW_VERSION "{shared}"\n', encoding="utf-8"
+    )
+    (firmware / "platformio.ini").write_text(
+        f'[env:beacon-board]\nbuild_flags = -DACAB_FW_VERSION=\\"{beacon}\\"\n',
+        encoding="utf-8",
+    )
+
+
+class OtaSigningKeyIdentityTests(unittest.TestCase):
+    """The signer must be the baked root, except in the ONE declared rotation cut.
+
+    In that cut the header bakes the NEW root and the RETIRING key signs, because a fielded board
+    accepts only an image signed by the root it already runs. Every other pairing in that release,
+    and the rotation pairing in any other release, fails closed.
+    """
+
+    ROTATION_REFUSED = "must bake the new trust root .* and be signed by the retiring key"
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.retiring_key = root / "retiring.pem"
+        self.new_key = root / "new.pem"
+        self.retiring_der = generate_p256_key(self.retiring_key)
+        self.new_der = generate_p256_key(self.new_key)
+        self.firmware = root / "firmware"
+        self.header = self.firmware / "lib/acab_core/ota_pubkey.h"
+        self.rotation = {
+            "release": "2.0.7",
+            "trust_root_sha256": hashlib.sha256(self.new_der).hexdigest(),
+            "signer_sha256": hashlib.sha256(self.retiring_der).hexdigest(),
+        }
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def rotation_declared(self, value):
+        return mock.patch.object(release_tools, "OTA_ROTATION", value)
+
+    def test_private_key_must_match_the_baked_public_der(self) -> None:
+        # No rotation in progress: the plain rule, and no firmware tree is needed around the header.
+        header = Path(self.temp.name) / "ota_pubkey.h"
+        write_ota_public_key_header(header, self.retiring_der)
+        with self.rotation_declared(None):
+            self.assertIsNone(ota_rotation_for_versions("2.0.7", "2.0.7"))
+            self.assertEqual(read_baked_ota_public_key_der(header), self.retiring_der)
             self.assertEqual(
-                require_ota_signing_key_identity(matching_key, header),
-                hashlib.sha256(expected).hexdigest(),
+                require_ota_signing_key_identity(self.retiring_key, header),
+                hashlib.sha256(self.retiring_der).hexdigest(),
             )
             with self.assertRaisesRegex(ReleaseToolError, "does not match the OTA trust root"):
-                require_ota_signing_key_identity(wrong_key, header)
+                require_ota_signing_key_identity(self.new_key, header)
+
+    def test_rotation_cut_bakes_the_new_root_and_is_signed_by_the_retiring_key(self) -> None:
+        declare_versions(self.firmware, "2.0.7", "2.0.7")
+        write_ota_public_key_header(self.header, self.new_der)
+        with self.rotation_declared(self.rotation):
+            self.assertIs(ota_rotation_for_versions("2.0.7", "2.0.7"), self.rotation)
+            self.assertEqual(
+                require_ota_signing_key_identity(self.retiring_key, self.header),
+                self.rotation["trust_root_sha256"],
+            )
+
+    def test_rotation_cut_refuses_a_header_that_was_not_rotated(self) -> None:
+        declare_versions(self.firmware, "2.0.7", "2.0.7")
+        write_ota_public_key_header(self.header, self.retiring_der)
+        with self.rotation_declared(self.rotation), self.assertRaisesRegex(
+            ReleaseToolError, self.ROTATION_REFUSED
+        ):
+            require_ota_signing_key_identity(self.retiring_key, self.header)
+
+    def test_rotation_cut_refuses_the_new_key_as_signer(self) -> None:
+        declare_versions(self.firmware, "2.0.7", "2.0.7")
+        write_ota_public_key_header(self.header, self.new_der)
+        with self.rotation_declared(self.rotation), self.assertRaisesRegex(
+            ReleaseToolError, self.ROTATION_REFUSED
+        ):
+            require_ota_signing_key_identity(self.new_key, self.header)
+
+    def test_versions_outside_the_window_keep_the_plain_rule(self) -> None:
+        # Declared for 2.0.7 while the tree still says 2.0.6: inactive, so signer == baked root.
+        declare_versions(self.firmware, "2.0.6", "2.0.6")
+        write_ota_public_key_header(self.header, self.retiring_der)
+        with self.rotation_declared(self.rotation):
+            self.assertIsNone(ota_rotation_for_versions("2.0.6", "2.0.6"))
+            self.assertEqual(
+                require_ota_signing_key_identity(self.retiring_key, self.header),
+                self.rotation["signer_sha256"],
+            )
+            with self.assertRaisesRegex(ReleaseToolError, "does not match the OTA trust root"):
+                require_ota_signing_key_identity(self.new_key, self.header)
+        # The pairing the window admits is refused outside it.
+        write_ota_public_key_header(self.header, self.new_der)
+        with self.rotation_declared(self.rotation), self.assertRaisesRegex(
+            ReleaseToolError, "does not match the OTA trust root"
+        ):
+            require_ota_signing_key_identity(self.retiring_key, self.header)
+
+    def test_rotation_cut_needs_both_declared_versions(self) -> None:
+        declare_versions(self.firmware, "2.0.7", "2.0.6")
+        write_ota_public_key_header(self.header, self.new_der)
+        with self.rotation_declared(self.rotation), self.assertRaisesRegex(
+            ReleaseToolError, "both must declare 2.0.7"
+        ):
+            require_ota_signing_key_identity(self.retiring_key, self.header)
+
+    def test_stale_rotation_declaration_is_refused(self) -> None:
+        # The new key over the new root would pass the plain rule; the leftover declaration is
+        # what fails, on either declared version having moved past the rotation release.
+        write_ota_public_key_header(self.header, self.new_der)
+        for shared, beacon in (("2.0.8", "2.0.8"), ("2.0.7", "2.0.8"), ("2.1", "2.1")):
+            with self.subTest(shared=shared, beacon=beacon):
+                declare_versions(self.firmware, shared, beacon)
+                with self.rotation_declared(self.rotation), self.assertRaisesRegex(
+                    ReleaseToolError, "delete the stale declaration"
+                ):
+                    require_ota_signing_key_identity(self.new_key, self.header)
+
+    def test_a_declared_rotation_cannot_be_placed_without_the_declared_versions(self) -> None:
+        # A header with no firmware tree around it fails closed instead of falling back to the
+        # plain rule, and as ReleaseToolError, which is what every caller catches.
+        header = Path(self.temp.name) / "ota_pubkey.h"
+        write_ota_public_key_header(header, self.new_der)
+        with self.rotation_declared(self.rotation), self.assertRaisesRegex(
+            ReleaseToolError, "cannot read the declared versions"
+        ):
+            require_ota_signing_key_identity(self.retiring_key, header)
+
+
+class VerifierOtaKeyIdentityTests(unittest.TestCase):
+    """check_ota_key_identity: the recorded root, the pub file, and the DER inside every image."""
+
+    def setUp(self) -> None:
+        self.verifier = load_verifier()
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.repo = root / "all-cameras-are-beacons"
+        self.firmware = self.repo / "firmware"
+        (self.firmware / "tools/ota_signing").mkdir(parents=True)
+        self.retiring_key = root / "retiring.pem"
+        self.new_key = root / "new.pem"
+        self.retiring_der = generate_p256_key(self.retiring_key)
+        self.new_der = generate_p256_key(self.new_key)
+        write_ota_public_key_header(self.firmware / "lib/acab_core/ota_pubkey.h", self.new_der)
+        images = root / "images"
+        images.mkdir()
+        self.fresh = images / "beacon-app.bin"
+        self.fresh.write_bytes(make_image() + self.new_der + b"tail")
+        self.stale = images / "acab-oui-spy-app.bin"
+        self.stale.write_bytes(make_image() + self.retiring_der + b"tail")
+        self.rotation = {
+            "release": "2.0.7",
+            "trust_root_sha256": hashlib.sha256(self.new_der).hexdigest(),
+            "signer_sha256": hashlib.sha256(self.retiring_der).hexdigest(),
+        }
+        for name, value in (
+            ("FW", os.fspath(self.firmware)),
+            ("REPO", os.fspath(self.repo)),
+            ("INTENDED_OTA_KEY_SHA256", self.rotation["trust_root_sha256"]),
+        ):
+            patcher = mock.patch.object(self.verifier, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def install_pub(self, key: Path) -> None:
+        subprocess.run(
+            ["openssl", "pkey", "-in", key, "-pubout", "-out",
+             self.firmware / "tools/ota_signing/beacon_ota_pub.pem"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def run_check(self, shared: str, beacon: str, images, rotation):
+        """The FAIL messages and printed output of one identity check, output swallowed."""
+        module = self.verifier
+        module.OK.clear()
+        module.FAIL.clear()
+        out = io.StringIO()
+        with mock.patch.object(release_tools, "OTA_ROTATION", rotation), \
+                contextlib.redirect_stdout(out):
+            module.check_ota_key_identity(shared, beacon, [os.fspath(p) for p in images])
+        return list(module.FAIL), out.getvalue()
+
+    def test_rotation_cut_accepts_the_retiring_pub_file_and_says_so(self) -> None:
+        self.install_pub(self.retiring_key)
+        failures, out = self.run_check("2.0.7", "2.0.7", [self.fresh], self.rotation)
+        self.assertEqual(failures, [], out)
+        self.assertIn("ROTATION CUT 2.0.7", out)
+        self.assertIn(self.rotation["trust_root_sha256"][:12], out)
+        self.assertIn(self.rotation["signer_sha256"][:12], out)
+
+    def test_rotation_cut_refuses_the_new_key_as_pub_file(self) -> None:
+        # Inside the window the signatures are made by the RETIRING key, so a pub file holding the
+        # new key would verify nothing the cut actually ships; the row must fail, not pass by
+        # matching the recorded root.
+        self.install_pub(self.new_key)
+        failures, out = self.run_check("2.0.7", "2.0.7", [self.fresh], self.rotation)
+        self.assertTrue(any("is the retiring" in m and "rotation cut" in m for m in failures), out)
+        self.assertIn("ROTATION CUT 2.0.7", out)
+
+    def test_an_image_without_the_baked_root_fails_even_in_the_rotation_cut(self) -> None:
+        self.install_pub(self.retiring_key)
+        failures, out = self.run_check(
+            "2.0.7", "2.0.7", [self.fresh, self.stale], self.rotation
+        )
+        self.assertTrue(any("acab-oui-spy-app.bin bakes" in m for m in failures), out)
+        self.assertFalse(any("beacon-app.bin bakes" in m for m in failures), out)
+
+    def test_outside_the_window_the_pub_file_must_be_the_recorded_root(self) -> None:
+        self.install_pub(self.retiring_key)
+        failures, out = self.run_check("2.0.8", "2.0.8", [self.fresh], None)
+        self.assertTrue(any("same key the boards bake in" in m for m in failures), out)
+        self.assertNotIn("ROTATION CUT", out)
+        self.install_pub(self.new_key)
+        failures, out = self.run_check("2.0.8", "2.0.8", [self.fresh], None)
+        self.assertEqual(failures, [], out)
+
+    def test_a_stale_declaration_is_a_failure_not_a_skip(self) -> None:
+        self.install_pub(self.new_key)
+        failures, out = self.run_check("2.0.8", "2.0.8", [self.fresh], self.rotation)
+        self.assertTrue(any("delete the stale declaration" in m for m in failures), out)
+
+    def test_the_declared_new_root_must_be_the_recorded_fingerprint(self) -> None:
+        self.install_pub(self.retiring_key)
+        wrong = dict(self.rotation, trust_root_sha256=hashlib.sha256(b"other").hexdigest())
+        failures, out = self.run_check("2.0.7", "2.0.7", [self.fresh], wrong)
+        self.assertTrue(
+            any("recorded release fingerprint as its new trust root" in m for m in failures), out
+        )
 
 
 class DirtyTreeDigestTests(unittest.TestCase):

@@ -87,13 +87,14 @@ static void chkStr(const char* name, const char* got, const char* want) {
 }
 
 // ---------------------------------------------------------------------------
-// MACs. The 0x02 bit of byte 0 is the locally-administered bit, and both ouiMatch and the
-// name-path co-signal test key on it, so "public" vs "random" has to be exact here.
+// MACs. The PUBLIC/RANDOM fixture names describe the WiFi U/L bit, which the existing
+// OUI guards also inspect. BLE address type cannot be inferred from this bit and is not
+// passed to the classifier. No name-match confidence may depend on these address bytes.
 // ---------------------------------------------------------------------------
-static const uint8_t MAC_FLOCK[6]   = {0xb4,0x1e,0x52,0x11,0x22,0x33};  // Flock Safety MA-L, public
+static const uint8_t MAC_FLOCK[6]   = {0xb4,0x1e,0x52,0x11,0x22,0x33};  // Flock Safety MA-L bytes
 static const uint8_t MAC_NEARMISS[6]= {0xb4,0x1e,0x53,0x11,0x22,0x33};  // one byte off the real OUI
 static const uint8_t MAC_FLOCKLA[6] = {0xb6,0x1e,0x52,0x11,0x22,0x33};  // same OUI + local bit set
-static const uint8_t MAC_PUBLIC[6]  = {0x00,0x11,0x22,0x33,0x44,0x55};  // public, no table hit
+static const uint8_t MAC_PUBLIC[6]  = {0x00,0x11,0x22,0x33,0x44,0x55};  // U/L bit clear, no table hit
 static const uint8_t MAC_RANDOM[6]  = {0xc2,0x33,0x44,0x55,0x66,0x77};  // local bit set, no table hit
 static const uint8_t MAC_FALCON[6]  = {0xd8,0xf3,0xbc,0xaa,0xbb,0xcc};  // Liteon/Falcon WiFi module
 static const uint8_t MAC_FALCONNM[6]= {0xd8,0xf3,0xbd,0xaa,0xbb,0xcc};  // neighbouring Liteon OUI
@@ -186,14 +187,14 @@ int main() {
     flockSetEnabled(false);
     chkInt("flockSetEnabled(false) reads back", flockIsEnabled() ? 1 : 0, 0);
     { std::vector<uint8_t> a; addName(a, "Penguin-0123456789");
-      chk("disabled: strongest BLE name still no hit", runBLE(MAC_FLOCK, a, &d), false); }
+      chk("disabled: matching BLE name still no hit", runBLE(MAC_FLOCK, a, &d), false); }
     { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Flock-a1b2c3");
       chk("disabled: strongest WiFi SSID still no hit", runWiFi(f, &d), false); }
     // Desert mode overrides the toggle inside both classifiers (it force-classifies everything),
     // so an off Flock toggle must NOT suppress a real ALPR hit while Desert is on.
     gDesert = true;
     { std::vector<uint8_t> a; addName(a, "Penguin-0123456789");
-      chk("disabled + Desert on: BLE classifies anyway", runBLE(MAC_FLOCK, a, &d), true, d.confidence, 80, d.detail); }
+      chk("disabled + Desert on: BLE classifies anyway", runBLE(MAC_FLOCK, a, &d), true, d.confidence, 70, d.detail); }
     { std::vector<uint8_t> f = mgmt(0x8, MAC_PUBLIC, MAC_PUBLIC); addSSID(f, "Flock-a1b2c3");
       chk("disabled + Desert on: WiFi classifies anyway", runWiFi(f, &d), true, d.confidence, 88, d.detail); }
     gDesert = false;
@@ -230,7 +231,7 @@ int main() {
       chk("std SIG 0x180a+0x1809 -> NOT a Raven", runBLE(MAC_RANDOM, a, &d), false); }
     { std::vector<uint8_t> a; addU16Svc(a, 0x3101);
       chk("near-miss vendor svc 0x3101 -> no hit", runBLE(MAC_RANDOM, a, &d), false); }
-    // Raven outranks every camera signal, including a name that would otherwise score 80.
+    // Raven outranks every camera signal, including a name that would otherwise score 70.
     { std::vector<uint8_t> a; addName(a, "Flock Sensor"); addU16Svc(a, RAVEN_SVC_GPS);
       chk("Raven svc + Flock name -> Raven, not camera", runBLE(MAC_FLOCK, a, &d), true, d.confidence, 92, d.detail, "raven fw 1.2.x"); }
     chkStr("  ...name still carried through", d.name, "Flock Sensor");
@@ -240,24 +241,54 @@ int main() {
     // 80 vs 70 is not cosmetic: 70 is hint-grade in the apps, 80 draws the strong verdict.
     printf("\n  -- BLE: name patterns --\n");
     { std::vector<uint8_t> a; addName(a, "FS Ext Battery");
-      chk("literal 'FS Ext Battery' on random MAC = 80", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 80, d.detail, ""); }
+      chk("literal 'FS Ext Battery' needs no co-signal = 80", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 80, d.detail, ""); }
     chkInt("  ...type is ACAB_FLOCK_CAMERA", d.type, ACAB_FLOCK_CAMERA);
     chkInt("  ...method is M_NAME", d.method, M_NAME);
     { std::vector<uint8_t> a; addName(a, "beacon FS Ext Battery 3");
       chk("literal matches as a substring, anywhere", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 80, d.detail); }
     { std::vector<uint8_t> a; addName(a, "Penguin-0123456789");
-      chk("'Penguin-'+digits on PUBLIC MAC = 80", runBLE(MAC_PUBLIC, a, &d), true, d.confidence, 80, d.detail); }
+      chk("'Penguin-'+digits with MAC bit clear = 70", runBLE(MAC_PUBLIC, a, &d), true, d.confidence, 70, d.detail); }
     { std::vector<uint8_t> a; addName(a, "Penguin-0123456789");
-      chk("'Penguin-'+digits on RANDOM MAC = 70", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 70, d.detail); }
+      chk("'Penguin-'+digits with MAC bit set = 70", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 70, d.detail); }
     { std::vector<uint8_t> a; addName(a, "FS-BEC46A");
-      chk("'FS-'+hex on random MAC = 70 (hint grade)", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 70, d.detail); }
-    // The other co-signal: the 0x09C8 mfg id promotes an anchored name even on a rotating address.
+      chk("'FS-'+hex without mfg = 70 (hint grade)", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 70, d.detail); }
+    // The retained co-signal: the 0x09C8 mfg id promotes an anchored name independently of MAC.
     { std::vector<uint8_t> a; addName(a, "FS-BEC46A"); addMfg(a, 0x09C8);
       chk("'FS-'+hex + 0x09C8 co-signal = 80", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 80, d.detail); }
     { std::vector<uint8_t> a; addName(a, "Flock Beacon 4");
-      chk("loose 'Flock' prefix on random MAC = 70", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 70, d.detail); }
+      chk("loose 'Flock' prefix without mfg = 70", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 70, d.detail); }
     { std::vector<uint8_t> a; addName(a, "flocking gadget");
       chk("loose prefix is case-insensitive (70)", runBLE(MAC_RANDOM, a, &d), true, d.confidence, 70, d.detail); }
+
+    // The removed boost mistook bit 0x02 for BLE address type: 44:... + FS-100 scored 80,
+    // while 46:... scored 70. The controller type is absent here, and a generic address
+    // supplies no Flock evidence. Exercise both bit states and 00:... for each name form;
+    // only the supported manufacturer co-signal may promote a non-literal name.
+    const uint8_t nameMacs[][6] = {
+        {0x44,0x33,0x44,0x55,0x66,0x77},
+        {0x46,0x33,0x44,0x55,0x66,0x77},
+        {0x00,0x11,0x22,0x33,0x44,0x55},
+    };
+    const char* names[] = { "FS-100", "Penguin-0123456789", "FS-BEC46A", "Flock Beacon" };
+    for (const auto& mac : nameMacs) {
+        char label[112];
+        for (const char* name : names) {
+            std::vector<uint8_t> a; addName(a, name);
+            snprintf(label, sizeof(label), "%s on %02x:... without mfg -> 70", name, mac[0]);
+            chk(label, runBLE(mac, a, &d), true, d.confidence, 70, d.detail, "");
+
+            addMfg(a, 0x09C7);
+            snprintf(label, sizeof(label), "%s on %02x:... + unrelated mfg -> 70", name, mac[0]);
+            chk(label, runBLE(mac, a, &d), true, d.confidence, 70, d.detail, "");
+
+            a.clear(); addName(a, name); addMfg(a, 0x09C8);
+            snprintf(label, sizeof(label), "%s on %02x:... + 0x09C8 -> 80", name, mac[0]);
+            chk(label, runBLE(mac, a, &d), true, d.confidence, 80, d.detail, "");
+        }
+        std::vector<uint8_t> a; addName(a, "FS Ext Battery");
+        snprintf(label, sizeof(label), "FS Ext Battery on %02x:... without mfg -> 80", mac[0]);
+        chk(label, runBLE(mac, a, &d), true, d.confidence, 80, d.detail, "");
+    }
     // The exact false positives the anchoring was written to kill. Each of these matched before.
     { std::vector<uint8_t> a; addName(a, "penguins fan");
       chk("'penguins fan' -> NO hit (was a match)", runBLE(MAC_RANDOM, a, &d), false); }
@@ -330,8 +361,8 @@ int main() {
     chkStr("  ...name field populated from the advert", d.name, "camera-7");
     { std::vector<uint8_t> a;
       chk("neighbouring OUI b4:1e:53 -> no hit", runBLE(MAC_NEARMISS, a, &d), false); }
-    // The local-bit guard: a randomized address cannot carry a real IEEE OUI, so the same three
-    // bytes with the local bit set must be rejected outright rather than matched and down-capped.
+    // Preserve the existing OUI guard: setting the U/L bit rejects this fixture. This tests
+    // that guard's byte rule, not BLE address type, which the classifier does not receive.
     { std::vector<uint8_t> a;
       chk("b6:1e:52 (local bit set) -> no hit", runBLE(MAC_FLOCKLA, a, &d), false); }
 
