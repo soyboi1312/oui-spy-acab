@@ -63,11 +63,17 @@ sky-spy project (architecture only, no code). Everything else, the detection
 signatures, the classifiers, the `acab_core` engine, the BLE GATT protocol, the apps,
 the Meshtastic uplink, and the web flasher pages (which drive the vendored ESP Web
 Tools bundle above), is this project's own work, built from the
-public references in `docs/signatures.md`. Earlier releases ported detection code from the unlicensed
+public references in `docs/signatures.md`. Earlier releases ported detection code from
 `colonelpanichacks/oui-spy`, `colonelpanichacks/oui-spy-unified-blue`, and `flock-you`; those
 signatures have since been re-sourced from public registries and the classifiers
 re-derived from public standards, so the project no longer carries their
-all-rights-reserved code.
+upstream detection code.
+
+`flock-you` added an [MIT license](https://github.com/colonelpanichacks/flock-you/blob/0793fba16d426cdb8a26440dc64a173b0bfa40f9/LICENSE)
+on [2026-07-29](https://github.com/colonelpanichacks/flock-you/commit/0793fba16d426cdb8a26440dc64a173b0bfa40f9).
+Its earlier lack of a license is historical, not its current status. This records
+the license change without reassessing earlier releases or the licenses of the
+other OUI-Spy repositories.
 
 ## Fonts
 
@@ -90,5 +96,5 @@ Detection signatures drift as vendors change hardware. Run
     python3 firmware/tools/check-signature-drift.py
 
 periodically to watch for a new opendroneid-core-c release worth re-vendoring. It no
-longer diffs the Flock OUI table against any third-party curated list (we ship only
-own-captured OUIs now); it only reports and never changes anything.
+longer diffs the Flock OUI table against any third-party curated list (that table uses
+our field captures and Flock's IEEE assignment); it only reports and never changes anything.

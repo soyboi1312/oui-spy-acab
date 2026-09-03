@@ -17,7 +17,7 @@ It runs on the beacon, our own dual-radio board, and on the **Colonel Panic OUI-
 - **Want to look around without hardware?** Install the [iPhone app](https://apps.apple.com/us/app/beacons-surveillance-scanner/id6781841861) or [Android app](https://play.google.com/store/apps/details?id=tech.soyboi.beacons) and tap **See how it works**. It loads six clearly marked fictional detections. Sample settings never configure a board, sample rows never enter your real Log, and leaving the sample restores your saved data.
 - **Already have compatible hardware?** Power the beacon, OUI-Spy, or Mesh-Detect board and tap **Scan** in the app. Grant Bluetooth access on iPhone, Nearby devices on Android 12 or newer, or Location on Android 8 through 11. Choose the board and approve the system pairing prompt. The first encrypted connection opens a short walkthrough followed by the relevant permission and readiness prompts.
 - **Building your own OUI-Spy or Mesh-Detect?** Use the [one-click DIY flasher](https://soyboi1312.github.io/all-cameras-are-beacons/) or follow the [command-line instructions](#flashing-from-the-command-line).
-- **Looking for the beacon?** Retail hardware is coming soon. Current availability and the waitlist are at [soyboi.tech](https://soyboi.tech).
+- **Want the beacon?** Buy it on [Tindie](https://www.tindie.com/stores/soyboitech/). Pricing, availability and the getting-started guide are at [soyboi.tech](https://soyboi.tech).
 - **Need a hand?** Read the [getting-started guide](https://soyboi.tech/getting-started), check the [FAQ and support page](https://soyboi.tech/faq), or open a [GitHub issue](https://github.com/soyboi1312/all-cameras-are-beacons/issues).
 
 A board is required for live detection. Sample data and an existing saved Log remain available without one.
@@ -104,7 +104,7 @@ Star an exact device to create a watched category. Mute known gear permanently, 
 
 Vibrate mode silences the board and uses category-shaped phone haptics. For example, glasses use a double tap and body cameras use a repeating pattern. On iPhone these haptics fire while the app is open, and both apps respect Focus or Do Not Disturb. Separately, opt-in per-category phone notifications can play sound after notification permission is granted. Every notification category starts off.
 
-Both apps provide VoiceOver or TalkBack descriptions for key status, map, and control surfaces, and their main layouts reflow for larger text.
+Both apps provide VoiceOver or TalkBack descriptions for key status, map, and control surfaces, and their main layouts reflow for larger text. Both also offer a higher-contrast palette: it follows the system contrast setting, and an "always use higher contrast" switch under Beacon > Display forces it on.
 
 ### Live Mode and widgets
 
@@ -206,17 +206,16 @@ The companion nRF firmware and the beacon hardware design, PCB, enclosure, and m
 
 ## Where things stand
 
-The current source version is **2.0.6** for the ESP32-S3 firmware and both phone apps. Public app and firmware distribution can lag the source tree.
+The current source version is **2.0.7** for the ESP32-S3 firmware and both phone apps. Public app and firmware distribution can lag the source tree.
 
-The detector, Meshtastic path, native apps, and firmware update flows have been exercised on real hardware. Retail beacon hardware is still coming soon. Detection depends on known, defensible radio signatures, so field capture and ground-truth validation remain ongoing work.
+The detector, Meshtastic path, native apps, and firmware update flows have been exercised on real hardware. Retail beacon hardware is sold through [Tindie](https://www.tindie.com/stores/soyboitech/); soyboi.tech carries current availability. Detection depends on known, defensible radio signatures, so field capture and ground-truth validation remain ongoing work.
 
 ESP32-S3 updates verify a signed image on the board and use a health-confirmation rollback path. On the dual-radio beacon, a combined update installs the nRF package first, then the ESP32-S3 image. The phone verifies the nRF package before transfer; the stock nRF bootloader itself provides CRC validation rather than the ESP32-S3's on-device signature check. Triggering that update also requires the encrypted app session and the physical power-on authorization window. The combined sequence has completed successfully from both iPhone and Android test devices.
 
 Still on the list:
 
-- bring the iPhone app from TestFlight to a public App Store release
-- publish current signed 2.0.6 recovery images for both board revisions before the retail launch
-- replace the development OTA key with a production key, keep it offline, and back it up securely before the retail launch
+- publish the signed 2.0.7 recovery images for both board revisions; units sold so far ship on 2.0.6 until the manifest goes live
+- publish the OTA key rotation: 2.0.7 bakes in the production key and is the transition image, signed with the retiring development key so every fielded board accepts it and trusts the production key from its next boot; publishing it re-keys every fielded board that installs it, a board that skips 2.0.7 needs a web flash once the development key is retired, and the private production key is kept offline and backed up
 - field-validate newer capture candidates before promoting any of them into production detection
 - keep the signature evidence, apps, firmware, and public documentation in sync as real-world gear changes
 
