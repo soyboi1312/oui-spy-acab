@@ -7,6 +7,12 @@
 <meta name="description" content="Privacy policy for the All Cameras Are Beacons app on iOS and Android.">
 <style>
   :root{ --bg:#0a0809; --ink:#f2f2f3; --dim:#9a9498; --line:#241d20; --accent:#ec3b2e; --accent-dim:#5a201c; --panel:#120d0f; }
+  /* Follows the OS "increase contrast" setting where the browser exposes it. Same moves as
+     the apps' higher-contrast palette: brighter secondary text, visible edges, a lighter
+     crimson for words; surfaces stay put. */
+  @media (prefers-contrast:more){
+    :root{ --ink:#ffffff; --dim:#c9c9d1; --line:#4a4a52; --accent:#ff6a5e; --accent-dim:#c0463c; }
+  }
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:var(--bg);color:var(--ink);font-family:ui-monospace,Menlo,monospace;line-height:1.6;padding:44px 20px}
   .wrap{max-width:680px;margin:0 auto}

@@ -18,6 +18,12 @@
     --dim:#8a8a93; --accent:#e4322b; --accent-dim:#7a1c19; --ok:#3ad07a;
     --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
   }
+  /* Follows the OS "increase contrast" setting where the browser exposes it. Same moves as
+     the apps' higher-contrast palette: brighter secondary text, visible edges, a lighter
+     crimson for words; surfaces stay put. */
+  @media (prefers-contrast:more){
+    :root{ --ink:#ffffff; --dim:#c9c9d1; --line:#4a4a52; --accent:#ff6a5e; --accent-dim:#c0463c; }
+  }
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:var(--bg);color:var(--ink);font-family:var(--mono);
     line-height:1.5;-webkit-font-smoothing:antialiased;
