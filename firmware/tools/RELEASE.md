@@ -45,6 +45,10 @@ The 2.0.7 cut is that release for the current rotation: it bakes the production 
 development key (`39e03b1581db574822be12631df557ac136a3c5b9c00b8e32e07dc4a9b6d3df1`), which signed
 every image through 2.0.6. Every image from 2.0.8 on is signed by the production key alone.
 
+boards still trusting the development key must install the transition image before moving to
+production-key-only releases. a board that skips the transition needs a USB flash once the
+development-key update path is retired.
+
 To rotate:
 
 1. Generate the new P-256 keypair offline and back up the private half. Do not put it on the

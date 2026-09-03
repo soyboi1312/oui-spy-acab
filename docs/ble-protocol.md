@@ -799,6 +799,8 @@ success), or after a 5-minute ceiling.
 
 The phone verifies the ZIP's SHA-256, detached signature, application-only layout, and inner
 `application_version` before it sends the trigger. It never retries legacy DFU automatically.
+the stock nRF bootloader validates CRC rather than the package signature; signature verification
+for that leg happens on the phone. the ESP32-S3 separately verifies its image signature on the board.
 After Nordic reports completion, the initiating S3 must report the target `nrfv`; only then does
 the combined coordinator begin S3 OTA. If the connected board still runs protocol 0 or 1, the app
 offers only the S3 update. The user must then physically power-cycle, reconnect on protocol 2, and
